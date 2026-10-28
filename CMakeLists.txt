@@ -5,10 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# The Puddle's lower layers (request signatures, key chains, JSON, HTTP, TLS) come from a Puddle checkout beside this one.
-set(PUDDLE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../puddle CACHE PATH "A Puddle checkout")
+# The Puddle's lower layers (request signatures, key chains, JSON, HTTP, TLS) come from the Puddle, pinned as the submodule
+# deps/puddle so a Pond commit always builds against the Puddle commit it was made with. -DPUDDLE_DIR=../puddle builds
+# against a working checkout instead, for changing both at once (scripts/build.sh --local).
+set(PUDDLE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/deps/puddle CACHE PATH "The Puddle source to build against")
 if(NOT EXISTS ${PUDDLE_DIR}/CMakeLists.txt)
-  message(FATAL_ERROR "no Puddle checkout at ${PUDDLE_DIR} (clone github.com/ezp2p/puddle there, or set -DPUDDLE_DIR=)")
+  message(FATAL_ERROR "no Puddle source at ${PUDDLE_DIR} (git submodule update --init, or set -DPUDDLE_DIR=)")
 endif()
 if(APPLE AND NOT OPENSSL_ROOT_DIR AND EXISTS /opt/homebrew/opt/openssl@3)
   set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)

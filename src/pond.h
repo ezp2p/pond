@@ -7,6 +7,7 @@
 #include "db.h"
 #include "key.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -27,6 +28,11 @@ constexpr int HISTORY_DEFAULT = 50, HISTORY_MAX = 100;
 constexpr int EVENTS_MAX = 200;
 constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 constexpr int WAIT_MS = 25 * 1000;       /* how long a request for events is held open */
+
+/* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
+ * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has, none yet. */
+constexpr int PROTOCOL = 1;
+constexpr std::array<const char *, 0> FEATURES{};
 
 int64_t now_ms();
 

@@ -8,8 +8,10 @@ Puddle. The design is in [docs/design.md](docs/design.md) and the routes in [api
 
 ## Build
 
-It needs MariaDB (the server, and its C client) and OpenSSL 3. It also needs a Puddle checkout beside this one, at `../puddle`,
-because it shares the Puddle's lower layers.
+It needs MariaDB (the server, and its C client) and OpenSSL 3. It shares the Puddle's lower layers, pinned as the submodule
+`deps/puddle` (clone with `--recurse-submodules`; `scripts/build.sh` fetches it if missing). To change the Puddle and the Pond
+together, build against a working checkout beside this one with `scripts/build.sh --local` (`../puddle`), and when done move
+the pin: `git -C deps/puddle checkout <commit>` and commit `deps/puddle`.
 
 ```sh
 brew install mariadb openssl@3 libyaml     # or: apt install mariadb-server libmariadb-dev libssl-dev libyaml-dev

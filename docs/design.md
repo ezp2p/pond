@@ -22,7 +22,11 @@ The Pond's own files live in `data_dir`. They are its key (`pond.key`, mode 0600
 put their own there.
 
 The code shares the Puddle's lower layers: request signatures, key chains, JSON, the HTTP parser and TLS. CMake builds
-them from a Puddle checkout next to this one (`../puddle`; override it with `-DPUDDLE_DIR=`).
+them from the Puddle source pinned as the submodule `deps/puddle`, so each Pond commit builds against the Puddle commit
+it was made with, whatever the Puddle's own branches are doing. `scripts/build.sh --local` builds against a working
+checkout at `../puddle` instead, for changing both at once; the pin is then moved to the Puddle commit that was merged.
+This is only about building. A running Pond and a running Puddle depend on each other only through the protocol (see
+"Versions").
 
 ## Who a Pond is
 
@@ -157,6 +161,22 @@ database:
   password: secret
   name: pond
 ```
+
+## Versions
+
+A Pond and a Puddle are built and upgraded apart, so neither may assume the other is the same age. What ties them is
+the protocol, not the version of either program.
+
+- The paths say the protocol: `/pond/v1/...`. A change an older Puddle would misread (a field that means something
+  else, a route that answers differently) gets new paths, `/pond/v2/...`, and a Pond serves both until its members
+  have moved.
+- Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
+  it does not know, so an older Puddle keeps working with a newer Pond.
+- `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
+  of optional parts this Pond has (none yet). A Puddle checks these before using an addition, rather than guessing from
+  a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
+
+A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.
 
 ## Limits
 

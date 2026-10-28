@@ -1,0 +1,3 @@
+[submodule "deps/puddle"]
+	path = deps/puddle
+	url = https://github.com/ezp2p/puddle.git

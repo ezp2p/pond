@@ -249,6 +249,7 @@ int main()
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":" + std::to_string(pond::PROTOCOL) + ",\"features\":[]"));
 
     std::string ch;
     {

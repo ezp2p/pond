@@ -141,6 +141,7 @@ int main()
 
     a = call(routes, ann, "GET", "/pond/v1/info", "", P);
     CHECK(a.status == 200 && has(a.body, "Ann B"));
+    CHECK(member_num(a.body, "protocol") == pond::PROTOCOL && has(a.body, "\"features\":[]"));
     int64_t cursor = member_num(a.body, "cursor");
     CHECK(cursor > 0);
     a = call(routes, ann, "GET", "/pond/v1/members", "", P);

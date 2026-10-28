@@ -223,7 +223,11 @@ Answer Service::info(const std::string &member)
     if (!db || !db->exec(std::string("SELECT ") + MEMBER_COLS + " FROM members WHERE id = ?", {member}, &m) || m.rows.empty() ||
         !db->exec("SELECT COALESCE(MAX(id), 0) FROM events", {}, &c))
         return server_error();
-    return {200, "{\"pond\":" + pond_json(*db) + ",\"me\":" + member_json(m.rows[0]) + ",\"channels\":" + channels_json(*db) +
+    std::string features = "[";
+    for (const char *f : FEATURES)
+        features += (features.size() > 1 ? "," : "") + jstr(f);
+    return {200, "{\"protocol\":" + std::to_string(PROTOCOL) + ",\"features\":" + features + "],\"pond\":" + pond_json(*db) +
+                     ",\"me\":" + member_json(m.rows[0]) + ",\"channels\":" + channels_json(*db) +
                      ",\"cursor\":" + std::to_string(num(c.rows[0][0])) + "}"};
 }
 
