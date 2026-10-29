@@ -5,10 +5,10 @@
 #include "db.h"
 #include "key.h"
 #include "pond.h"
+#include "tls.h"
 
-#include "http/tls.h"
-
-#include <openssl/ssl.h>
+#include <drogon/orm/Exception.h>
+#include <trantor/utils/Logger.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +18,8 @@
 #include <vector>
 
 using namespace pond;
+using drogon::sync_wait;
+using drogon::orm::Result;
 
 static const char USAGE[] =
     "usage: pondctl [-c pond.yaml] <command>\n"
@@ -106,6 +108,9 @@ static bool options(std::vector<std::string> &args, std::vector<std::pair<std::s
     return true;
 }
 
+static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &key, const std::string &cmd, const std::string &sub,
+               std::vector<std::string> &args);
+
 int main(int argc, char **argv)
 {
     std::string path = "pond.yaml";
@@ -127,81 +132,81 @@ int main(int argc, char **argv)
     std::string cmd = args[0], sub = args.size() > 1 ? args[1] : "";
     args.erase(args.begin());
 
+    trantor::Logger::setLogLevel(trantor::Logger::kWarn);
     PondKey key;
     if (cmd == "init") {
         if (args.size() != 1)
             return usage();
-        if (!create_key(cfg.data_dir, key, err))
+        if (!create_key(cfg.data_dir, key, err) || !ensure_certificate(cfg.data_dir, err))
             return die(err);
     } else if (!load_key(cfg.data_dir, key, err)) {
         return die(err);
     }
 
-    Pool pool(cfg.db, 4);
-    {
-        auto db = pool.get();
-        if (!db)
-            return die("cannot reach the database " + cfg.db.name);
-        if (!migrate(*db, err))
-            return die(err);
+    DbPtr db = connect_db(cfg.db);
+    if (!migrate(db, err))
+        return die(err);
+    Service svc(db, key);
+    try {
+        return run(cfg, svc, db, key, cmd, sub, args);
+    } catch (const drogon::orm::DrogonDbException &e) {
+        return die(std::string("database: ") + e.base().what());
     }
-    Service svc(pool, key);
-    auto db = pool.get();
+}
 
+/* One command, once the key and database are ready. */
+static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &key, const std::string &cmd, const std::string &sub,
+               std::vector<std::string> &args)
+{
+    /* what an admin action said: "" is done, anything else is why not */
+    auto done = [](const Outcome &o) { return o.empty() ? 0 : die(o); };
     if (cmd == "init") {
-        std::string ignored;
-        if (!svc.set_name(args[0], nullptr, err) || !svc.channel_create("general", "", ignored))
-            return die(err);
+        Outcome o = sync_wait(svc.set_name(args[0], std::nullopt));
+        if (!o.empty())
+            return die(o);
+        sync_wait(svc.channel_create("general", "")); /* already there when init is run again on the same database */
         printf("Pond %s made, id %s, with a channel #general.\nMake an invite with: pondctl invite create\n", args[0].c_str(),
                key.id.c_str());
         return 0;
     }
     if (cmd == "info") {
-        Result r;
-        db->exec("SELECT (SELECT COUNT(*) FROM members WHERE left_ms IS NULL), (SELECT COUNT(*) FROM channels WHERE deleted = 0),"
-                 " (SELECT COUNT(*) FROM messages)",
-                 {}, &r);
-        char e[256] = "", fp[65] = "";
-        SSL_CTX *tls = puddle_tls_context(cfg.data_dir.c_str(), e, sizeof e);
-        if (tls)
-            puddle_tls_fingerprint_hex(tls, fp);
-        SSL_CTX_free(tls);
+        Result r = db->execSqlSync("SELECT (SELECT COUNT(*) FROM members WHERE left_ms IS NULL),"
+                                   " (SELECT COUNT(*) FROM channels WHERE deleted = 0), (SELECT COUNT(*) FROM messages)");
+        std::string err, fp = ensure_certificate(cfg.data_dir, err) ? certificate_fingerprint(cfg.data_dir + "/cert.pem") : err;
         printf("name         %s\nid           %s\naddress      %s\ncertificate  %s\nmembers      %s\nchannels     %s\nmessages     %s\n",
-               svc.setting("name").c_str(), key.id.c_str(), link_address(cfg).c_str(), *fp ? fp : e, text(r.rows[0][0]).c_str(),
-               text(r.rows[0][1]).c_str(), text(r.rows[0][2]).c_str());
+               sync_wait(svc.setting("name")).c_str(), key.id.c_str(), link_address(cfg).c_str(), fp.c_str(), text(r[0][0]).c_str(),
+               text(r[0][1]).c_str(), text(r[0][2]).c_str());
         return 0;
     }
     if (cmd == "name") {
         std::string description = "\x01";
         if (!options(args, {{"--description", &description}}) || args.size() != 1)
             return usage();
-        bool has = description != "\x01";
-        return svc.set_name(args[0], has ? &description : nullptr, err) ? 0 : die(err);
+        std::optional<std::string> d;
+        if (description != "\x01")
+            d = description;
+        return done(sync_wait(svc.set_name(args[0], d)));
     }
     if (cmd == "channel") {
         args.erase(args.begin());
         std::string topic;
         if (!options(args, {{"--topic", &topic}}))
             return usage();
-        bool ok;
-        if (sub == "create" && args.size() == 1) {
-            ok = svc.channel_create(args[0], topic, err);
-        } else if (sub == "list" && args.empty()) {
-            Result r;
-            db->exec("SELECT name, id, topic FROM channels WHERE deleted = 0 ORDER BY position, id", {}, &r);
-            for (auto &row : r.rows)
+        if (sub == "create" && args.size() == 1)
+            return done(sync_wait(svc.channel_create(args[0], topic)));
+        if (sub == "list" && args.empty()) {
+            Result r = db->execSqlSync("SELECT name, id, topic FROM channels WHERE deleted = 0 ORDER BY position, id");
+            for (const auto &row : r)
                 printf("#%-24s %s  %s\n", text(row[0]).c_str(), text(row[1]).c_str(), text(row[2]).c_str());
             return 0;
-        } else if (sub == "rename" && args.size() == 2) {
-            ok = svc.channel_rename(args[0], args[1], err);
-        } else if (sub == "topic" && args.size() == 2) {
-            ok = svc.channel_topic(args[0], args[1], err);
-        } else if (sub == "delete" && args.size() == 1) {
-            ok = svc.channel_delete(args[0], err);
-        } else {
-            return usage();
         }
-        return ok ? 0 : die(err);
+        if (sub == "rename" && args.size() == 2)
+            return done(sync_wait(svc.channel_rename(args[0], args[1])));
+        if (sub == "topic" && args.size() == 2)
+            return done(sync_wait(svc.channel_topic(args[0], args[1])));
+        if (sub == "delete" && args.size() == 1)
+            return done(sync_wait(svc.channel_delete(args[0])));
+        return usage();
     }
     if (cmd == "invite") {
         args.erase(args.begin());
@@ -213,44 +218,44 @@ int main(int argc, char **argv)
             int64_t until = expires.empty() ? 0 : parse_expiry(expires);
             if ((!uses.empty() && n <= 0) || (!expires.empty() && until <= now_ms()))
                 return die("--uses is a number above 0; --expires is like 7d, 24h, 90m or a date to come (YYYY-MM-DD)");
-            std::string token;
-            if (!svc.invite_create(n, until, token, err))
-                return die(err);
-            printf("%s\n", link_for(cfg, token).c_str());
+            auto token = std::make_shared<std::string>();
+            Outcome o = sync_wait(svc.invite_create(n, until, token));
+            if (!o.empty())
+                return die(o);
+            printf("%s\n", link_for(cfg, *token).c_str());
             fprintf(stderr, "%s, %s\n", n ? (std::to_string(n) + (n == 1 ? " use" : " uses")).c_str() : "unlimited uses",
                     until ? ("expires " + when(until)).c_str() : "never expires");
             return 0;
         }
         if (sub == "list" && args.empty()) {
-            Result r;
-            db->exec("SELECT token, uses, max_uses, expires_ms, revoked FROM invites ORDER BY created_ms", {}, &r);
+            Result r = db->execSqlSync("SELECT token, uses, max_uses, expires_ms, revoked FROM invites ORDER BY created_ms");
             int64_t now = now_ms();
-            for (auto &row : r.rows) {
-                std::string state = num(row[4])                             ? "revoked"
-                                    : row[3] && num(row[3]) <= now          ? "expired"
-                                    : row[2] && num(row[1]) >= num(row[2]) ? "used up"
-                                                                            : "open";
+            for (const auto &row : r) {
+                std::string state = num(row[4])                                    ? "revoked"
+                                    : !row[3].isNull() && num(row[3]) <= now        ? "expired"
+                                    : !row[2].isNull() && num(row[1]) >= num(row[2]) ? "used up"
+                                                                                     : "open";
                 printf("%s  %-8s %s/%s uses  %s\n", text(row[0]).c_str(), state.c_str(), text(row[1]).c_str(),
-                       row[2] ? row[2]->c_str() : "unlimited", row[3] ? ("until " + when(num(row[3]))).c_str() : "no expiry");
+                       row[2].isNull() ? "unlimited" : text(row[2]).c_str(), row[3].isNull() ? "no expiry" : ("until " + when(num(row[3]))).c_str());
             }
             return 0;
         }
         if (sub == "revoke" && args.size() == 1)
-            return svc.invite_revoke(args[0], err) ? 0 : die(err);
+            return done(sync_wait(svc.invite_revoke(args[0])));
         return usage();
     }
     if (cmd == "member") {
         args.erase(args.begin());
         if (sub == "list" && args.empty()) {
-            Result r;
-            db->exec("SELECT id, JSON_VALUE(profile, '$.display_name'), joined_ms FROM members WHERE left_ms IS NULL ORDER BY joined_ms", {},
-                     &r);
-            for (auto &row : r.rows)
-                printf("%s  %-24s joined %s\n", text(row[0]).c_str(), row[1] ? row[1]->c_str() : "(no profile)", when(num(row[2])).c_str());
+            Result r =
+                db->execSqlSync("SELECT id, JSON_VALUE(profile, '$.display_name'), joined_ms FROM members WHERE left_ms IS NULL ORDER BY joined_ms");
+            for (const auto &row : r)
+                printf("%s  %-24s joined %s\n", text(row[0]).c_str(), row[1].isNull() ? "(no profile)" : text(row[1]).c_str(),
+                       when(num(row[2])).c_str());
             return 0;
         }
         if (sub == "remove" && args.size() == 1)
-            return svc.member_remove(args[0], err) ? 0 : die(err);
+            return done(sync_wait(svc.member_remove(args[0])));
         return usage();
     }
     return usage();

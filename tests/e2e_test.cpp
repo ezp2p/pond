@@ -1,263 +1,114 @@
-/* Two real Puddles and a real Pond, over TLS on this machine, driven through the Puddles' owner API as the app drives them:
- * joining with invites, messages arriving while a request for events is held open, a new channel, profiles, scrolling back past
- * what a Puddle keeps, a Puddle restarting, being removed, and leaving. */
+/* Two real Puddles (puddled, a separate program: PUDDLED in CMakeLists.txt) and a real Pond, over TLS on this machine, the
+ * Puddles driven through their owner API as the app drives them: joining with invites, messages arriving while a request for
+ * events is held open, a new channel, profiles, scrolling back past what a Puddle keeps, a Puddle restarting, being removed,
+ * and leaving. Skipped (77) without a puddled. */
 
-#include "testdb.h"
+#include "harness.h"
 
-#include "db.h"
-#include "key.h"
-#include "listener.h"
-#include "pond.h"
-#include "routes.h"
-
-#include "base/json.h"
-#include "core/config.h"
-#include "core/identity.h"
-#include "service/server.h"
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <openssl/ssl.h>
-#include <sys/socket.h>
-
-#include <chrono>
-#include <functional>
-#include <thread>
+#include <sys/stat.h>
 
 using namespace pond;
-
-static std::string root;
-
-static unsigned free_port()
-{
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    bind(fd, (sockaddr *)&a, sizeof a);
-    socklen_t l = sizeof a;
-    getsockname(fd, (sockaddr *)&a, &l);
-    close(fd);
-    return ntohs(a.sin_port);
-}
-
-static bool until(const std::function<bool()> &cond, int ms = 10000)
-{
-    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
-    while (!cond()) {
-        if (std::chrono::steady_clock::now() > end)
-            return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    return true;
-}
-
-static bool has(const std::string &s, const std::string &part)
-{
-    return s.find(part) != std::string::npos;
-}
 
 /* ---- a Puddle ---- */
 
 struct Node {
-    std::string name;
-    puddle_config cfg{};
-    puddle_server *srv = nullptr;
-    std::thread th;
-    std::string token;
+    std::string name, dir, conf, token;
+    unsigned port = 0;
+    pid_t pid = 0;
 
-    bool make(const char *who, const char *display)
+    bool make(const std::string &root, const char *who, const char *display)
     {
         name = who;
-        std::string dir = root + "/" + who;
+        dir = root + "/" + who;
+        conf = dir + "/puddle.yaml";
         mkdir(dir.c_str(), 0700);
-        std::string pf = dir + "/profiles.yaml";
-        FILE *f = fopen(pf.c_str(), "w");
-        fprintf(f, "profiles:\n  - id: main\n    display_name: %s\n  - id: work\n    display_name: %s (work)\n", display, display);
-        fclose(f);
-        snprintf(cfg.dir, sizeof cfg.dir, "%s", dir.c_str());
-        snprintf(cfg.data_dir, sizeof cfg.data_dir, "%s/data", dir.c_str());
-        snprintf(cfg.address, sizeof cfg.address, "127.0.0.1");
-        cfg.port = (uint16_t)free_port();
-        snprintf(cfg.profile_files[0], PUDDLE_PATH_MAX, "%s", pf.c_str());
-        cfg.nprofile_files = 1;
-        char err[300], phrase[PUDDLE_PHRASE_LEN + 1];
-        puddle_identity *id = puddle_identity_create(cfg.data_dir, phrase, err, sizeof err);
-        if (!id)
+        std::ofstream(dir + "/profiles.yaml") << "profiles:\n  - id: main\n    display_name: " << display << "\n  - id: work\n    display_name: "
+                                              << display << " (work)\n";
+        port = free_port();
+        std::ofstream(conf) << "address: 127.0.0.1\nport: " << port << "\ndata_dir: " << dir << "/data\nprofiles: " << dir << "/profiles.yaml\n";
+        std::string out;
+        if (run(std::string(PUDDLED) + " -c " + conf + " --init < /dev/null", &out) != 0) {
+            fprintf(stderr, "%s: puddled --init: %s\n", who, out.c_str());
             return false;
-        puddle_identity_close(id);
-        puddle_identity_confirm(cfg.data_dir);
+        }
         return up();
     }
 
     bool up()
     {
-        char err[300];
-        srv = puddle_server_create(&cfg, err, sizeof err);
-        if (!srv) {
-            fprintf(stderr, "%s: %s\n", name.c_str(), err);
+        pid = spawn({PUDDLED, "-c", conf}, dir + "/log");
+        if (pid <= 0 || !until([&] { return port_open(port); }, 20000))
             return false;
-        }
-        char tok[100] = "";
-        FILE *f = fopen((std::string(cfg.data_dir) + "/state/owner-token").c_str(), "r");
-        if (!f || !fgets(tok, sizeof tok, f))
-            return false;
-        fclose(f);
-        token = tok;
-        token.erase(token.find_last_not_of("\r\n") + 1);
-        th = std::thread([s = srv] { puddle_server_run(s); });
-        return true;
+        std::ifstream f(dir + "/data/state/owner-token");
+        std::getline(f, token);
+        return !token.empty();
     }
 
-    void down()
-    {
-        if (!srv)
-            return;
-        puddle_server_stop(srv);
-        th.join();
-        puddle_server_destroy(srv);
-        srv = nullptr;
-    }
+    void down() { stop(pid); }
 
     ~Node() { down(); }
 
-    /* One owner request; the body of the answer in `out`. The status, or -1. */
-    int api(const char *method, const std::string &path, const std::string &body, std::string &out)
-    {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        a.sin_port = htons(cfg.port);
-        if (connect(fd, (sockaddr *)&a, sizeof a) != 0) {
-            close(fd);
-            return -1;
-        }
-        timeval tv = {30, 0};
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
-        SSL *ssl = SSL_new(ctx);
-        SSL_set_fd(ssl, fd);
-        int status = -1;
-        out.clear();
-        if (SSL_connect(ssl) == 1) {
-            std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + token +
-                              "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
-            SSL_write(ssl, req.data(), (int)req.size());
-            std::string all;
-            char buf[16384];
-            int r;
-            while ((r = SSL_read(ssl, buf, sizeof buf)) > 0)
-                all.append(buf, (size_t)r);
-            if (sscanf(all.c_str(), "HTTP/1.1 %d", &status) != 1)
-                status = -1;
-            size_t b = all.find("\r\n\r\n");
-            out = b == std::string::npos ? "" : all.substr(b + 4);
-        }
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        close(fd);
-        return status;
-    }
     std::string get(const std::string &path)
     {
-        std::string out;
-        api("GET", path, "", out);
-        return out;
+        return https(port, "GET", path, "", {"Authorization: Bearer " + token}).body;
     }
     int post(const std::string &path, const std::string &body, std::string *out = nullptr)
     {
-        std::string o;
-        int st = api("POST", path, body, o);
+        Reply r = https(port, "POST", path, body, {"Authorization: Bearer " + token});
         if (out)
-            *out = o;
-        return st;
+            *out = r.body;
+        return r.status;
     }
 };
-
-static std::string str_member(const std::string &json, const char *key)
-{
-    puddle_span v;
-    char buf[200] = "";
-    if (puddle_json_member(json.data(), json.size(), key, &v) == 0)
-        puddle_json_string(v, buf, sizeof buf);
-    return buf;
-}
-
-static int count(const std::string &s, const std::string &part)
-{
-    int n = 0;
-    for (size_t at = s.find(part); at != std::string::npos; at = s.find(part, at + 1))
-        n++;
-    return n;
-}
 
 /* The id of the first message in a page ({"items": [...]}): the oldest. */
 static int64_t first_id(const std::string &page)
 {
-    size_t at = page.find("\"id\":");
-    return at == std::string::npos ? 0 : strtoll(page.c_str() + at + 5, nullptr, 10);
+    Json::Value v = parse(page);
+    return v["items"].isArray() && !v["items"].empty() ? v["items"][0]["id"].asInt64() : 0;
 }
 
 int main()
 {
-    TestDb tdb;
-    if (!tdb.start()) {
+    if (access(PUDDLED, X_OK) != 0) {
+        fprintf(stderr, "e2e_test: skipped: no puddled at %s (build Puddle, or set -DPUDDLED=)\n", PUDDLED);
+        return 77;
+    }
+    TestDb db;
+    if (!db.start()) {
         fprintf(stderr, "cannot start a MariaDB for the test\n");
         return 1;
     }
-    root = tdb.dir;
-    std::string err;
 
     /* ---- the Pond ---- */
-    PondKey key;
-    CHECK(create_key(root + "/pond", key, err));
-    Pool pool(tdb.cfg, 16);
-    {
-        auto db = pool.get();
-        CHECK(db && migrate(*db, err));
-    }
-    Service svc(pool, key);
-    svc.wait_ms = 20000; /* long enough that only news, or stopping, ends a wait */
-    Routes routes(svc);
-    Listener listener;
-    unsigned port = free_port();
-    CHECK(listener.open("127.0.0.1", port, root + "/pond", routes.handler(), err));
-    std::thread serving([&] { listener.run(); });
-    std::thread watcher([&] { svc.watch(); });
-    CHECK(svc.set_name("Lily Pad", nullptr, err));
-    CHECK(svc.channel_create("general", "", err));
-    std::string once, open;
-    CHECK(svc.invite_create(1, 0, once, err));
-    CHECK(svc.invite_create(0, 0, open, err));
-    std::string base = "pond://127.0.0.1:" + std::to_string(port) + "?invite=";
+    PondProc pond(db);
+    CHECK(pond.init("Lily Pad", 20000)); /* long enough that only news, or stopping, ends a wait */
+    std::string out, once, open;
+    pond.ctl("invite create --uses 1 2>/dev/null", &out);
+    once = out.substr(out.find("invite=") + 7, 26);
+    pond.ctl("invite create 2>/dev/null", &out);
+    open = out.substr(out.find("invite=") + 7, 26);
+    CHECK(pond.up());
+    std::string base = "pond://127.0.0.1:" + std::to_string(pond.port) + "?invite=";
 
     Node ann, ben;
-    CHECK(ann.make("ann", "Ann"));
-    CHECK(ben.make("ben", "Ben"));
+    CHECK(ann.make(db.dir, "ann", "Ann"));
+    CHECK(ben.make(db.dir, "ben", "Ben"));
 
     /* ---- joining ---- */
-    std::string out;
     CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"puddle://127.0.0.1:1\"}", &out) == 400 && has(out, "bad_link"));
     CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + "aaaaaaaaaaaaaaaaaaaaaaaaaa\"}", &out) == 409 && has(out, "invite_refused"));
     CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"nope\"}", &out) == 404);
     CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(out, "Lily Pad") && has(out, "\"name\":\"general\"") && has(out, "\"display_name\":\"Ann\""));
-    std::string pid = str_member(out, "id");
-    CHECK(pid == key.id);
+    std::string pid = str_of(out, "id");
+    CHECK(pid == pond.id);
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":" + std::to_string(pond::PROTOCOL) + ",\"features\":[]"));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":1,\"features\":[]"));
 
-    std::string ch;
-    {
-        Result r;
-        auto db = pool.get();
-        db->exec("SELECT id FROM channels WHERE name = 'general'", {}, &r);
-        ch = text(r.rows[0][0]);
-    }
+    std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";
     CHECK(until([&] { return has(ann.get(P), "\"display_name\":\"Ben\""); })); /* Ben joining reaches Ann as an event */
     CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"status\":\"connected\""); }));
@@ -275,15 +126,9 @@ int main()
     CHECK(ann.post(P + "/channels/999/messages/send", "{\"body\":\"lost\"}") == 404);
 
     /* ---- a channel made by the admin ---- */
-    CHECK(svc.channel_create("random", "anything goes", err));
+    CHECK(pond.ctl("channel create random --topic 'anything goes'") == 0);
     CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"name\":\"random\""); }));
-    std::string random;
-    {
-        Result r;
-        auto db = pool.get();
-        db->exec("SELECT id FROM channels WHERE name = 'random'", {}, &r);
-        random = text(r.rows[0][0]);
-    }
+    std::string random = pond.channel("random");
     CHECK(ben.post(P + "/channels/" + random + "/messages/send", "{\"body\":\"random thought\"}") == 200);
     CHECK(until([&] { return has(ann.get(P + "/channels/" + random + "/messages"), "random thought"); }));
 
@@ -293,18 +138,13 @@ int main()
     CHECK(ann.post(P + "/profile", "{\"profile\":\"nope\"}") == 404);
 
     /* ---- scrolling back past what a Puddle keeps ---- */
-    std::string archive;
-    {
-        /* a channel with history from before anyone was watching (no events), which the members then hear of */
-        Result r;
-        auto db = pool.get();
-        db->exec("INSERT INTO channels (name, position, created_ms) VALUES ('archive', 9, ?)", {now_ms()}, &r);
-        archive = std::to_string(r.insert_id);
-        for (int i = 1; i <= 120; i++)
-            db->exec("INSERT INTO messages (channel, author, text, ts_ms) VALUES (?, ?, ?, ?)",
-                     {r.insert_id, std::string(52, 'a'), "old " + std::to_string(i), now_ms()});
-    }
-    CHECK(svc.channel_topic("archive", "from before", err));
+    /* a channel with history from before anyone was watching (no events), which the members then hear of */
+    CHECK(db.sql("INSERT INTO channels (name, position, created_ms) VALUES ('archive', 9, 1)") == 0);
+    std::string archive = pond.channel("archive"), values;
+    for (int i = 1; i <= 120; i++)
+        values += std::string(i > 1 ? "," : "") + "(" + archive + ", '" + std::string(52, 'a') + "', 'old " + std::to_string(i) + "', 1)";
+    CHECK(db.sql("INSERT INTO messages (channel, author, text, ts_ms) VALUES " + values) == 0);
+    CHECK(pond.ctl("channel topic archive 'from before'") == 0);
     std::string A = P + "/channels/" + archive + "/messages";
     CHECK(until([&] { return has(ben.get(A), "old 120"); }));
     std::string page = ben.get(A);
@@ -328,10 +168,16 @@ int main()
     CHECK(has(ann.get(msgs), "hello, pond"));
     CHECK(until([&] { return has(ann.get(msgs), "while you were out"); }));
 
+    /* ---- the Pond restarting: its members wait, then carry on ---- */
+    pond.down();
+    CHECK(pond.up());
+    CHECK(ben.post(msgs + "/send", "{\"body\":\"after the restart\"}") == 200);
+    CHECK(until([&] { return has(ann.get(msgs), "after the restart"); }, 70000)); /* a follower backs off up to 60 s */
+
     /* ---- removed by the admin ---- */
-    char ben_id[PUDDLE_USER_ID_LEN + 1];
-    puddle_identity_id(puddle_server_identity(ben.srv), ben_id);
-    CHECK(svc.member_remove(ben_id, err));
+    std::string ben_id = str_of(ben.get(P), "me");
+    CHECK(ben_id.size() == 52);
+    CHECK(pond.ctl("member remove " + ben_id) == 0);
     CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"status\":\"removed\""); }));
     CHECK(until([&] { return !has(ann.get(P), ben_id); }));
     CHECK(ben.post(msgs + "/send", "{\"body\":\"am I still here\"}", &out) == 409 && has(out, "removed"));
@@ -342,23 +188,7 @@ int main()
     CHECK(ann.post(P + "/leave", "") == 204);
     CHECK(!has(ann.get("/api/v1/ponds"), pid));
     CHECK(ann.post(msgs + "/send", "{\"body\":\"gone\"}") == 404);
-    {
-        Result r;
-        auto db = pool.get();
-        db->exec("SELECT COUNT(*) FROM members WHERE left_ms IS NULL", {}, &r);
-        CHECK(num(r.rows[0][0]) == 0);
-    }
+    CHECK(db.sql("SELECT COUNT(*) FROM members WHERE left_ms IS NULL", &out) == 0 && out.rfind("0", 0) == 0);
 
-    ann.down();
-    ben.down();
-    listener.stop();
-    serving.join();
-    svc.stop();
-    watcher.join();
-    listener.drain();
-    if (failures)
-        fprintf(stderr, "%d failure(s)\n", failures);
-    else
-        printf("e2e_test: ok\n");
-    return failures ? 1 : 0;
+    return finish("e2e_test");
 }

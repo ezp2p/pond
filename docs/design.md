@@ -21,12 +21,16 @@ The Pond's own files live in `data_dir`. They are its key (`pond.key`, mode 0600
 (`cert.pem`, `key.pem`). The certificate is made self-signed on first start, as a Puddle does, unless the operator has
 put their own there.
 
-The code shares the Puddle's lower layers: request signatures, key chains, JSON, the HTTP parser and TLS. CMake builds
-them from the Puddle source pinned as the submodule `deps/puddle`, so each Pond commit builds against the Puddle commit
-it was made with, whatever the Puddle's own branches are doing. `scripts/build.sh --local` builds against a working
-checkout at `../puddle` instead, for changing both at once; the pin is then moved to the Puddle commit that was merged.
-This is only about building. A running Pond and a running Puddle depend on each other only through the protocol (see
-"Versions").
+The Pond is its own program and shares no code with Puddle. What the two must agree on is the protocol (see
+"Versions"), above all the parts that prove who a member is: key chains and request signatures. The Pond checks those
+in `src/identity.cpp` and `src/reqsig.cpp`, written from Puddle's documentation (its `docs/identity.md`, "The chain
+file", and `docs/streams.md`, "Request signatures"). `tests/identity_test.cpp` checks them on their own, and
+`tests/e2e_test.cpp` against real Puddles.
+
+It is built on Drogon: HTTPS on a few threads (`threads` in `pond.yaml`), with no thread per connection, so a request
+held open for events costs a socket and a little memory. Handlers are C++20 coroutines, and MariaDB is reached through
+Drogon's asynchronous client, so a request waiting on the database holds no thread either. CMake fetches Drogon at a
+fixed release and builds it with MariaDB and Redis support, with one small fix of ours (`patches/`).
 
 ## Who a Pond is
 
@@ -109,14 +113,19 @@ connection.
 Events are kept for 7 days. If a cursor is older than the oldest event kept, the answer is `{"reset": true}`, and the
 Puddle fetches `/info` and recent history again instead of replaying.
 
-Inside `pondd`, one thread checks the newest event number twice a second and wakes the waiting requests when it
+Inside `pondd`, a timer checks the newest event number twice a second and wakes the waiting requests when it
 changes. That way a change made by `pondctl`, or by another `pondd` later, is seen without anyone telling it.
+
+Events are committed in the order of their ids. Each transaction that adds one first locks the same row
+(`settings.event_lock`), and holds it until it commits. Without that, two transactions could commit out of order: a
+member could be handed event 11 while event 10 was still uncommitted, move its cursor past 10, and never see it.
 
 ## What the database holds
 
 | Table | Columns |
 |---|---|
-| `settings` | `name`, `value`: the Pond's name and description, and the schema version |
+| `settings` | `name`, `value`: the Pond's name and description, and `event_lock` (see "Events") |
+| `schema_version` | `version`: which of `db.cpp`'s steps have been run |
 | `channels` | `id`, `name`, `topic`, `position`, `created_ms`, `deleted` |
 | `members` | `id` (user id), `sign_pub`, `kid`, `chain`, `profile` (JSON), `joined_ms`, `left_ms` |
 | `invites` | `token`, `max_uses` (NULL = unlimited), `uses`, `expires_ms` (NULL = never), `created_ms`, `revoked` |
@@ -154,13 +163,19 @@ listen: 0.0.0.0           # where pondd listens
 port: 8443
 address: pond.example.org:8443   # what invite links say; port left off if 443
 data_dir: /var/lib/pond   # pond.key, cert.pem, key.pem
+threads: 0                # threads answering requests; 0 is one per CPU
+events_wait_ms: 25000     # how long a request for events is held open (the tests shorten it)
 database:
-  host: 127.0.0.1         # or socket: /path/to/mysql.sock
+  host: 127.0.0.1         # "localhost" is the client library's default Unix socket
   port: 3306
   user: pond
   password: secret
   name: pond
+  connections: 16
 ```
+
+Unknown settings are an error, so a typo is not silently ignored. Drogon's MariaDB client cannot be given a socket path:
+with `host: localhost` it uses the client library's default socket, and otherwise it connects over TCP.
 
 ## Versions
 
@@ -183,8 +198,8 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 - Requests that fail any check get `404`.
 - Bodies are up to 32 KiB. A profile is up to 16 KiB of JSON, and is stored as received, apart from that limit and
   being a JSON object.
-- At most 2000 connections are held at once, each with a thread. That is the main thing that stops one `pondd`
-  scaling far, and it is what Redis and several processes, or an event loop, will replace.
+- Connections are not limited by `pondd` beyond Drogon's default (100,000) and the open-file limit it is given. Each
+  member's Puddle holds one open nearly all the time.
 - Each member may send 5 messages a second, with bursts of up to 20.
 
 ## Not yet
@@ -198,4 +213,4 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 - A Pond changing its TLS certificate. The Puddle pins the one it saw at join, so a new certificate (for example a
   renewed Let's Encrypt one) makes the Pond unreachable until the member joins again. A signed announcement of the
   new certificate, like a Puddle's address record, will fix this.
-- Redis, several `pondd` processes, and an event loop instead of a thread per connection.
+- Redis, and several `pondd` processes. The client for Redis is already built in; nothing uses it yet.

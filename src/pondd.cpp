@@ -4,25 +4,17 @@
 #include "config.h"
 #include "db.h"
 #include "key.h"
-#include "listener.h"
 #include "pond.h"
 #include "routes.h"
+#include "tls.h"
 
-#include "base/log.h"
-#include "platform/process.h"
+#include <drogon/drogon.h>
 
 #include <cstdio>
 #include <cstring>
-#include <thread>
 
 using namespace pond;
-
-static Listener *g_listener;
-
-static void on_stop()
-{
-    g_listener->stop(); /* only wakes it: safe in a signal handler */
-}
+using namespace drogon;
 
 int main(int argc, char **argv)
 {
@@ -35,39 +27,53 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    /* each line as it is logged, also when stdout is a file or a pipe (a service manager's journal) */
+    trantor::Logger::setOutputFunction([](const char *msg, uint64_t len) { fwrite(msg, 1, len, stdout); }, [] { fflush(stdout); });
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     Config cfg;
     std::string err;
     PondKey key;
-    if (!load_config(path, cfg, err) || !load_key(cfg.data_dir, key, err)) {
+    if (!load_config(path, cfg, err) || !load_key(cfg.data_dir, key, err) || !ensure_certificate(cfg.data_dir, err)) {
         fprintf(stderr, "pondd: %s\n", err.c_str());
         return 1;
     }
-    Pool pool(cfg.db, 64);
-    {
-        auto db = pool.get();
-        if (!db || !migrate(*db, err)) {
-            fprintf(stderr, "pondd: %s\n", db ? err.c_str() : "cannot reach the database");
-            return 1;
-        }
-    }
-    Service svc(pool, key);
-    Routes routes(svc);
-    Listener listener;
-    if (!listener.open(cfg.listen, cfg.port, cfg.data_dir, routes.handler(), err)) {
+    DbPtr db = connect_db(cfg.db);
+    if (!migrate(db, err)) {
         fprintf(stderr, "pondd: %s\n", err.c_str());
         return 1;
     }
-    g_listener = &listener;
-    puddle_ignore_broken_pipe();
-    puddle_on_stop_signal(on_stop);
 
-    std::thread watcher([&] { svc.watch(); });
-    puddle_log(PUDDLE_LOG_INFO, "Pond %s listening on %s:%u (certificate %s)", key.id.c_str(), cfg.listen.c_str(), cfg.port,
-               listener.fingerprint.c_str());
-    listener.run();
-    puddle_log(PUDDLE_LOG_INFO, "stopping");
-    svc.stop(); /* answers everyone waiting for events */
-    watcher.join();
-    listener.drain();
+    Service svc(db, key, app().getLoop());
+    svc.wait_ms = cfg.events_wait_ms;
+    Routes routes(svc);
+    /* every request goes to the routes, whatever its path and method, so that nothing is answered differently from an
+     * unknown path (no 405s) */
+    app().registerHandlerViaRegex(
+        "/.*", [&routes](HttpRequestPtr req) -> Task<HttpResponsePtr> { co_return co_await routes.handle(std::move(req)); },
+        {Get, Post, Put, Delete, Patch, Options, Head});
+    app().setCustom404Page(Routes::not_found(), false);
+
+    auto stop = [&svc] {
+        LOG_INFO << "stopping";
+        svc.stop(); /* answers everyone waiting for events, then gives the answers a moment to go out */
+        app().getLoop()->runAfter(0.3, [] { app().quit(); });
+    };
+    std::string cert = cfg.data_dir + "/cert.pem";
+    app()
+        .setLogLevel(trantor::Logger::kInfo)
+        .addListener(cfg.listen, (uint16_t)cfg.port, true, cert, cfg.data_dir + "/key.pem")
+        .setThreadNum(cfg.threads)
+        .enableServerHeader(false)
+        .setClientMaxBodySize(1 << 20) /* the routes refuse more than 32 KiB, with the same 404 as anything else */
+        .setClientMaxMemoryBodySize(1 << 20)
+        .setIdleConnectionTimeout(120)
+        .setTermSignalHandler(stop)
+        .setIntSignalHandler(stop);
+    app().getLoop()->queueInLoop([&] {
+        svc.watch();
+        LOG_INFO << "Pond " << key.id << " listening on " << cfg.listen << ":" << cfg.port << " (certificate "
+                 << certificate_fingerprint(cert) << ")";
+    });
+    app().run();
     return 0;
 }

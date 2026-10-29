@@ -1,240 +1,191 @@
-/* The Pond's routes against a real MariaDB, with requests signed by real Puddle identities: joining with invites of each kind,
- * channels, messages, waiting for events, leaving and being removed, and that every failed check looks like an unknown path. */
+/* A real pondd against a real MariaDB, with requests signed by member identities (harness.h): joining with invites of each
+ * kind, channels, messages, waiting for events, leaving and being removed, and that every failed check looks like an unknown
+ * path. The admin's side is pondctl. */
 
-#include "testdb.h"
-
-#include "db.h"
-#include "key.h"
-#include "pond.h"
-#include "routes.h"
-
-#include "base/json.h"
-#include "core/identity.h"
-#include "http/reqsig.h"
-
-#include <chrono>
-#include <thread>
+#include "harness.h"
 
 using namespace pond;
 
-static std::string root;
-
-static puddle_identity *make_identity(const char *name)
-{
-    char phrase[PUDDLE_PHRASE_LEN + 1], err[300];
-    std::string dir = root + "/" + name;
-    puddle_identity *id = puddle_identity_create(dir.c_str(), phrase, err, sizeof err);
-    if (!id) {
-        fprintf(stderr, "cannot make %s: %s\n", name, err);
-        exit(2);
-    }
-    puddle_identity_confirm(dir.c_str());
-    return id;
-}
-
-static std::string id_of(puddle_identity *p)
-{
-    char id[PUDDLE_USER_ID_LEN + 1];
-    puddle_identity_id(p, id);
-    return id;
-}
-
-static std::string chain_of(puddle_identity *p)
-{
-    size_t len;
-    char *c = puddle_identity_chain(p, &len);
-    std::string s(c, len);
-    free(c);
-    return s;
-}
-
-/* A request from `who`, signed for `to` (the Pond's id, or "*"), straight to the routes. */
-static Answer call(Routes &r, puddle_identity *who, const char *method, const std::string &target, const std::string &body,
-                   const std::string &to)
-{
-    puddle_request req = {};
-    snprintf(req.method, sizeof req.method, "%s", method);
-    snprintf(req.target, sizeof req.target, "%s", target.c_str());
-    snprintf(req.path, sizeof req.path, "%.*s", (int)target.find('?'), target.c_str());
-    req.content_length = body.size();
-    if (who)
-        puddle_reqsig_sign(who, method, target.c_str(), body.data(), body.size(), to.c_str(), 0, req.signature, sizeof req.signature);
-    return r.handle(req, (const unsigned char *)body.c_str(), body.size());
-}
-
-static std::string join_body(puddle_identity *who, const std::string &invite, const char *name)
+static std::string join_body(const Identity &who, const std::string &invite, const char *name)
 {
     std::string profile = name ? std::string("{\"display_name\":\"") + name + "\"}" : "null";
-    return "{\"invite\":" + jstr(invite) + ",\"chain\":" + jstr(chain_of(who)) + ",\"profile\":" + profile + "}";
+    return "{\"invite\":" + jstr(invite) + ",\"chain\":" + jstr(who.chain) + ",\"profile\":" + profile + "}";
 }
 
-static int64_t member_num(const std::string &json, const char *key)
+/* The token in the link `pondctl invite create` prints. */
+static std::string invite(PondProc &p, const std::string &args)
 {
-    puddle_span v;
-    int64_t n = -1;
-    if (puddle_json_member(json.data(), json.size(), key, &v) == 0)
-        puddle_json_int64(v, &n);
-    return n;
-}
-
-static bool has(const std::string &s, const std::string &part)
-{
-    return s.find(part) != std::string::npos;
+    std::string out;
+    p.ctl("invite create " + args + " 2>/dev/null", &out);
+    size_t at = out.find("invite=");
+    return at == std::string::npos ? "" : out.substr(at + 7, 26);
 }
 
 int main()
 {
-    TestDb tdb;
-    if (!tdb.start()) {
+    TestDb db;
+    if (!db.start()) {
         fprintf(stderr, "cannot start a MariaDB for the test\n");
         return 1;
     }
-    root = tdb.dir;
-    std::string err;
-    PondKey key;
-    CHECK(create_key(root + "/pond", key, err));
-    CHECK(!create_key(root + "/pond", key, err)); /* never a second key */
-    PondKey again;
-    CHECK(load_key(root + "/pond", again, err) && again.id == key.id && key.id.size() == 52);
+    PondProc pond(db);
+    CHECK(pond.init("Test Pond", 300));
+    std::string out;
+    CHECK(pond.ctl("init Again", &out) != 0 && has(out, "already has a key")); /* never a second key */
+    CHECK(pond.ctl("channel create general", &out) != 0 && has(out, "already a channel")); /* init made it */
+    CHECK(pond.ctl("channel create 'Bad Name'") != 0);
+    std::string two = invite(pond, "--uses 2"), forever = invite(pond, ""), soon = invite(pond, "--expires 1m");
+    CHECK(two.size() == 26 && forever.size() == 26 && soon.size() == 26);
+    CHECK(db.sql("UPDATE invites SET expires_ms = 1 WHERE token = '" + soon + "'") == 0); /* as if a minute had passed */
+    CHECK(pond.up());
+    const std::string P = pond.id;
 
-    Pool pool(tdb.cfg, 8);
-    {
-        auto db = pool.get();
-        CHECK(db && migrate(*db, err));
-        CHECK(migrate(*db, err)); /* twice is harmless */
-    }
-    Service svc(pool, key);
-    svc.wait_ms = 300;
-    std::thread watcher([&] { svc.watch(); });
-    Routes routes(svc);
-    const std::string P = key.id;
-
-    CHECK(svc.set_name("Test Pond", nullptr, err));
-    CHECK(svc.channel_create("general", "", err));
-    CHECK(!svc.channel_create("general", "", err)); /* names are unique */
-    CHECK(!svc.channel_create("Bad Name", "", err));
-    std::string two, forever, expired;
-    CHECK(svc.invite_create(2, 0, two, err));
-    CHECK(svc.invite_create(0, 0, forever, err));
-    CHECK(svc.invite_create(0, now_ms() - 1000, expired, err));
-
-    puddle_identity *ann = make_identity("ann"), *ben = make_identity("ben"), *cat = make_identity("cat"), *dan = make_identity("dan");
+    Identity ann, ben, cat, dan;
 
     /* ---- joining ---- */
-    CHECK(call(routes, ann, "POST", "/pond/v1/join", join_body(ann, "aaaaaaaaaaaaaaaaaaaaaaaaaa", "Ann"), "*").status == -1);
-    CHECK(call(routes, ann, "POST", "/pond/v1/join", join_body(ann, expired, "Ann"), "*").status == -1);
-    CHECK(call(routes, ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), P).status == -1); /* a first request is signed for "*" */
-    CHECK(call(routes, nullptr, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), "*").status == -1); /* unsigned */
-    CHECK(call(routes, ben, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), "*").status == -1);   /* someone else's chain */
-    CHECK(call(routes, ann, "GET", "/pond/v1/info", "", P).status == -1);                               /* not a member yet */
+    CHECK(pond.call(&ann, "POST", "/pond/v1/join", join_body(ann, "aaaaaaaaaaaaaaaaaaaaaaaaaa", "Ann"), "*").status == 404);
+    CHECK(pond.call(&ann, "POST", "/pond/v1/join", join_body(ann, soon, "Ann"), "*").status == 404); /* expired */
+    CHECK(pond.call(&ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), P).status == 404); /* a first request is signed for "*" */
+    CHECK(pond.call(nullptr, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), "*").status == 404); /* unsigned */
+    CHECK(pond.call(&ben, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), "*").status == 404);   /* someone else's chain */
+    Reply a = pond.call(&ann, "GET", "/pond/v1/info");
+    CHECK(a.status == 404 && a.body == "{\"error\":\"not_found\"}"); /* not a member yet: just like a path that isn't there */
 
-    Answer a = call(routes, ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), "*");
+    a = pond.call(&ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), "*");
     CHECK(a.status == 200);
-    CHECK(has(a.body, "\"name\":\"Test Pond\"") && has(a.body, "\"name\":\"general\"") && has(a.body, id_of(ann)) &&
+    CHECK(has(a.body, "\"name\":\"Test Pond\"") && has(a.body, "\"name\":\"general\"") && has(a.body, ann.id) &&
           has(a.body, "\"display_name\":\"Ann\""));
-    CHECK(call(routes, ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann B"), "*").status == 200); /* again: spends nothing */
-    CHECK(call(routes, ben, "POST", "/pond/v1/join", join_body(ben, two, "Ben"), "*").status == 200);   /* the second use */
-    CHECK(call(routes, cat, "POST", "/pond/v1/join", join_body(cat, two, "Cat"), "*").status == -1);    /* used up */
-    CHECK(call(routes, cat, "POST", "/pond/v1/join", join_body(cat, forever, nullptr), "*").status == 200);
-    CHECK(svc.invite_revoke(forever, err));
-    CHECK(call(routes, dan, "POST", "/pond/v1/join", join_body(dan, forever, "Dan"), "*").status == -1); /* revoked */
+    CHECK(pond.call(&ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann B"), "*").status == 200); /* again: spends nothing */
+    CHECK(pond.call(&ben, "POST", "/pond/v1/join", join_body(ben, two, "Ben"), "*").status == 200);   /* the second use */
+    CHECK(pond.call(&cat, "POST", "/pond/v1/join", join_body(cat, two, "Cat"), "*").status == 404);   /* used up */
+    CHECK(pond.call(&cat, "POST", "/pond/v1/join", join_body(cat, forever, nullptr), "*").status == 200);
+    CHECK(pond.ctl("invite revoke " + forever) == 0);
+    CHECK(pond.call(&dan, "POST", "/pond/v1/join", join_body(dan, forever, "Dan"), "*").status == 404); /* revoked */
+    CHECK(pond.ctl("invite list", &out) == 0 && has(out, "used up") && has(out, "revoked") && has(out, "expired"));
 
-    a = call(routes, ann, "GET", "/pond/v1/info", "", P);
+    a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(member_num(a.body, "protocol") == pond::PROTOCOL && has(a.body, "\"features\":[]"));
-    int64_t cursor = member_num(a.body, "cursor");
+    CHECK(num_of(a.body, "protocol") == 1 && has(a.body, "\"features\":[]"));
+    int64_t cursor = num_of(a.body, "cursor");
     CHECK(cursor > 0);
-    a = call(routes, ann, "GET", "/pond/v1/members", "", P);
-    CHECK(a.status == 200 && has(a.body, id_of(ben)) && has(a.body, id_of(cat)) && !has(a.body, id_of(dan)));
+    a = pond.call(&ann, "GET", "/pond/v1/members");
+    CHECK(a.status == 200 && has(a.body, ben.id) && has(a.body, cat.id) && !has(a.body, dan.id));
+    CHECK(pond.ctl("member list", &out) == 0 && has(out, "Ann B") && has(out, "(no profile)"));
 
     /* ---- messages ---- */
-    std::string ch = "1";
-    {
-        Result r;
-        auto db = pool.get();
-        db->exec("SELECT id FROM channels WHERE name = 'general'", {}, &r);
-        ch = text(r.rows[0][0]);
-    }
+    std::string ch = pond.channel("general");
     std::string send = "/pond/v1/channels/" + ch + "/send";
-    a = call(routes, ann, "POST", send, "{\"text\":\"  hello, pond  \",\"nonce\":\"n1\"}", P);
-    CHECK(a.status == 200 && has(a.body, "\"text\":\"hello, pond\"") && has(a.body, id_of(ann)));
-    int64_t first = member_num(a.body, "id");
-    Answer dup = call(routes, ann, "POST", send, "{\"text\":\"hello, pond\",\"nonce\":\"n1\"}", P);
-    CHECK(dup.status == 200 && member_num(dup.body, "id") == first); /* the same nonce posts nothing new */
-    CHECK(call(routes, ben, "POST", send, "{\"text\":\"hi ann\\nhow are you\"}", P).status == 200);
-    CHECK(call(routes, ben, "POST", send, "{\"text\":\"   \"}", P).status == 400);
-    CHECK(call(routes, ben, "POST", send, "{\"text\":\"" + std::string(4001, 'x') + "\"}", P).status == 400);
-    CHECK(call(routes, ben, "POST", "/pond/v1/channels/999/send", "{\"text\":\"lost\"}", P).status == 404);
-    CHECK(call(routes, dan, "POST", send, "{\"text\":\"let me in\"}", P).status == -1);
+    a = pond.call(&ann, "POST", send, "{\"text\":\"  hello, pond  \",\"nonce\":\"n1\"}");
+    CHECK(a.status == 200 && has(a.body, "\"text\":\"hello, pond\"") && has(a.body, ann.id));
+    int64_t first = num_of(a.body, "id");
+    Reply dup = pond.call(&ann, "POST", send, "{\"text\":\"hello, pond\",\"nonce\":\"n1\"}");
+    CHECK(dup.status == 200 && num_of(dup.body, "id") == first); /* the same nonce posts nothing new */
+    CHECK(pond.call(&ben, "POST", send, "{\"text\":\"hi ann\\nhow are you\"}").status == 200);
+    CHECK(pond.call(&ben, "POST", send, "{\"text\":\"   \"}").status == 400);
+    CHECK(pond.call(&ben, "POST", send, "{\"text\":\"" + std::string(4001, 'x') + "\"}").status == 400);
+    CHECK(pond.call(&ben, "POST", send, "{\"text\":42}").status == 400);
+    CHECK(pond.call(&ben, "POST", send, "not json").status == 400);
+    CHECK(pond.call(&ben, "POST", "/pond/v1/channels/999/send", "{\"text\":\"lost\"}").status == 404);
+    CHECK(pond.call(&dan, "POST", send, "{\"text\":\"let me in\"}").status == 404);
 
-    a = call(routes, cat, "GET", "/pond/v1/channels/" + ch + "/messages", "", P);
+    a = pond.call(&cat, "GET", "/pond/v1/channels/" + ch + "/messages");
     CHECK(a.status == 200 && has(a.body, "hi ann\\nhow are you") && a.body.find("hi ann") < a.body.find("hello, pond")); /* newest first */
-    a = call(routes, cat, "GET", "/pond/v1/channels/" + ch + "/messages?limit=1", "", P);
+    a = pond.call(&cat, "GET", "/pond/v1/channels/" + ch + "/messages?limit=1");
     CHECK(a.status == 200 && !has(a.body, "hello, pond"));
-    a = call(routes, cat, "GET", "/pond/v1/channels/" + ch + "/messages?before=" + std::to_string(first + 1), "", P);
+    a = pond.call(&cat, "GET", "/pond/v1/channels/" + ch + "/messages?before=" + std::to_string(first + 1));
     CHECK(a.status == 200 && has(a.body, "hello, pond") && !has(a.body, "hi ann"));
-    CHECK(call(routes, cat, "GET", "/pond/v1/channels/" + ch + "/messages?limit=101", "", P).status == 400);
-    CHECK(call(routes, cat, "GET", "/pond/v1/channels/" + ch + "/messages?sort=up", "", P).status == 400);
+    CHECK(pond.call(&cat, "GET", "/pond/v1/channels/" + ch + "/messages?limit=101").status == 400);
+    CHECK(pond.call(&cat, "GET", "/pond/v1/channels/" + ch + "/messages?sort=up").status == 400);
+    CHECK(pond.call(&cat, "GET", "/pond/v1/channels/" + ch + "/messages?limit=1&limit=2").status == 400);
+
+    /* a burst past the limit is told to slow down */
+    int slowed = 0;
+    for (int i = 0; i < 30; i++)
+        slowed += pond.call(&cat, "POST", send, "{\"text\":\"spam " + std::to_string(i) + "\"}").status == 429;
+    CHECK(slowed > 0);
 
     /* ---- events ---- */
-    a = call(routes, cat, "GET", "/pond/v1/events?after=" + std::to_string(cursor), "", P);
+    a = pond.call(&cat, "GET", "/pond/v1/events?after=" + std::to_string(cursor));
     CHECK(a.status == 200 && has(a.body, "\"kind\":\"message\"") && has(a.body, "hello, pond") && has(a.body, "how are you"));
-    int64_t next = member_num(a.body, "cursor");
+    int64_t next = num_of(a.body, "cursor");
     CHECK(next > cursor);
+    a = pond.call(&cat, "GET", "/pond/v1/events?after=" + std::to_string(next));
+    while (a.status == 200 && !has(a.body, "\"events\":[]")) { /* the spam above, a page at a time */
+        next = num_of(a.body, "cursor");
+        a = pond.call(&cat, "GET", "/pond/v1/events?after=" + std::to_string(next));
+    }
     auto t0 = std::chrono::steady_clock::now();
-    a = call(routes, cat, "GET", "/pond/v1/events?after=" + std::to_string(next), "", P);
+    a = pond.call(&cat, "GET", "/pond/v1/events?after=" + std::to_string(next));
     auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     CHECK(a.status == 200 && has(a.body, "\"events\":[]") && waited >= 250); /* held, then empty */
 
     /* a request that is waiting is answered as soon as something happens, here from the admin's side */
-    Answer woke;
-    std::thread waiter([&] {
-        svc.wait_ms = 5000;
-        woke = call(routes, cat, "GET", "/pond/v1/events?after=" + std::to_string(next), "", P);
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    pond.down();
+    CHECK(run("sed -i '' 's/events_wait_ms: 300/events_wait_ms: 5000/' " + pond.conf) == 0);
+    CHECK(pond.up());
+    Reply woke;
+    std::thread waiter([&] { woke = pond.call(&cat, "GET", "/pond/v1/events?after=" + std::to_string(next)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
     t0 = std::chrono::steady_clock::now();
-    CHECK(svc.channel_create("random", "chat", err));
+    CHECK(pond.ctl("channel create random --topic chat") == 0);
     waiter.join();
     waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     CHECK(woke.status == 200 && has(woke.body, "\"kind\":\"channel\"") && has(woke.body, "\"name\":\"random\"") && waited < 2000);
-    svc.wait_ms = 300;
-    next = member_num(woke.body, "cursor");
-    CHECK(svc.channel_rename("random", "off-topic", err));
-    CHECK(svc.channel_delete("off-topic", err));
-    a = call(routes, cat, "GET", "/pond/v1/events?after=" + std::to_string(next), "", P);
-    CHECK(has(a.body, "off-topic") && has(a.body, "channel_deleted"));
+    next = num_of(woke.body, "cursor");
+    CHECK(pond.ctl("channel rename random off-topic") == 0);
+    CHECK(pond.ctl("channel delete off-topic") == 0);
+    CHECK(pond.ctl("channel delete off-topic") != 0);
+    CHECK(until([&] {
+        a = pond.call(&cat, "GET", "/pond/v1/events?after=" + std::to_string(next));
+        return has(a.body, "off-topic") && has(a.body, "channel_deleted");
+    }));
 
     /* ---- profiles, leaving, removing ---- */
-    CHECK(call(routes, ben, "POST", "/pond/v1/profile", "{\"profile\":{\"display_name\":\"Benjamin\"}}", P).status == 204);
-    CHECK(call(routes, ben, "POST", "/pond/v1/profile", "{\"profile\":\"not an object\"}", P).status == 400);
-    CHECK(has(call(routes, ann, "GET", "/pond/v1/members", "", P).body, "Benjamin"));
-    CHECK(call(routes, ben, "POST", "/pond/v1/leave", "", P).status == 204);
-    CHECK(call(routes, ben, "GET", "/pond/v1/info", "", P).status == -1);
-    CHECK(!has(call(routes, ann, "GET", "/pond/v1/members", "", P).body, id_of(ben)));
-    CHECK(svc.member_remove(id_of(cat), err));
-    CHECK(!svc.member_remove(id_of(cat), err));
-    CHECK(call(routes, cat, "GET", "/pond/v1/info", "", P).status == -1);
-    a = call(routes, ann, "GET", "/pond/v1/channels/" + ch + "/messages", "", P);
+    CHECK(pond.call(&ben, "POST", "/pond/v1/profile", "{\"profile\":{\"display_name\":\"Benjamin\"}}").status == 204);
+    CHECK(pond.call(&ben, "POST", "/pond/v1/profile", "{\"profile\":\"not an object\"}").status == 400);
+    CHECK(has(pond.call(&ann, "GET", "/pond/v1/members").body, "{\"display_name\":\"Benjamin\"}")); /* kept as sent */
+    CHECK(pond.call(&ben, "POST", "/pond/v1/leave").status == 204);
+    CHECK(pond.call(&ben, "GET", "/pond/v1/info").status == 404);
+    CHECK(!has(pond.call(&ann, "GET", "/pond/v1/members").body, ben.id));
+    CHECK(pond.ctl("member remove " + cat.id) == 0);
+    CHECK(pond.ctl("member remove " + cat.id) != 0);
+    CHECK(pond.call(&cat, "GET", "/pond/v1/info").status == 404);
+    a = pond.call(&ann, "GET", "/pond/v1/channels/" + ch + "/messages");
     CHECK(has(a.body, "how are you")); /* what they said stays */
 
     /* ---- keys ---- */
-    CHECK(call(routes, ann, "POST", "/pond/v1/keys", "{\"chain\":" + jstr(chain_of(ann)) + "}", P).status == 204);
-    CHECK(call(routes, dan, "POST", "/pond/v1/keys", "{\"chain\":" + jstr(chain_of(dan)) + "}", P).status == -1);
+    Identity before = ann;
+    ann.roll_keys();
+    CHECK(pond.call(&before, "GET", "/pond/v1/info").status == 200);
+    CHECK(pond.call(&ann, "GET", "/pond/v1/info").status == 404); /* not until the Pond hears of the new key */
+    CHECK(pond.call(&ann, "POST", "/pond/v1/keys", "{\"chain\":" + jstr(ann.chain) + "}").status == 204);
+    CHECK(pond.call(&ann, "GET", "/pond/v1/info").status == 200);
+    CHECK(pond.call(&before, "GET", "/pond/v1/info").status == 404); /* a retired key starts nothing */
+    CHECK(pond.call(&ann, "POST", "/pond/v1/keys", "{\"chain\":" + jstr(before.chain) + "}").status == 404); /* not by its own key */
+    CHECK(pond.call(&dan, "POST", "/pond/v1/keys", "{\"chain\":" + jstr(dan.chain) + "}").status == 404);   /* not a member */
 
     /* ---- what nobody may ask ---- */
-    CHECK(call(routes, ann, "GET", "/pond/v1/nothing", "", P).status == -1);
-    CHECK(call(routes, ann, "POST", "/pond/v1/info", "", P).status == -1);
-    CHECK(call(routes, ann, "GET", "/pond/v1/channels/01/messages", "", P).status == -1);
-    CHECK(call(routes, ann, "GET", "/pond/v1/info", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").status == -1); /* another Pond */
+    CHECK(pond.call(&ann, "GET", "/pond/v1/nothing").status == 404);
+    CHECK(pond.call(&ann, "POST", "/pond/v1/info").status == 404);
+    CHECK(pond.call(&ann, "DELETE", "/pond/v1/info").status == 404); /* not 405 */
+    CHECK(pond.call(&ann, "GET", "/pond/v1/channels/01/messages").status == 404);
+    CHECK(pond.call(&ann, "GET", "/").status == 404);
+    CHECK(pond.call(&ann, "GET", "/pond/v1/info", "", std::string(52, 'a')).status == 404); /* signed for another Pond */
+    a = pond.call(&ann, "GET", "/pond/v1/info", "", "", -10 * 60 * 1000);
+    CHECK(a.status == 401 && has(a.body, "clock_skew")); /* a member may be told their clock is off */
+    std::string sig = ann.signature("GET", "/pond/v1/info", "", P);
+    CHECK(https(pond.port, "GET", "/pond/v1/info", "", {"X-Puddle-Signature: " + sig}).status == 200);
+    a = https(pond.port, "GET", "/pond/v1/info", "", {"X-Puddle-Signature: " + sig});
+    CHECK(a.status == 401 && has(a.body, "replayed"));
 
-    svc.stop();
-    watcher.join();
-    for (auto *p : {ann, ben, cat, dan})
-        puddle_identity_close(p);
-    if (failures)
-        fprintf(stderr, "%d failure(s)\n", failures);
-    else
-        printf("pond_test: ok\n");
-    return failures ? 1 : 0;
+    /* ---- stopping answers everyone waiting ---- */
+    std::thread held([&] { woke = pond.call(&ann, "GET", "/pond/v1/events?after=999999"); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    t0 = std::chrono::steady_clock::now();
+    pond.down();
+    held.join();
+    waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(woke.status == 200 && has(woke.body, "\"events\":[]") && waited < 2000);
+
+    return finish("pond_test");
 }

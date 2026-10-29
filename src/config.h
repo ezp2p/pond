@@ -8,12 +8,12 @@
 namespace pond {
 
 struct DbConfig {
-    std::string host = "127.0.0.1";
+    std::string host = "127.0.0.1"; /* "localhost" means the client library's default Unix socket */
     unsigned port = 3306;
-    std::string socket; /* a Unix socket instead of host and port */
     std::string user = "pond";
     std::string password;
     std::string name = "pond";
+    unsigned connections = 16;
 };
 
 struct Config {
@@ -21,6 +21,8 @@ struct Config {
     unsigned port = 8443;
     std::string address; /* host[:port] for invite links; "" = listen:port */
     std::string data_dir;
+    unsigned threads = 0;       /* threads answering requests; 0 = one per CPU */
+    int events_wait_ms = 25000; /* how long a request for events is held open */
     DbConfig db;
 };
 

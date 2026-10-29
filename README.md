@@ -8,15 +8,18 @@ Puddle. The design is in [docs/design.md](docs/design.md) and the routes in [api
 
 ## Build
 
-It needs MariaDB (the server, and its C client) and OpenSSL 3. It shares the Puddle's lower layers, pinned as the submodule
-`deps/puddle` (clone with `--recurse-submodules`; `scripts/build.sh` fetches it if missing). To change the Puddle and the Pond
-together, build against a working checkout beside this one with `scripts/build.sh --local` (`../puddle`), and when done move
-the pin: `git -C deps/puddle checkout <commit>` and commit `deps/puddle`.
+It is C++20, built on [Drogon](https://github.com/drogonframework/drogon), which CMake fetches and builds the first time
+(a few minutes). It needs MariaDB (the server, and its C client), OpenSSL 3 or later, hiredis, jsoncpp and yaml-cpp. It
+shares no code with Puddle.
 
 ```sh
-brew install mariadb openssl@3 libyaml     # or: apt install mariadb-server libmariadb-dev libssl-dev libyaml-dev
-scripts/build.sh                           # builds and runs the tests (each test starts a throwaway MariaDB)
+brew install mariadb openssl hiredis jsoncpp yaml-cpp
+# or: apt install mariadb-server libmariadb-dev libssl-dev libhiredis-dev libjsoncpp-dev libyaml-cpp-dev uuid-dev zlib1g-dev
+scripts/build.sh                           # builds and runs the tests (each test starts a throwaway MariaDB and pondd)
 ```
+
+The end-to-end test also needs a built Puddle to join the Pond with: it looks for `../puddle/build/puddled` (set
+`-DPUDDLED=` for another), and is skipped without one.
 
 ## Run
 

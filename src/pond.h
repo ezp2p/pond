@@ -2,22 +2,28 @@
 
 /* What a Pond does, apart from HTTP: members joining and leaving, channels, messages, invites and the event log that members'
  * Puddles follow (docs/design.md). pondd's routes call it for members; pondctl calls it for the admin. Every answer is JSON
- * text, in the shapes api/pond.yaml gives. */
+ * text, in the shapes api/pond.yaml gives. Everything that touches the database is a coroutine, awaited (co_await, or
+ * drogon::sync_wait in pondctl). */
 
 #include "db.h"
 #include "key.h"
+#include "ratelimit.h"
+
+#include <drogon/utils/coroutine.h>
+#include <trantor/net/EventLoop.h>
 
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
-typedef struct puddle_keyed puddle_keyed;
-
 namespace pond {
+
+using drogon::Task;
 
 constexpr size_t TEXT_MAX = 4000;        /* characters in a message */
 constexpr size_t TOPIC_MAX = 1024;
@@ -27,7 +33,6 @@ constexpr size_t PROFILE_MAX = 16 * 1024;
 constexpr int HISTORY_DEFAULT = 50, HISTORY_MAX = 100;
 constexpr int EVENTS_MAX = 200;
 constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
-constexpr int WAIT_MS = 25 * 1000;       /* how long a request for events is held open */
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has, none yet. */
@@ -39,11 +44,9 @@ int64_t now_ms();
 /* A channel name: 1 to 32 of a-z, 0-9 and '-'. */
 bool channel_name_ok(const std::string &s);
 
-/* A new invite token: 26 characters of base32. */
+/* An invite token: 26 characters of base32. */
 std::string new_token();
-
-/* `s` as a JSON string, quotes included. */
-std::string jstr(const std::string &s);
+bool token_ok(const std::string &s);
 
 /* What a handler answers: an HTTP status, and a JSON body ("" for none). */
 struct Answer {
@@ -52,7 +55,7 @@ struct Answer {
 };
 Answer fail(int status, const char *code);
 
-/* A member's Puddle's key chain, checked (puddle_chain_verify). */
+/* A member's Puddle's key chain, checked (verify_chain). */
 struct Chain {
     std::string id;
     std::string sign_pub_hex, kid;
@@ -60,67 +63,76 @@ struct Chain {
     std::string text;
 };
 
+/* What an admin action did: "" if it worked, else why not. */
+using Outcome = std::string;
+
 class Service {
 public:
-    Service(Pool &pool, PondKey key);
-    ~Service();
+    /* `timers` runs the waits for events and the watch; it must be running while those are used (pondd's main loop). */
+    Service(DbPtr db, PondKey key, trantor::EventLoop *timers = nullptr);
     const PondKey &key() const { return key_; }
-    int wait_ms = WAIT_MS; /* how long events() holds a request; tests shorten it */
+    int wait_ms = 25000; /* how long events() holds a request */
 
     /* ---- for the routes ---- */
 
     /* The current signing key of the member `id`, if `kid` names it (the request signature check). */
-    bool member_key(const std::string &id, const std::string &kid, unsigned char pub[32]);
-    bool is_member(const std::string &id);
+    Task<std::optional<std::array<unsigned char, 32>>> member_key(std::string id, std::string kid);
+    Task<bool> is_member(std::string id);
 
     /* `profile` is the JSON object, or "" for none. */
-    Answer join(const Chain &chain, const std::string &invite, const std::string &profile);
-    Answer keys(const std::string &member, const Chain &chain);
-    Answer info(const std::string &member);
-    Answer history(const std::string &channel, int64_t before, int limit);
-    Answer send(const std::string &member, const std::string &channel, const std::string &text, const std::string &nonce);
-    /* Holds the caller until there is something after `after`, `WAIT_MS` pass, or stop(). */
-    Answer events(int64_t after);
-    Answer members();
-    Answer set_profile(const std::string &member, const std::string &profile);
-    Answer leave(const std::string &member);
+    Task<Answer> join(Chain chain, std::string invite, std::string profile);
+    Task<Answer> keys(std::string member, Chain chain);
+    Task<Answer> info(std::string member);
+    Task<Answer> history(int64_t channel, int64_t before, int limit);
+    Task<Answer> send(std::string member, int64_t channel, std::string text, std::string nonce);
+    /* Answers when there is something after `after`, `wait_ms` pass, or stop(). */
+    Task<Answer> events(int64_t after);
+    Task<Answer> members();
+    Task<Answer> set_profile(std::string member, std::string profile);
+    Task<Answer> leave(std::string member);
 
-    /* ---- for pondctl: false with the reason in `err` ---- */
+    /* ---- for pondctl ---- */
 
-    bool set_name(const std::string &name, const std::string *description, std::string &err);
-    bool channel_create(const std::string &name, const std::string &topic, std::string &err);
-    bool channel_rename(const std::string &name, const std::string &to, std::string &err);
-    bool channel_topic(const std::string &name, const std::string &topic, std::string &err);
-    bool channel_delete(const std::string &name, std::string &err);
+    Task<Outcome> set_name(std::string name, std::optional<std::string> description);
+    Task<Outcome> channel_create(std::string name, std::string topic);
+    Task<Outcome> channel_rename(std::string name, std::string to);
+    Task<Outcome> channel_topic(std::string name, std::string topic);
+    Task<Outcome> channel_delete(std::string name);
     /* `max_uses` 0 = unlimited, `expires_ms` 0 = never. The token made is in `token`. */
-    bool invite_create(int max_uses, int64_t expires_ms, std::string &token, std::string &err);
-    bool invite_revoke(const std::string &token, std::string &err);
-    bool member_remove(const std::string &id, std::string &err);
-    std::string setting(const std::string &name);
+    Task<Outcome> invite_create(int max_uses, int64_t expires_ms, std::shared_ptr<std::string> token);
+    Task<Outcome> invite_revoke(std::string token);
+    Task<Outcome> member_remove(std::string id);
+    Task<std::string> setting(std::string name);
 
     /* ---- the event log ---- */
 
-    /* Watch the newest event number twice a second, so a change made by pondctl or another process wakes those waiting; and
-     * forget events past EVENTS_KEEP_MS once an hour. Runs until stop(). */
+    /* Check the newest event number twice a second, so a change made by pondctl or another process wakes those waiting; and
+     * forget events past EVENTS_KEEP_MS once an hour. Runs on `timers` until stop(). */
     void watch();
+    /* Answer everyone waiting, and stop watching. */
     void stop();
 
 private:
-    Answer enter(const Chain &chain, const std::string &invite, const std::string &profile);
-    bool add_event(Db &db, const char *kind, const std::string &data);
+    struct Waiter;
+    struct News;
+    Task<Answer> enter(Chain chain, std::string invite, std::string profile);
+    Task<int64_t> add_event(const TxPtr &tx, const char *kind, const std::string &data);
+    Task<std::string> member_json_of(const DbPtr &db, const std::string &id);
+    Task<std::string> pond_json(const DbPtr &db);
+    Task<std::string> channels_json();
+    Task<Outcome> channel_set(std::string name, const char *column, std::string value);
+    Task<Outcome> remove_member(std::string id);
     void bump(int64_t id);
-    bool live_channel(Db &db, const std::string &name_or_id, int64_t &id, std::string *json, bool by_name);
-    std::string member_json(const std::vector<Cell> &row); /* id, profile, joined_ms */
-    std::string pond_json(Db &db);
-    std::string channels_json(Db &db);
+    Task<> tick();
 
-    Pool &pool_;
+    DbPtr db_;
     PondKey key_;
-    puddle_keyed *send_limit_;
+    trantor::EventLoop *timers_;
+    Keyed send_limit_{20, 200}; /* 5 a second on average, 20 at once */
     std::mutex mu_;
-    std::condition_variable cv_;
-    int64_t latest_ = 0, oldest_ = 0;
-    std::atomic<bool> stopping_{false};
+    std::vector<std::shared_ptr<Waiter>> waiters_;
+    int64_t latest_ = 0, oldest_ = 0, next_prune_ = 0;
+    std::atomic<bool> stopping_{false}, ticking_{false};
 };
 
 } // namespace pond

@@ -10,10 +10,13 @@ address: pond.example.org:8443
 # The Pond's key (pond.key) and TLS certificate (cert.pem, key.pem; a self-signed one is made if there is none).
 data_dir: /var/lib/pond
 
+# Threads answering requests; 0 is one per CPU.
+threads: 0
+
 database:
-  host: 127.0.0.1
+  host: 127.0.0.1     # "localhost" is the client library's default Unix socket
   port: 3306
-  # socket: /run/mysqld/mysqld.sock     # instead of host and port
   user: pond
   password: secret
   name: pond
+  connections: 16

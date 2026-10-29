@@ -1,91 +1,106 @@
 #include "config.h"
 
-#include "core/yamltree.h"
+#include <yaml-cpp/yaml.h>
 
 #include <cstdlib>
-#include <cstring>
 
 namespace pond {
 
-static bool scalar(const ynode *n, const char *key, std::string &out, std::string &err)
+static std::string where(const YAML::Node &n)
 {
-    const char *s = ynode_scalar(n);
-    if (!s) {
-        err = std::string(key) + " must be a single value (line " + std::to_string(ynode_line(n)) + ")";
+    return " (line " + std::to_string(n.Mark().line + 1) + ")";
+}
+
+static bool scalar(const YAML::Node &n, const std::string &key, std::string &out, std::string &err)
+{
+    if (!n.IsScalar()) {
+        err = key + " must be a single value" + where(n);
         return false;
     }
-    out = s;
+    out = n.Scalar();
     return true;
 }
 
-static bool port(const ynode *n, const char *key, unsigned &out, std::string &err)
+static bool number(const YAML::Node &n, const std::string &key, long lo, long hi, long &out, std::string &err)
 {
     std::string s;
     if (!scalar(n, key, s, err))
         return false;
     char *end = nullptr;
-    long v = strtol(s.c_str(), &end, 10);
-    if (s.empty() || *end || v < 1 || v > 65535) {
-        err = std::string(key) + " must be a port number (line " + std::to_string(ynode_line(n)) + ")";
+    out = strtol(s.c_str(), &end, 10);
+    if (s.empty() || *end || out < lo || out > hi) {
+        err = key + " must be a number from " + std::to_string(lo) + " to " + std::to_string(hi) + where(n);
         return false;
     }
-    out = (unsigned)v;
     return true;
 }
 
-static bool database(const ynode *map, DbConfig &db, std::string &err)
+static bool number(const YAML::Node &n, const std::string &key, long lo, long hi, unsigned &out, std::string &err)
 {
-    if (ynode_kind(map) != Y_MAP) {
-        err = "database must be a map";
+    long v;
+    return number(n, key, lo, hi, v, err) && (out = (unsigned)v, true);
+}
+
+static bool database(const YAML::Node &map, DbConfig &db, std::string &err)
+{
+    if (!map.IsMap()) {
+        err = "database must be a map" + where(map);
         return false;
     }
-    for (size_t i = 0; i < ynode_count(map); i++) {
-        std::string k = ynode_key(map, i);
-        const ynode *v = ynode_item(map, i);
-        bool ok = k == "host"       ? scalar(v, "database.host", db.host, err)
-                  : k == "port"     ? port(v, "database.port", db.port, err)
-                  : k == "socket"   ? scalar(v, "database.socket", db.socket, err)
-                  : k == "user"     ? scalar(v, "database.user", db.user, err)
-                  : k == "password" ? scalar(v, "database.password", db.password, err)
-                  : k == "name"     ? scalar(v, "database.name", db.name, err)
-                                    : (err = "unknown setting database." + k, false);
+    for (auto it : map) {
+        std::string k = it.first.as<std::string>();
+        const YAML::Node &v = it.second;
+        bool ok = k == "host"          ? scalar(v, "database.host", db.host, err)
+                  : k == "port"        ? number(v, "database.port", 1, 65535, db.port, err)
+                  : k == "user"        ? scalar(v, "database.user", db.user, err)
+                  : k == "password"    ? scalar(v, "database.password", db.password, err)
+                  : k == "name"        ? scalar(v, "database.name", db.name, err)
+                  : k == "connections" ? number(v, "database.connections", 1, 1000, db.connections, err)
+                  : k == "socket"      ? (err = "database.socket is no longer used: set host to localhost for the default socket", false)
+                                       : (err = "unknown setting database." + k, false);
         if (!ok)
             return false;
     }
+    for (const std::string *v : {&db.host, &db.user, &db.name})
+        if (v->empty() || v->find_first_of(" \t'\\") != std::string::npos) {
+            err = "database host, user and name must not be empty or have spaces, quotes or backslashes in them";
+            return false;
+        }
     return true;
 }
 
 bool load_config(const std::string &path, Config &out, std::string &err)
 {
-    char e[256] = "";
-    ynode *root = puddle_yaml_parse_file(path.c_str(), e, sizeof e);
-    if (!root) {
-        err = e;
+    YAML::Node root;
+    try {
+        root = YAML::LoadFile(path);
+    } catch (const YAML::Exception &e) {
+        err = path + ": " + e.what();
         return false;
     }
     bool ok = true;
-    if (ynode_kind(root) != Y_MAP) {
-        err = path + ": not a map of settings";
+    if (!root.IsMap()) {
+        err = "not a map of settings";
         ok = false;
     }
-    for (size_t i = 0; ok && i < ynode_count(root); i++) {
-        std::string k = ynode_key(root, i);
-        const ynode *v = ynode_item(root, i);
-        ok = k == "listen"     ? scalar(v, "listen", out.listen, err)
-             : k == "port"     ? port(v, "port", out.port, err)
-             : k == "address"  ? scalar(v, "address", out.address, err)
-             : k == "data_dir" ? scalar(v, "data_dir", out.data_dir, err)
-             : k == "database" ? database(v, out.db, err)
-                               : (err = "unknown setting " + k, false);
+    for (auto it = root.begin(); ok && it != root.end(); ++it) {
+        std::string k = it->first.as<std::string>();
+        const YAML::Node &v = it->second;
+        long wait;
+        ok = k == "listen"           ? scalar(v, "listen", out.listen, err)
+             : k == "port"           ? number(v, "port", 1, 65535, out.port, err)
+             : k == "address"        ? scalar(v, "address", out.address, err)
+             : k == "data_dir"       ? scalar(v, "data_dir", out.data_dir, err)
+             : k == "threads"        ? number(v, "threads", 0, 1024, out.threads, err)
+             : k == "events_wait_ms" ? number(v, "events_wait_ms", 100, 60000, wait, err) && (out.events_wait_ms = (int)wait, true)
+             : k == "database"       ? database(v, out.db, err)
+                                     : (err = "unknown setting " + k, false);
     }
-    puddle_yaml_free(root);
     if (ok && out.data_dir.empty()) {
         err = "data_dir is required";
         ok = false;
     }
-    if (ok && !err.empty())
-        err.clear();
-    if (!ok && err.rfind(path, 0) != 0)
+    if (!ok)
         err = path + ": " + err;
     return ok;
 }
