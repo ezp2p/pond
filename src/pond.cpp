@@ -7,7 +7,10 @@
 #include <drogon/orm/Exception.h>
 #include <trantor/utils/Logger.h>
 
+#include <cctype>
 #include <chrono>
+#include <cstring>
+#include <map>
 
 namespace pond {
 
@@ -62,7 +65,10 @@ static Outcome refused(const DrogonDbException &e)
     return std::string("the database refused it: ") + e.base().what();
 }
 
-Service::Service(DbPtr db, PondKey key, trantor::EventLoop *timers) : db_(std::move(db)), key_(std::move(key)), timers_(timers) {}
+Service::Service(DbPtr db, PondKey key, std::string data_dir, trantor::EventLoop *timers)
+    : db_(std::move(db)), key_(std::move(key)), files_dir_(data_dir + "/files"), timers_(timers)
+{
+}
 
 /* ---- JSON for what is kept ---- */
 
@@ -82,10 +88,45 @@ static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
            ",\"position\":" + std::to_string(num(row[3])) + "}";
 }
 
-static std::string message_json(const drogon::orm::Row &row) /* MESSAGE_COLS */
+/* `files` is the message's "files" array, or "" for a message without any */
+static std::string message_json(const drogon::orm::Row &row, const std::string &files = "") /* MESSAGE_COLS */
 {
     return "{\"id\":" + std::to_string(num(row[0])) + ",\"channel\":" + std::to_string(num(row[1])) + ",\"author\":" + jstr(text(row[2])) +
-           ",\"text\":" + jstr(text(row[3])) + ",\"ts\":" + std::to_string(num(row[4])) + "}";
+           ",\"text\":" + jstr(text(row[3])) + ",\"ts\":" + std::to_string(num(row[4])) + (files.empty() ? "" : ",\"files\":" + files) + "}";
+}
+
+/* Rows of MESSAGE_COLS as a JSON array, each with the files it carries. */
+Task<std::string> Service::messages_json(const DbPtr &db, const Result &r)
+{
+    std::map<int64_t, std::string> files;
+    if (!r.empty()) {
+        std::string ids;
+        for (size_t i = 0; i < r.size(); i++)
+            ids += (i ? "," : "") + std::to_string(num(r[i][0])); /* numbers from the database: safe to put in the statement */
+        Result f = co_await db->execSqlCoro("SELECT message, file, name, mime, size, w, h, duration_ms, preview FROM message_files"
+                                            " WHERE message IN (" + ids + ") ORDER BY message, position");
+        for (const auto &row : f) {
+            std::string &out = files[num(row[0])];
+            out += out.empty() ? "[" : ",";
+            out += "{\"id\":" + jstr(text(row[1])) + ",\"name\":" + jstr(text(row[2])) + ",\"mime\":" + jstr(text(row[3])) +
+                   ",\"size\":" + std::to_string(num(row[4]));
+            if (num(row[5]) > 0 && num(row[6]) > 0)
+                out += ",\"w\":" + std::to_string(num(row[5])) + ",\"h\":" + std::to_string(num(row[6]));
+            if (num(row[7]) > 0)
+                out += ",\"duration_ms\":" + std::to_string(num(row[7]));
+            if (!text(row[8]).empty())
+                out += ",\"preview\":" + jstr(text(row[8]));
+            out += "}";
+        }
+        for (auto &[id, a] : files)
+            a += "]";
+    }
+    std::string out = "[";
+    for (size_t i = 0; i < r.size(); i++) {
+        auto it = files.find(num(r[i][0]));
+        out += (i ? "," : "") + message_json(r[i], it == files.end() ? "" : it->second);
+    }
+    co_return out + "]";
 }
 
 Task<std::string> Service::member_json_of(const DbPtr &db, const std::string &id)
@@ -96,11 +137,14 @@ Task<std::string> Service::member_json_of(const DbPtr &db, const std::string &id
 
 Task<std::string> Service::pond_json(const DbPtr &db)
 {
-    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description')");
-    std::string name, description;
+    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size')");
+    std::string name, description, max = std::to_string(FILES_DEFAULT_MAX);
     for (const auto &row : r)
-        (text(row[0]) == "name" ? name : description) = text(row[1]);
-    co_return "{\"id\":" + jstr(key_.id) + ",\"name\":" + jstr(name) + ",\"description\":" + jstr(description) + "}";
+        (text(row[0]) == "name" ? name : text(row[0]) == "description" ? description : max) = text(row[1]);
+    /* what members may send: "files" (docs/design.md, "Files"); max_size 0 is files turned off */
+    co_return "{\"id\":" + jstr(key_.id) + ",\"name\":" + jstr(name) + ",\"description\":" + jstr(description) +
+              ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
+              std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "}}";
 }
 
 Task<std::string> Service::channels_json()
@@ -224,20 +268,51 @@ Task<Answer> Service::history(int64_t channel, int64_t before, int limit)
         Result r = co_await db_->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS +
                                                  " FROM messages WHERE channel = ? AND id < ? ORDER BY id DESC LIMIT ?",
                                              channel, before > 0 ? before : INT64_MAX, (int64_t)limit);
-        std::string out = "{\"messages\":[";
-        for (size_t i = 0; i < r.size(); i++)
-            out += (i ? "," : "") + message_json(r[i]);
-        co_return Answer{200, out + "]}"};
+        co_return Answer{200, "{\"messages\":" + co_await messages_json(db_, r) + "}"};
     } catch (const DrogonDbException &e) {
         co_return server_error(e);
     }
 }
 
-Task<Answer> Service::send(std::string member, int64_t channel, std::string in, std::string nonce)
+/* What a message says of a file, cleaned: false if it cannot be. */
+static bool clean_file(FileRef &f)
+{
+    std::string name;
+    if (!clean_text(f.name, FILE_NAME_MAX, false, name) || name.empty() || name.size() > FILE_NAME_MAX || name == "." || name == "..")
+        return false;
+    for (char c : name)
+        if (c == '/' || c == '\\')
+            return false;
+    f.name = name;
+    bool slash = false;
+    for (char &c : f.mime) {
+        c = (char)tolower((unsigned char)c);
+        slash = slash || c == '/';
+        if (!isalnum((unsigned char)c) && !strchr("/!#$&^_.+-", c))
+            return false;
+    }
+    if (f.mime.size() > FILE_MIME_MAX || !slash)
+        f.mime = "application/octet-stream";
+    if (f.preview.size() > FILE_PREVIEW_MAX || f.w < 0 || f.h < 0 || f.duration_ms < 0 || f.w > 100000 || f.h > 100000)
+        return false;
+    for (char c : f.preview)
+        if (!isalnum((unsigned char)c) && c != '+' && c != '/' && c != '=')
+            return false;
+    if (!f.w || !f.h)
+        f.w = f.h = 0;
+    return true;
+}
+
+Task<Answer> Service::send(std::string member, int64_t channel, std::string in, std::string nonce, std::vector<FileRef> files)
 {
     std::string body;
-    if (!clean_text(in, TEXT_MAX, true, body) || body.empty())
+    if (!clean_text(in, TEXT_MAX, true, body) || (body.empty() && files.empty()))
         co_return fail(400, "bad_text");
+    if (files.size() > FILES_PER_MESSAGE)
+        co_return fail(400, "too_many_files");
+    for (auto &f : files)
+        if (!clean_file(f))
+            co_return fail(400, "bad_file");
     if (!send_limit_.take(member, now_ms()))
         co_return fail(429, "slow_down");
     TxPtr tx;
@@ -245,11 +320,34 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
         Result live = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0", channel);
         if (live.empty())
             co_return fail(404, "no_channel");
+        if (!files.empty() && co_await files_max() == 0)
+            co_return fail(409, "files_off");
         tx = co_await db_->newTransactionCoro();
+        std::vector<int64_t> sizes;
+        for (auto &f : files) {
+            Result w = co_await tx->execSqlCoro("SELECT size FROM files WHERE id = ? AND whole = 1 LOCK IN SHARE MODE", f.id);
+            if (w.empty()) {
+                tx->rollback();
+                co_return Answer{409, "{\"error\":\"no_file\",\"file\":" + jstr(f.id) + "}"}; /* not here whole: send it first */
+            }
+            sizes.push_back(num(w[0][0]));
+        }
         Result ins = co_await tx->execSqlCoro("INSERT INTO messages (channel, author, text, nonce, ts_ms) VALUES (?, ?, ?, ?, ?)", channel,
                                               member, body, nonce.empty() ? std::nullopt : std::optional<std::string>(nonce), now_ms());
-        Result r = co_await tx->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS + " FROM messages WHERE id = ?", (int64_t)ins.insertId());
-        std::string msg = message_json(r.at(0));
+        int64_t mid = (int64_t)ins.insertId();
+        for (size_t i = 0; i < files.size(); i++) {
+            const FileRef &f = files[i];
+            auto opt = [](int64_t v) { return v > 0 ? std::optional<int64_t>(v) : std::nullopt; };
+            co_await tx->execSqlCoro("INSERT INTO message_files (message, position, file, name, mime, size, w, h, duration_ms, preview)"
+                                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                     mid, (int64_t)i, f.id, f.name, f.mime, sizes[i], opt(f.w), opt(f.h), opt(f.duration_ms),
+                                     f.preview.empty() ? std::nullopt : std::optional<std::string>(f.preview));
+        }
+        Result r = co_await tx->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS + " FROM messages WHERE id = ?", mid);
+        std::string list = co_await messages_json(tx, r);
+        std::string msg = list.substr(1, list.size() - 2);
+        if (msg.empty())
+            throw std::out_of_range("message");
         int64_t ev = co_await add_event(tx, "message", msg);
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
@@ -269,7 +367,8 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
     try {
         Result r = co_await db_->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS + " FROM messages WHERE author = ? AND nonce = ?", member,
                                              nonce);
-        co_return r.empty() ? fail(500, "database") : Answer{200, message_json(r[0])};
+        std::string list = co_await messages_json(db_, r);
+        co_return r.empty() ? fail(500, "database") : Answer{200, list.substr(1, list.size() - 2)};
     } catch (const DrogonDbException &e) {
         co_return server_error(e);
     }
@@ -452,6 +551,7 @@ Task<> Service::tick()
         if (now_ms() >= next_prune_) {
             next_prune_ = now_ms() + 3600 * 1000;
             co_await db_->execSqlCoro("DELETE FROM events WHERE ts_ms < ?", now_ms() - EVENTS_KEEP_MS);
+            co_await sweep_files();
         }
         Result r = co_await db_->execSqlCoro("SELECT COALESCE(MAX(id), 0), COALESCE(MIN(id), 0) FROM events");
         {

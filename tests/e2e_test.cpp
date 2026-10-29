@@ -16,7 +16,7 @@ struct Node {
     unsigned port = 0;
     pid_t pid = 0;
 
-    bool make(const std::string &root, const char *who, const char *display)
+    bool make(const std::string &root, const char *who, const char *display, const std::string &extra = "")
     {
         name = who;
         dir = root + "/" + who;
@@ -25,7 +25,7 @@ struct Node {
         std::ofstream(dir + "/profiles.yaml") << "profiles:\n  - id: main\n    display_name: " << display << "\n  - id: work\n    display_name: "
                                               << display << " (work)\n";
         port = free_port();
-        std::ofstream(conf) << "address: 127.0.0.1\nport: " << port << "\ndata_dir: " << dir << "/data\nprofiles: " << dir << "/profiles.yaml\n";
+        std::ofstream(conf) << "address: 127.0.0.1\nport: " << port << "\ndata_dir: " << dir << "/data\nprofiles: " << dir << "/profiles.yaml\n" << extra;
         std::string out;
         if (run(std::string(PUDDLED) + " -c " + conf + " --init < /dev/null", &out) != 0) {
             fprintf(stderr, "%s: puddled --init: %s\n", who, out.c_str());
@@ -58,6 +58,19 @@ struct Node {
         if (out)
             *out = r.body;
         return r.status;
+    }
+
+    /* Upload `bytes` as a file the owner will send, a MiB at a time: its id, or "" */
+    std::string upload(const std::string &bytes)
+    {
+        std::string out;
+        if (post("/api/v1/files/uploads/create", "{\"size\":" + std::to_string(bytes.size()) + "}", &out) != 201)
+            return "";
+        std::string u = "/api/v1/files/uploads/" + str_of(out, "upload");
+        for (size_t at = 0, n = 0; at < bytes.size(); at += 1 << 20, n++)
+            if (post(u + "/chunks/" + std::to_string(n), bytes.substr(at, 1 << 20)) != 200)
+                return "";
+        return post(u + "/finish", "", &out) == 201 ? str_of(out, "id") : "";
     }
 };
 
@@ -93,7 +106,7 @@ int main()
 
     Node ann, ben;
     CHECK(ann.make(db.dir, "ann", "Ann"));
-    CHECK(ben.make(db.dir, "ben", "Ben"));
+    CHECK(ben.make(db.dir, "ben", "Ben", "files:\n  auto_download: 1 MiB\n"));
 
     /* ---- joining ---- */
     CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"puddle://127.0.0.1:1\"}", &out) == 400 && has(out, "bad_link"));
@@ -106,7 +119,7 @@ int main()
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":1,\"features\":[]"));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":1,\"features\":[\"files\"]"));
 
     std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";
@@ -131,6 +144,35 @@ int main()
     std::string random = pond.channel("random");
     CHECK(ben.post(P + "/channels/" + random + "/messages/send", "{\"body\":\"random thought\"}") == 200);
     CHECK(until([&] { return has(ann.get(P + "/channels/" + random + "/messages"), "random thought"); }));
+
+    /* ---- files: sent through the Pond, fetched by itself up to the automatic limit, and on asking past it ---- */
+    {
+        std::string small(300 * 1024, '\0'), big(5 * (1 << 19), '\0');
+        for (size_t i = 0; i < big.size(); i++)
+            big[i] = (char)(i * 13 + i / 4099), small[i % small.size()] = (char)(i * 5);
+        std::string sid = ann.upload(small), bid = ann.upload(big);
+        CHECK(sid.size() == 64 && bid.size() == 64);
+        std::string files = "[{\"id\":\"" + sid + "\",\"name\":\"small.txt\",\"mime\":\"text/plain\"},{\"id\":\"" + bid +
+                            "\",\"name\":\"big.bin\",\"mime\":\"application/octet-stream\"}]";
+        CHECK(pond.ctl("files max-size 2M") == 0);
+        CHECK(until([&] { return has(ann.get(P), "\"max_size\":2097152"); }));
+        CHECK(ann.post(msgs + "/send", "{\"files\":" + files + "}", &out) == 409 && has(out, "too_large"));
+        CHECK(pond.ctl("files max-size 10M") == 0);
+        CHECK(until([&] { return has(ann.get(P), "\"max_size\":10485760"); }));
+        CHECK(ann.post(msgs + "/send", "{\"body\":\"two files\",\"files\":" + files + "}", &out) == 200);
+        CHECK(until([&] { return has(ben.get(msgs), "big.bin"); }));
+        CHECK(until([&] { return has(ben.get("/api/v1/files/" + sid), "\"available\""); }));
+        CHECK(ben.get("/api/v1/files/" + sid + "/content") == small);
+        std::string page = ben.get(msgs);
+        CHECK(has(page, "\"name\":\"big.bin\"") && has(page, "\"state\":\"waiting\"")); /* over Ben's automatic limit */
+        long long id = 0; /* the message's id comes first in it */
+        sscanf(page.c_str() + page.rfind("{\"id\":", page.find("two files")), "{\"id\":%lld", &id);
+        std::string mid = std::to_string(id);
+        CHECK(ben.post(msgs + "/" + mid + "/files/" + bid + "/download", "") == 204);
+        CHECK(until([&] { return has(ben.get("/api/v1/files/" + bid), "\"available\""); }));
+        CHECK(ben.get("/api/v1/files/" + bid + "/content") == big);
+        CHECK(has(ann.get(msgs), "\"state\":\"available\""));
+    }
 
     /* ---- profiles ---- */
     CHECK(ann.post(P + "/profile", "{\"profile\":\"work\"}") == 200);
