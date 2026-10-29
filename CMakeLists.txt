@@ -57,6 +57,7 @@ add_library(pond_lib STATIC
   src/json.cpp
   src/key.cpp
   src/ratelimit.cpp
+  src/roles.cpp
   src/pond.cpp
   src/reqsig.cpp
   src/routes.cpp

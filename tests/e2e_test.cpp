@@ -119,7 +119,7 @@ int main()
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":1,\"features\":[\"files\"]"));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":2,\"features\":[\"files\",\"roles\"]"));
 
     std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";
@@ -215,6 +215,20 @@ int main()
     CHECK(pond.up());
     CHECK(ben.post(msgs + "/send", "{\"body\":\"after the restart\"}") == 200);
     CHECK(until([&] { return has(ann.get(msgs), "after the restart"); }, 70000)); /* a follower backs off up to 60 s */
+
+    /* ---- roles: offered from pondctl, accepted in the app, and used from it ---- */
+    CHECK(pond.ctl("member offer " + str_of(ann.get(P), "me") + " operator --yes") == 0);
+    CHECK(until([&] { return has(ann.get("/api/v1/ponds"), "\"offer\":{\"id\":"); })); /* an event for Ann alone */
+    CHECK(has(ben.get("/api/v1/ponds"), "\"offer\":null"));
+    CHECK(ben.post(P + "/offer/accept", "") == 404);
+    CHECK(ann.post(P + "/offer/accept", "", &out) == 200 && has(out, "\"role\":\"operator\""));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"role\":\"operator\",\"offer\":null"));
+    CHECK(until([&] { return has(ben.get(P), "\"role\":\"operator\""); }));
+    CHECK(ben.post(P + "/admin/channels/create", "{\"name\":\"nope\"}", &out) == 409 && has(out, "no_role"));
+    CHECK(ann.post(P + "/admin/channels/create", "{\"name\":\"news\",\"topic\":\"what is new\"}") == 204);
+    CHECK(ann.post(P + "/admin/channels/create", "{\"name\":\"news\"}", &out) == 400 && has(out, "already a channel"));
+    CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"name\":\"news\""); }));
+    CHECK(has(ann.get(P + "/admin/bans"), "\"bans\":[]"));
 
     /* ---- removed by the admin ---- */
     std::string ben_id = str_of(ben.get(P), "me");

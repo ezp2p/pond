@@ -65,7 +65,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 1 && has(a.body, "\"features\":[\"files\"]"));
+    CHECK(num_of(a.body, "protocol") == 2 && has(a.body, "\"features\":[\"files\",\"roles\"]"));
     int64_t cursor = num_of(a.body, "cursor");
     CHECK(cursor > 0);
     a = pond.call(&ann, "GET", "/pond/v1/members");
@@ -181,7 +181,7 @@ int main()
                             base64((const unsigned char *)hashes.data(), hashes.size()) + "\"}";
         CHECK(pond.call(&dan, "POST", "/pond/v1/join", join_body(dan, invite(pond, ""), "Dan"), "*").status == 200);
         a = pond.call(&ann, "GET", "/pond/v1/info");
-        CHECK(has(a.body, "\"features\":[\"files\"]") && has(a.body, "\"files\":{\"max_size\":26214400,\"chunk_size\":1048576"));
+        CHECK(has(a.body, "\"features\":[\"files\",\"roles\"]") && has(a.body, "\"files\":{\"max_size\":26214400,\"chunk_size\":1048576"));
         CHECK(pond.ctl("files max-size 2M") == 0);
         a = pond.call(&ann, "POST", F, begin);
         CHECK(a.status == 413 && has(a.body, "\"max\":2097152")); /* over what the admin allows */
@@ -226,6 +226,70 @@ int main()
         for (int i = 0; i < 11; i++)
             many += std::string(i ? "," : "") + "{\"id\":\"" + fid + "\",\"name\":\"a\",\"mime\":\"x/y\"}";
         CHECK(pond.call(&ann, "POST", send, many + "]}").status == 400);
+    }
+
+    /* ---- roles: offered from pondctl, accepted in the app; rank decides who may act on whom ---- */
+    {
+        Identity eve;
+        CHECK(pond.call(&eve, "POST", "/pond/v1/join", join_body(eve, invite(pond, ""), "Eve"), "*").status == 200);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/channels/create", "{\"name\":\"ops\"}").status == 404); /* no role: no such route */
+        CHECK(pond.ctl("member list", &out) == 0 && has(out, "member"));
+        int64_t c0 = num_of(pond.call(&ann, "GET", "/pond/v1/info").body, "cursor");
+        CHECK(pond.ctl("member offer Da operator < /dev/null", &out) != 0 && has(out, "nothing changed")); /* not confirmed */
+        CHECK(pond.ctl("member offer nobody-at-all operator --yes") != 0);
+        CHECK(pond.ctl("member offer Dan operator --yes", &out) == 0 && has(out, dan.id));
+        a = pond.call(&dan, "GET", "/pond/v1/info");
+        CHECK(has(a.body, "\"role\":\"member\"") && has(a.body, "\"offer\":{\"id\":"));
+        int64_t offer = parse(a.body)["offer"]["id"].asInt64();
+        CHECK(has(pond.call(&ann, "GET", "/pond/v1/info").body, "\"offer\":null"));
+        a = pond.call(&ann, "GET", "/pond/v1/events?after=" + std::to_string(c0));
+        CHECK(a.status == 200 && !has(a.body, "role_offer") && !has(a.body, "reset") && num_of(a.body, "cursor") > c0); /* for Dan alone */
+        CHECK(has(pond.call(&dan, "GET", "/pond/v1/events?after=" + std::to_string(c0)).body, "\"kind\":\"role_offer\""));
+        CHECK(pond.call(&ann, "POST", "/pond/v1/roles/answer", "{\"offer\":" + std::to_string(offer) + ",\"accept\":true}").status == 404);
+        a = pond.call(&dan, "POST", "/pond/v1/roles/answer", "{\"offer\":" + std::to_string(offer) + ",\"accept\":true}");
+        CHECK(a.status == 200 && has(a.body, "\"role\":\"operator\""));
+        CHECK(has(pond.call(&ann, "GET", "/pond/v1/members").body, "\"role\":\"operator\""));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/roles/answer", "{\"offer\":" + std::to_string(offer) + ",\"accept\":true}").status == 404); /* spent */
+
+        /* an operator runs the Pond from the app */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/create", "{\"name\":\"ops\",\"topic\":\"running things\"}").status == 204);
+        a = pond.call(&dan, "POST", "/pond/v1/admin/channels/create", "{\"name\":\"ops\"}");
+        CHECK(a.status == 400 && has(a.body, "already a channel"));
+        std::string ops = pond.channel("ops");
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + ops + "/edit", "{\"name\":\"operations\",\"topic\":\"t\"}").status == 204);
+        CHECK(has(pond.call(&ann, "GET", "/pond/v1/info").body, "\"name\":\"operations\",\"topic\":\"t\""));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/pond", "{\"name\":\"Renamed\"}").status == 204);
+        CHECK(has(pond.call(&ann, "GET", "/pond/v1/info").body, "\"name\":\"Renamed\""));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + ops + "/delete").status == 204);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + ops + "/delete").status == 404);
+
+        /* an administrator, below an operator */
+        CHECK(pond.ctl("member role Ann operator --yes", &out) != 0 && has(out, "offered, not given"));
+        CHECK(pond.ctl("member offer " + ann.id + " administrator --yes") == 0);
+        a = pond.call(&ann, "GET", "/pond/v1/info");
+        offer = parse(a.body)["offer"]["id"].asInt64();
+        CHECK(pond.call(&ann, "POST", "/pond/v1/roles/answer", "{\"offer\":" + std::to_string(offer) + ",\"accept\":true}").status == 200);
+        a = pond.call(&ann, "POST", "/pond/v1/admin/members/" + dan.id + "/remove");
+        CHECK(a.status == 409 && has(a.body, "outranked")); /* nobody acts on an operator from the app */
+        CHECK(has(pond.call(&ann, "POST", "/pond/v1/admin/members/" + ann.id + "/remove").body, "not_yourself"));
+
+        /* banning: out, and refused at the door until unbanned */
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + eve.id + "/ban", "{\"reason\":\"spam\"}").status == 204);
+        CHECK(pond.call(&eve, "GET", "/pond/v1/info").status == 404);
+        CHECK(pond.call(&eve, "POST", "/pond/v1/join", join_body(eve, invite(pond, ""), "Eve"), "*").status == 404);
+        a = pond.call(&ann, "GET", "/pond/v1/admin/bans");
+        CHECK(a.status == 200 && has(a.body, eve.id) && has(a.body, "\"reason\":\"spam\"") && has(a.body, "\"display_name\":\"Eve\""));
+        CHECK(pond.ctl("member bans", &out) == 0 && has(out, eve.id) && has(out, "spam"));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/bans/" + eve.id + "/unban").status == 204);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/bans/" + eve.id + "/unban").status == 404);
+        CHECK(pond.call(&eve, "POST", "/pond/v1/join", join_body(eve, invite(pond, ""), "Eve"), "*").status == 200);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + eve.id + "/remove").status == 204); /* a kick: back with an invite */
+        CHECK(pond.call(&eve, "POST", "/pond/v1/join", join_body(eve, invite(pond, ""), "Eve"), "*").status == 200);
+
+        /* taking a role away, and the record */
+        CHECK(pond.ctl("member role " + ann.id + " member --yes") == 0);
+        CHECK(pond.call(&ann, "GET", "/pond/v1/admin/bans").status == 404);
+        CHECK(pond.ctl("log", &out) == 0 && has(out, "offer_role") && has(out, "accept_role") && has(out, "ban") && has(out, "channel_create"));
     }
 
     /* ---- what nobody may ask ---- */

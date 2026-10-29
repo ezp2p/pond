@@ -72,14 +72,14 @@ Service::Service(DbPtr db, PondKey key, std::string data_dir, trantor::EventLoop
 
 /* ---- JSON for what is kept ---- */
 
-static const char MEMBER_COLS[] = "id, profile, joined_ms";
+static const char MEMBER_COLS[] = "id, profile, joined_ms, role";
 static const char CHANNEL_COLS[] = "id, name, topic, position";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
 
 static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
 {
     return "{\"id\":" + jstr(text(row[0])) + ",\"profile\":" + (row[1].isNull() ? std::string("null") : text(row[1])) +
-           ",\"joined\":" + std::to_string(num(row[2])) + "}";
+           ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + "}";
 }
 
 static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
@@ -197,6 +197,11 @@ Task<Answer> Service::enter(Chain chain, std::string invite, std::string profile
         Result r = co_await tx->execSqlCoro("SELECT left_ms FROM members WHERE id = ? FOR UPDATE", chain.id);
         bool member = !r.empty() && r[0][0].isNull();
         int64_t now = now_ms();
+        Result banned = co_await tx->execSqlCoro("SELECT 1 FROM bans WHERE member = ?", chain.id);
+        if (!banned.empty()) { /* answered as an invite that does not work: a ban says nothing either */
+            tx->rollback();
+            co_return fail(404, "not_found");
+        }
         if (!member) {
             /* spend one use, in the same statement that checks the invite may still be used, so two joins can't share the last */
             Result u = co_await tx->execSqlCoro("UPDATE invites SET uses = uses + 1 WHERE token = ? AND revoked = 0"
@@ -252,8 +257,8 @@ Task<Answer> Service::info(std::string member)
         for (const char *f : FEATURES)
             features += (features.size() > 1 ? "," : "") + jstr(f);
         co_return Answer{200, "{\"protocol\":" + std::to_string(PROTOCOL) + ",\"features\":" + features + "],\"pond\":" +
-                                  co_await pond_json(db_) + ",\"me\":" + me + ",\"channels\":" + co_await channels_json() +
-                                  ",\"cursor\":" + std::to_string(num(c[0][0])) + "}"};
+                                  co_await pond_json(db_) + ",\"me\":" + me + ",\"offer\":" + co_await offer_json(member) +
+                                  ",\"channels\":" + co_await channels_json() + ",\"cursor\":" + std::to_string(num(c[0][0])) + "}"};
     } catch (const DrogonDbException &e) {
         co_return server_error(e);
     }
@@ -412,7 +417,9 @@ Task<Outcome> Service::remove_member(std::string id)
     TxPtr tx;
     try {
         tx = co_await db_->newTransactionCoro();
-        Result r = co_await tx->execSqlCoro("UPDATE members SET left_ms = ? WHERE id = ? AND left_ms IS NULL", now_ms(), id);
+        /* a role does not outlast membership: someone who comes back comes back a member */
+        Result r = co_await tx->execSqlCoro("UPDATE members SET left_ms = ?, role = 'member' WHERE id = ? AND left_ms IS NULL", now_ms(), id);
+        co_await tx->execSqlCoro("DELETE FROM role_offers WHERE member = ?", id);
         int64_t ev = r.affectedRows() ? co_await add_event(tx, "member_left", "{\"id\":" + jstr(id) + "}") : 0;
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
@@ -438,10 +445,11 @@ Task<Answer> Service::leave(std::string member)
 
 /* ---- the event log ---- */
 
-Task<int64_t> Service::add_event(const TxPtr &tx, const char *kind, const std::string &data)
+Task<int64_t> Service::add_event(const TxPtr &tx, const char *kind, const std::string &data, std::string only_for)
 {
     co_await tx->execSqlCoro("SELECT value FROM settings WHERE name = 'event_lock' FOR UPDATE");
-    Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms) VALUES (?, ?, ?)", std::string(kind), data, now_ms());
+    Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms, only_for) VALUES (?, ?, ?, ?)", std::string(kind), data,
+                                        now_ms(), only_for.empty() ? std::nullopt : std::optional<std::string>(only_for));
     co_return (int64_t)r.insertId();
 }
 
@@ -505,12 +513,13 @@ void Service::bump(int64_t id)
         w->wake();
 }
 
-Task<Answer> Service::events(int64_t after)
+Task<Answer> Service::events(int64_t after, std::string member)
 {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
     for (;;) {
         try {
-            Result r = co_await db_->execSqlCoro("SELECT id, kind, data FROM events WHERE id > ? ORDER BY id LIMIT ?", after, (int64_t)EVENTS_MAX);
+            Result r = co_await db_->execSqlCoro("SELECT id, kind, data, only_for FROM events WHERE id > ? ORDER BY id LIMIT ?", after,
+                                                 (int64_t)EVENTS_MAX);
             int64_t oldest;
             {
                 std::lock_guard<std::mutex> g(mu_);
@@ -526,10 +535,16 @@ Task<Answer> Service::events(int64_t after)
             if ((oldest > 0 && after + 1 < oldest && (r.empty() || num(r[0][0]) == oldest)) || (r.empty() && latest > after))
                 co_return Answer{200, "{\"reset\":true}"};
             if (!r.empty()) {
+                /* an event for one member is left out for the rest; the cursor still moves past it */
                 std::string out = "{\"events\":[";
-                for (size_t i = 0; i < r.size(); i++)
-                    out += std::string(i ? "," : "") + "{\"id\":" + std::to_string(num(r[i][0])) + ",\"kind\":" + jstr(text(r[i][1])) +
+                bool first = true;
+                for (size_t i = 0; i < r.size(); i++) {
+                    if (!r[i][3].isNull() && text(r[i][3]) != member)
+                        continue;
+                    out += std::string(first ? "" : ",") + "{\"id\":" + std::to_string(num(r[i][0])) + ",\"kind\":" + jstr(text(r[i][1])) +
                            ",\"data\":" + text(r[i][2]) + "}";
+                    first = false;
+                }
                 co_return Answer{200, out + "],\"cursor\":" + std::to_string(num(r[r.size() - 1][0])) + "}"};
             }
         } catch (const DrogonDbException &e) {
