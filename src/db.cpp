@@ -33,6 +33,16 @@ static const char *const STEPS[][8] = {
         "INSERT IGNORE INTO settings (name, value) VALUES ('event_lock', '')",
         nullptr,
     },
+    {
+        /* files (docs/design.md, "Files"): the bytes are in data_dir/files; `have` is a '0' or '1' for each chunk */
+        "CREATE TABLE files (id CHAR(64) PRIMARY KEY, size BIGINT NOT NULL, chunks MEDIUMBLOB NOT NULL, have MEDIUMBLOB NOT NULL,"
+        " whole TINYINT NOT NULL DEFAULT 0, uploader CHAR(52) NOT NULL, created_ms BIGINT NOT NULL, KEY (whole, created_ms))"
+        " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE message_files (message BIGINT NOT NULL, position TINYINT NOT NULL, file CHAR(64) NOT NULL,"
+        " name VARCHAR(255) NOT NULL, mime VARCHAR(127) NOT NULL, size BIGINT NOT NULL, w INT NULL, h INT NULL,"
+        " duration_ms BIGINT NULL, preview TEXT NULL, PRIMARY KEY (message, position), KEY (file)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run

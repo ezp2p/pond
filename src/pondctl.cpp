@@ -36,7 +36,9 @@ static const char USAGE[] =
     "  invite list\n"
     "  invite revoke <token>\n"
     "  member list\n"
-    "  member remove <user id>\n";
+    "  member remove <user id>\n"
+    "  files                                the largest file members may send, and the room files take\n"
+    "  files max-size <size>|off            e.g. 25M, 1G, 500K; off stops members sending files\n";
 
 static int usage()
 {
@@ -68,6 +70,36 @@ static int64_t parse_expiry(const std::string &s)
     tm.tm_hour = 23, tm.tm_min = 59, tm.tm_sec = 59;
     time_t t = timegm(&tm);
     return t > 0 ? (int64_t)t * 1000 : 0;
+}
+
+/* "25M", "1G", "500K", "1048576", or "off" (0). -1 if it is none of those. */
+static int64_t parse_size(const std::string &s)
+{
+    if (s == "off")
+        return 0;
+    char *end = nullptr;
+    double n = strtod(s.c_str(), &end);
+    if (end == s.c_str() || n < 0)
+        return -1;
+    std::string unit = end;
+    for (auto &c : unit)
+        c = (char)toupper((unsigned char)c);
+    if (unit.size() == 2 && unit[1] == 'B')
+        unit.resize(1);
+    int64_t per = unit.empty() || unit == "B" ? 1 : unit == "K" ? 1 << 10 : unit == "M" ? 1 << 20 : unit == "G" ? 1 << 30 : -1;
+    return per < 0 ? -1 : (int64_t)(n * per);
+}
+
+static std::string size_text(int64_t b)
+{
+    char buf[32];
+    if (b >= 1 << 30)
+        snprintf(buf, sizeof buf, "%.1f GiB", b / 1073741824.0);
+    else if (b >= 1 << 20)
+        snprintf(buf, sizeof buf, "%.1f MiB", b / 1048576.0);
+    else
+        snprintf(buf, sizeof buf, "%lld KiB", (long long)(b >> 10));
+    return buf;
 }
 
 static std::string when(int64_t ms)
@@ -146,7 +178,7 @@ int main(int argc, char **argv)
     DbPtr db = connect_db(cfg.db);
     if (!migrate(db, err))
         return die(err);
-    Service svc(db, key);
+    Service svc(db, key, cfg.data_dir);
     try {
         return run(cfg, svc, db, key, cmd, sub, args);
     } catch (const drogon::orm::DrogonDbException &e) {
@@ -242,6 +274,24 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
         }
         if (sub == "revoke" && args.size() == 1)
             return done(sync_wait(svc.invite_revoke(args[0])));
+        return usage();
+    }
+    if (cmd == "files") {
+        if (!args.empty())
+            args.erase(args.begin());
+        if (sub.empty() && args.empty()) {
+            int64_t max = sync_wait(svc.files_max());
+            auto [count, bytes] = sync_wait(svc.files_usage());
+            printf("largest file  %s\nkept         %lld file(s), %s\n", max ? size_text(max).c_str() : "off (members cannot send files)",
+                   (long long)count, size_text(bytes).c_str());
+            return 0;
+        }
+        if (sub == "max-size" && args.size() == 1) {
+            int64_t b = parse_size(args[0]);
+            if (b < 0)
+                return die("a size is like 25M, 1G or 500K, or off");
+            return done(sync_wait(svc.set_files_max(b)));
+        }
         return usage();
     }
     if (cmd == "member") {

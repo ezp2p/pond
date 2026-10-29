@@ -43,7 +43,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    Service svc(db, key, app().getLoop());
+    Service svc(db, key, cfg.data_dir, app().getLoop());
     svc.wait_ms = cfg.events_wait_ms;
     Routes routes(svc);
     /* every request goes to the routes, whatever its path and method, so that nothing is answered differently from an
@@ -64,8 +64,8 @@ int main(int argc, char **argv)
         .addListener(cfg.listen, (uint16_t)cfg.port, true, cert, cfg.data_dir + "/key.pem")
         .setThreadNum(cfg.threads)
         .enableServerHeader(false)
-        .setClientMaxBodySize(1 << 20) /* the routes refuse more than 32 KiB, with the same 404 as anything else */
-        .setClientMaxMemoryBodySize(1 << 20)
+        .setClientMaxBodySize(2 << 20) /* a chunk of a file and its headers; the routes refuse more than each takes, with a 404 */
+        .setClientMaxMemoryBodySize(2 << 20)
         .setIdleConnectionTimeout(120)
         .setTermSignalHandler(stop)
         .setIntSignalHandler(stop);

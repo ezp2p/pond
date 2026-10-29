@@ -18,14 +18,44 @@ using drogon::HttpResponse;
 using drogon::HttpResponsePtr;
 
 constexpr size_t BODY_MAX = 32 * 1024;
+constexpr size_t SEND_MAX = 64 * 1024;           /* ten files with previews, and the text */
+constexpr size_t BEGIN_MAX = 256 * 1024;         /* the hashes of a file of FILE_HARD_MAX, in base64 */
 constexpr int UNKNOWN = -1; /* the status of an answer that must look like a path that does not exist */
 
 static const Answer NOT_FOUND = {UNKNOWN, ""};
 
-enum Kind { JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, NONE };
+enum Kind { JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, NONE };
 
-/* Which route `method path` is, and the channel id in it if it has one. */
-static Kind route_of(const std::string &method, std::string_view p, int64_t &channel)
+/* A whole number of up to 18 digits with no leading zero (or "0" when `zero`), as all of `s`. -1 if it is not one. */
+static int64_t number_of(std::string_view s, bool zero)
+{
+    if (s.empty() || s.size() > 18 || (s[0] == '0' && !(zero && s.size() == 1)))
+        return -1;
+    for (char c : s)
+        if (c < '0' || c > '9')
+            return -1;
+    return strtoll(std::string(s).c_str(), nullptr, 10);
+}
+
+/* The routes under /pond/v1/files/{file}: the file id and the chunk number in it, if any. */
+static Kind file_route(bool get, bool post, std::string_view p, std::string &file, int64_t &n)
+{
+    size_t slash = p.find('/');
+    file = std::string(p.substr(0, slash));
+    if (file.size() != 64)
+        return NONE;
+    if (slash == std::string_view::npos)
+        return post ? FILE_BEGIN : NONE;
+    std::string_view rest = p.substr(slash);
+    if (rest == "/chunks")
+        return get ? FILE_HASHES : NONE;
+    if (rest.substr(0, 8) != "/chunks/" || (n = number_of(rest.substr(8), true)) < 0)
+        return NONE;
+    return get ? FILE_GET : post ? FILE_PUT : NONE;
+}
+
+/* Which route `method path` is, and the channel id, file id and chunk number in it if it has them. */
+static Kind route_of(const std::string &method, std::string_view p, int64_t &channel, std::string &file, int64_t &n)
 {
     bool get = method == "GET", post = method == "POST";
     if (p.substr(0, 9) != "/pond/v1/")
@@ -38,6 +68,8 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     if (get && p == "members") return MEMBERS;
     if (post && p == "profile") return PROFILE;
     if (post && p == "leave") return LEAVE;
+    if (p.substr(0, 6) == "files/")
+        return file_route(get, post, p.substr(6), file, n);
     if (p.substr(0, 9) != "channels/")
         return NONE;
     p.remove_prefix(9);
@@ -54,9 +86,40 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     return NONE;
 }
 
+/* Routes whose body is a JSON object. FILE_PUT's is a chunk's bytes. */
 static bool takes_body(Kind k)
 {
-    return k == JOIN || k == KEYS || k == SEND || k == PROFILE;
+    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN;
+}
+
+static size_t body_max(Kind k)
+{
+    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : BODY_MAX;
+}
+
+/* "files": [{id, name, mime, w?, h?, duration_ms?, preview?}], as a send says them; cleaned by the Service. */
+static bool body_files(const Json::Value &json, std::vector<FileRef> &out)
+{
+    if (!json.isMember("files"))
+        return true;
+    const Json::Value &a = json["files"];
+    if (!a.isArray() || a.size() > FILES_PER_MESSAGE)
+        return false;
+    for (const auto &o : a) {
+        FileRef f;
+        if (!o.isObject() || !get_string(o, "id", f.id) || !get_string(o, "name", f.name) || !get_string(o, "mime", f.mime))
+            return false;
+        if (o.isMember("preview") && !get_string(o, "preview", f.preview))
+            return false;
+        for (auto [key, to] : {std::pair<const char *, int64_t *>{"w", &f.w}, {"h", &f.h}, {"duration_ms", &f.duration_ms}})
+            if (o.isMember(key)) {
+                if (!o[key].isInt64())
+                    return false;
+                *to = o[key].asInt64();
+            }
+        out.push_back(std::move(f));
+    }
+    return true;
 }
 
 /* The query string as `allowed` keys and whole numbers: no other keys, none twice. Missing keys are left out of `out`. */
@@ -117,9 +180,10 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req)
     const std::string &path = req->getOriginalPath();
     std::string target = req->query().empty() ? path : path + "?" + req->query();
     std::string body(req->body());
-    int64_t channel = 0;
-    Kind k = route_of(method, path, channel);
-    if (k == NONE || (!takes_body(k) && !body.empty()) || body.size() > BODY_MAX)
+    int64_t channel = 0, chunk = -1;
+    std::string file;
+    Kind k = route_of(method, path, channel, file, chunk);
+    if (k == NONE || (!takes_body(k) && k != FILE_PUT && !body.empty()) || body.size() > body_max(k))
         co_return NOT_FOUND;
     int64_t now = now_ms();
 
@@ -199,12 +263,17 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req)
     }
     case SEND: {
         std::string text, nonce;
-        if (!get_string(json, "text", text) || (json.isMember("nonce") && !get_string(json, "nonce", nonce)) || nonce.size() > 32)
+        std::vector<FileRef> files;
+        if ((json.isMember("text") || !json.isMember("files")) && !get_string(json, "text", text))
             co_return fail(400, "bad_request");
+        if ((json.isMember("nonce") && !get_string(json, "nonce", nonce)) || nonce.size() > 32)
+            co_return fail(400, "bad_request");
+        if (!body_files(json, files))
+            co_return fail(400, "bad_file");
         for (char c : nonce)
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'))
                 co_return fail(400, "bad_nonce");
-        co_return co_await svc_.send(sender, channel, text, nonce);
+        co_return co_await svc_.send(sender, channel, text, nonce, std::move(files));
     }
     case EVENTS: {
         std::map<std::string, int64_t> q;
@@ -222,6 +291,23 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req)
     }
     case LEAVE:
         co_return co_await svc_.leave(sender);
+    case FILE_BEGIN: {
+        std::string chunks;
+        if (!json.isMember("size") || !json["size"].isInt64() || !get_string(json, "chunks", chunks) || chunks.size() % 4 != 0)
+            co_return fail(400, "bad_request");
+        std::string hashes(chunks.size() / 4 * 3, '\0');
+        size_t pad = chunks.empty() ? 0 : chunks.back() == '=' ? (chunks[chunks.size() - 2] == '=' ? 2 : 1) : 0;
+        hashes.resize(hashes.size() - pad);
+        if (hashes.empty() || !unbase64(chunks, (unsigned char *)hashes.data(), hashes.size()))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.file_begin(sender, file, json["size"].asInt64(), std::move(hashes));
+    }
+    case FILE_PUT:
+        co_return co_await svc_.file_put(sender, file, chunk, std::move(body));
+    case FILE_HASHES:
+        co_return co_await svc_.file_chunks(sender, file);
+    case FILE_GET:
+        co_return co_await svc_.file_chunk(sender, file, chunk);
     case NONE:
         break;
     }
@@ -256,13 +342,14 @@ Task<HttpResponsePtr> Routes::handle(HttpRequestPtr req)
         r = HttpResponse::newHttpResponse();
         r->setStatusCode((drogon::HttpStatusCode)a.status);
         if (!a.body.empty()) {
-            r->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+            r->setContentTypeCode(a.bytes ? drogon::CT_APPLICATION_OCTET_STREAM : drogon::CT_APPLICATION_JSON);
             r->setBody(std::move(a.body));
         } else {
             r->setContentTypeCode(drogon::CT_NONE);
         }
     }
-    if (req->getOriginalPath() != "/pond/v1/events") /* a member's Puddle asks for events all day long */
+    /* a member's Puddle asks for events all day long, and files come a chunk at a time */
+    if (req->getOriginalPath() != "/pond/v1/events" && req->getOriginalPath().find("/chunks/") == std::string::npos)
         LOG_INFO << req->peerAddr().toIp() << " " << req->methodString() << " " << req->getOriginalPath() << " -> "
                  << (a.status == UNKNOWN ? 404 : a.status);
     co_return r;
