@@ -1,0 +1,16 @@
+diff --git a/lib/src/HttpServer.cc b/lib/src/HttpServer.cc
+index e299094..42b9bba 100644
+--- a/lib/src/HttpServer.cc
++++ b/lib/src/HttpServer.cc
+@@ -996,7 +996,11 @@ void HttpServer::sendResponse(const TcpConnectionPtr &conn,
+         auto httpString = respImplPtr->renderToBuffer();
+         conn->send(httpString);
+         if (!respImplPtr->contentLengthIsAllowed())
++        {
++            if (response->ifCloseConnection())
++                conn->shutdown();
+             return;
++        }
+         auto &asyncStreamCallback = respImplPtr->asyncStreamCallback();
+         if (asyncStreamCallback)
+         {
