@@ -36,7 +36,14 @@ static const char USAGE[] =
     "  invite list\n"
     "  invite revoke <token>\n"
     "  member list\n"
-    "  member remove <user id>\n"
+    "  member offer <member> operator|administrator [--yes]   offer a role; they accept it in their app\n"
+    "  member role <member> member|administrator              take a role away (or lower it) at once\n"
+    "  member remove <member>\n"
+    "  member ban <member> [--reason <text>]                  remove them, and refuse them if they join again\n"
+    "  member unban <user id>\n"
+    "  member bans\n"
+    "  log [N]                                                the last N admin actions (20)\n"
+    "    <member> is a user id, or part of a member's display name\n"
     "  files                                the largest file members may send, and the room files take\n"
     "  files max-size <size>|off            e.g. 25M, 1G, 500K; off stops members sending files\n";
 
@@ -142,6 +149,39 @@ static bool options(std::vector<std::string> &args, std::vector<std::pair<std::s
 
 static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &key, const std::string &cmd, const std::string &sub,
                std::vector<std::string> &args);
+
+/* A current member: `who` is their user id, or part of their display name (any case) that only one member's has. Their id, display
+ * name, role and when they joined; false with the reason in `why`. */
+struct Who {
+    std::string id, name, role;
+    int64_t joined = 0;
+};
+static bool find_member(const DbPtr &db, const std::string &who, Who &out, std::string &why)
+{
+    Result r = db->execSqlSync("SELECT id, COALESCE(JSON_VALUE(profile, '$.display_name'), ''), role, joined_ms FROM members"
+                               " WHERE left_ms IS NULL AND (id = ? OR LOWER(JSON_VALUE(profile, '$.display_name')) LIKE CONCAT('%', LOWER(?), '%'))",
+                               who, who);
+    for (const auto &row : r)
+        if (text(row[0]) == who) /* an exact id wins */
+            r = db->execSqlSync("SELECT id, COALESCE(JSON_VALUE(profile, '$.display_name'), ''), role, joined_ms FROM members WHERE id = ?", who);
+    if (r.size() != 1) {
+        why = r.empty() ? "no member is " + who : std::to_string(r.size()) + " members match " + who + "; give their user id (pondctl member list)";
+        return false;
+    }
+    out = {text(r[0][0]), text(r[0][1]), text(r[0][2]), num(r[0][3])};
+    return true;
+}
+
+/* Ask on the terminal; only "y" or "yes" is a yes. */
+static bool confirm(const std::string &question)
+{
+    printf("%s [y/N] ", question.c_str());
+    fflush(stdout);
+    char line[16] = "";
+    if (!fgets(line, sizeof line, stdin))
+        return false;
+    return !strcmp(line, "y\n") || !strcmp(line, "yes\n") || !strcmp(line, "Y\n");
+}
 
 int main(int argc, char **argv)
 {
@@ -295,18 +335,88 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
         return usage();
     }
     if (cmd == "member") {
-        args.erase(args.begin());
+        if (!args.empty())
+            args.erase(args.begin());
+        std::string reason;
+        bool flag_yes = false;
+        for (auto it = args.begin(); it != args.end();)
+            if (*it == "--yes") {
+                flag_yes = true;
+                it = args.erase(it);
+            } else {
+                ++it;
+            }
+        if (!options(args, {{"--reason", &reason}}))
+            return usage();
         if (sub == "list" && args.empty()) {
-            Result r =
-                db->execSqlSync("SELECT id, JSON_VALUE(profile, '$.display_name'), joined_ms FROM members WHERE left_ms IS NULL ORDER BY joined_ms");
+            Result r = db->execSqlSync("SELECT id, JSON_VALUE(profile, '$.display_name'), joined_ms, role FROM members WHERE left_ms IS NULL"
+                                       " ORDER BY FIELD(role, 'operator', 'administrator', 'member'), joined_ms");
             for (const auto &row : r)
-                printf("%s  %-24s joined %s\n", text(row[0]).c_str(), row[1].isNull() ? "(no profile)" : text(row[1]).c_str(),
-                       when(num(row[2])).c_str());
+                printf("%s  %-24s %-14s joined %s\n", text(row[0]).c_str(), row[1].isNull() ? "(no profile)" : text(row[1]).c_str(),
+                       text(row[3]).c_str(), when(num(row[2])).c_str());
             return 0;
         }
-        if (sub == "remove" && args.size() == 1)
-            return done(sync_wait(svc.member_remove(args[0])));
+        if (sub == "bans" && args.empty()) {
+            Result r = db->execSqlSync("SELECT b.member, JSON_VALUE(m.profile, '$.display_name'), b.by_who, b.reason, b.ts_ms FROM bans b"
+                                       " LEFT JOIN members m ON m.id = b.member ORDER BY b.ts_ms");
+            for (const auto &row : r)
+                printf("%s  %-24s banned %s by %s%s\n", text(row[0]).c_str(), row[1].isNull() ? "(no profile)" : text(row[1]).c_str(),
+                       when(num(row[4])).c_str(), text(row[2]).substr(0, 12).c_str(), text(row[3]).empty() ? "" : (": " + text(row[3])).c_str());
+            return 0;
+        }
+        if (sub == "unban" && args.size() == 1)
+            return done(sync_wait(svc.unban(args[0], "pondctl")));
+        Who w;
+        std::string why;
+        if ((sub == "offer" || sub == "role") && args.size() == 2) {
+            auto role = role_of_name(args[1]);
+            if (!role || (sub == "offer" && role == Role::MEMBER))
+                return die(sub == "offer" ? "offer operator or administrator" : "a role is member, administrator or operator");
+            if (!find_member(db, args[0], w, why))
+                return die(why);
+            auto now = role_of_name(w.role).value_or(Role::MEMBER);
+            printf("%s\n  name    %s\n  role    %s\n  joined  %s\n", w.id.c_str(), w.name.empty() ? "(no profile)" : w.name.c_str(),
+                   w.role.c_str(), when(w.joined).c_str());
+            if (sub == "role" && *role > now)
+                return die("a role is offered, not given: pondctl member offer " + w.id + " " + args[1]);
+            if (*role == now && sub == "offer")
+                return die((w.name.empty() ? w.id : w.name) + " is already " + w.role);
+            std::string q = sub == "offer" ? "Offer " + args[1] + " to " + (w.name.empty() ? w.id.substr(0, 12) : w.name) + "?"
+                                           : "Make " + (w.name.empty() ? w.id.substr(0, 12) : w.name) + " " + args[1] + "?";
+            if (!flag_yes && !confirm(q))
+                return die("nothing changed");
+            if (sub == "offer") {
+                Outcome o = sync_wait(svc.offer_role(w.id, *role));
+                if (!o.empty())
+                    return die(o);
+                printf("Offered. They will see it in their app, and it lapses in 7 days unless they answer.\n");
+                return 0;
+            }
+            return done(sync_wait(svc.set_role(w.id, *role, "pondctl")));
+        }
+        if ((sub == "remove" || sub == "ban") && args.size() == 1) {
+            if (!find_member(db, args[0], w, why)) {
+                if (sub == "ban" && args[0].size() == 52) /* someone who has left can still be banned, by id */
+                    return done(sync_wait(svc.ban(args[0], reason, "pondctl")));
+                return die(why);
+            }
+            if (sub == "remove") {
+                Outcome o = sync_wait(svc.member_remove(w.id));
+                if (o.empty())
+                    sync_wait(svc.log_admin("pondctl", "remove", w.id, ""));
+                return done(o);
+            }
+            return done(sync_wait(svc.ban(w.id, reason, "pondctl")));
+        }
         return usage();
+    }
+    if (cmd == "log") {
+        int n = sub.empty() ? 20 : atoi(sub.c_str());
+        Result r = db->execSqlSync("SELECT ts_ms, by_who, action, target, detail FROM admin_log ORDER BY id DESC LIMIT ?", (int64_t)(n > 0 ? n : 20));
+        for (auto row = r.rbegin(); row != r.rend(); ++row)
+            printf("%s  %-12s %-15s %s%s\n", when(num((*row)[0])).c_str(), text((*row)[1]).substr(0, 12).c_str(), text((*row)[2]).c_str(),
+                   text((*row)[3]).substr(0, 16).c_str(), text((*row)[4]).empty() ? "" : ("  " + text((*row)[4])).c_str());
+        return 0;
     }
     return usage();
 }

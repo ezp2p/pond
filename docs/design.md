@@ -238,6 +238,85 @@ first, and anything larger, or in older messages, when the owner asks. This is d
 - **Bandwidth per Pond.** The rate limit is per member. A Pond with many members can still use all of its uplink; a
   total limit, or a queue, may be needed.
 
+## Roles: operators and administrators
+
+Besides the person with a shell on the server (who runs `pondctl`), a Pond has members it trusts to run it from inside
+the app. There are two such roles, above an ordinary member:
+
+| Role | Who | May |
+|---|---|---|
+| **Operator** | The people running the Pond. Several may be. | Everything an administrator may, and act on administrators. Later, the Pond's own settings (what is now only in `pondctl`, short of the server: the database, ports, certificates stay in `pond.yaml`). |
+| **Administrator** | People trusted to look after it. | Everything inside the Pond: channels, removing and banning members, the Pond's name. Not the system: they cannot touch operators, or settings an operator keeps. |
+| Member | Everyone else | Read, write, send files. |
+
+What exactly separates an operator from an administrator beyond rank is left to settle as each setting comes up; today
+it is only that rank (see "Open questions").
+
+### Becoming one: an offer, accepted
+
+A role is never just given. The admin on the server offers it, and the member accepts it in their app:
+
+1. The Pond is stood up, and its admin joins it with an invite from `pondctl invite create`, as anyone does. A Pond is
+   invite only; there is no other way in.
+2. `pondctl member offer <member> operator` (or `administrator`). `<member>` is their user id, or part of their
+   display name; the Pond never learns a member's Puddle address, since Puddles always call the Pond, so the id is
+   what names them. The app shows a member their own id ("Copy my id" in the Pond's menu).
+3. `pondctl` shows who that is (id, display name, when they joined) and asks: `Offer operator to Ann (ab3k…)? [y/N]`.
+4. The Pond records the offer and sends the member an event only they receive (`role_offer`). Their Puddle shows it:
+   "Dev Pond invites you to be an operator", with Accept and Decline.
+5. Accepting (`POST /pond/v1/roles/answer {offer, accept}`) gives them the role; every member hears of it (a `member`
+   event, now carrying `role`). Declining drops the offer. An offer not answered in 7 days lapses.
+
+`pondctl member role <member> member` takes a role away at once (no offer needed to step down), and
+`pondctl member list` shows each member's role. The server's admin can always do anything; nothing in the app can
+lock them out.
+
+Why an offer rather than granting outright: the member sees it happen and agrees, a mistyped id gives nobody power
+they did not ask for, and it uses the same event stream the Puddle already follows, so it reaches a Puddle behind NAT
+or a Levee like everything else.
+
+### Events for one member
+
+An offer is for one member, so its event must not reach the others. Events gain a column, `only_for`: an event with
+one is given only to that member's requests for events (the others skip its id, which is harmless: cursors only need
+to increase). `/info` also says the member's open offer, if any, so a Puddle that missed the event (a reset) still
+sees it.
+
+### What they do from the app
+
+Operators and administrators call admin routes, signed like everything else. The Pond looks up the sender's role; a
+member without one gets the same `404` as any refusal.
+
+| Route | Does |
+|---|---|
+| `POST /pond/v1/admin/pond` | `{name?, description?}` |
+| `POST /pond/v1/admin/channels/create` | `{name, topic?}` |
+| `POST /pond/v1/admin/channels/{channel}/edit` | `{name?, topic?}` |
+| `POST /pond/v1/admin/channels/{channel}/delete` | |
+| `POST /pond/v1/admin/members/{member}/remove` | Kick: they are out, and may come back with an invite |
+| `POST /pond/v1/admin/members/{member}/ban` | `{reason?}`: out, and refused if they try to join again |
+| `GET /pond/v1/admin/bans` | Who is banned, by whom, when and why |
+| `POST /pond/v1/admin/bans/{member}/unban` | |
+
+Rank decides who may act on whom: an operator on administrators and members, an administrator on members only.
+Nobody acts on an operator from the app (only `pondctl` can), and nobody on themselves. Each of these goes in
+`admin_log` (who, what, when), as do `pondctl`'s, for a record of who did what.
+
+Bans are by user id. A member who makes a new identity is a new member; banning by anything else (an address, a
+device) is not possible, since the Pond knows nothing else of them.
+
+### Protocol
+
+These are additions, so they stay in `/pond/v1`: `protocol` becomes 2, and `features` gains `roles`. A member and `me`
+gain `role` (`operator`, `administrator` or `member`), and `/info` gains `offer` (`{id, role}` or null).
+
+### Open questions
+
+- What an operator may do that an administrator may not, setting by setting.
+- Whether operators should be able to offer roles from the app, and administrators offer administrator.
+- Whether an operator may step down from the app, and whether the last operator may.
+- Bans with an end date, and a ban list that `pondctl` can import and export.
+
 ## What the database holds
 
 | Table | Columns |
@@ -249,6 +328,11 @@ first, and anything larger, or in older messages, when the owner asks. This is d
 | `invites` | `token`, `max_uses` (NULL = unlimited), `uses`, `expires_ms` (NULL = never), `created_ms`, `revoked` |
 | `messages` | `id`, `channel`, `author`, `text`, `nonce`, `ts_ms`; one index on `(channel, id)`, and a unique one on `(author, nonce)` |
 | `events` | `id`, `kind`, `data` (JSON), `ts_ms` |
+| `members` (more) | `role`: `operator`, `administrator` or `member` |
+| `role_offers` | `id`, `member`, `role`, `created_ms`; open until answered or 7 days old |
+| `bans` | `member`, `by` (a member id, or `pondctl`), `reason`, `ts_ms` |
+| `admin_log` | `id`, `by`, `action`, `target`, `detail`, `ts_ms` |
+| `events` (more) | `only_for`: a member id, for an event only they receive |
 | `files` | `id`, `size`, `chunks` (the hashes, 32 bytes each), `have` (a `0` or `1` per chunk), `whole`, `uploader`, `created_ms` |
 | `message_files` | `message`, `position`, `file`, and what the sender said of it: `name`, `mime`, `size`, `w`, `h`, `duration_ms`, `preview` |
 
@@ -269,14 +353,21 @@ pondctl channel delete <name>
 pondctl invite create [--uses N] [--expires 7d|24h|2026-12-31]
 pondctl invite list
 pondctl invite revoke <token>
-pondctl member list
-pondctl member remove <user id>
+pondctl member list                             with each member's role
+pondctl member offer <member> operator|administrator [--yes]   asks first; they accept in their app
+pondctl member role <member> member|administrator              take a role away, or lower it
+pondctl member remove <member>
+pondctl member ban <member> [--reason <text>]
+pondctl member unban <user id>
+pondctl member bans
+pondctl log [N]                                 the last N admin actions, from the app and from pondctl
 pondctl files                                   the largest file members may send, and the room files take
 pondctl files max-size <size>|off               25M, 1G, 500K...; off stops members sending files
 pondctl info                                    the Pond's id, address, certificate fingerprint and counts
 ```
 
-`invite create` prints the link to give out. `init` also makes a channel called `general`.
+`invite create` prints the link to give out. `init` also makes a channel called `general`. `<member>` is a user id, or
+part of a member's display name that only one member's has.
 
 ## `pond.yaml`
 
@@ -328,9 +419,8 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 
 ## Not yet
 
-- Roles and permissions, including who may post where, and admin from inside the app.
+- Permissions finer than the three roles, such as who may post where.
 - Editing, deleting and replying to messages, reactions, mentions, unread counts and typing indicators.
-- Bans. Removing a member does not stop them joining again with a valid invite.
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.
 - A Pond changing its TLS certificate. The Puddle pins the one it saw at join, so a new certificate (for example a

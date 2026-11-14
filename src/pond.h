@@ -36,8 +36,15 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has, none yet. */
-constexpr int PROTOCOL = 1;
-constexpr std::array<const char *, 1> FEATURES{"files"};
+constexpr int PROTOCOL = 2; /* 2: roles (docs/design.md, "Roles") */
+constexpr std::array<const char *, 2> FEATURES{"files", "roles"};
+
+/* Roles (docs/design.md, "Roles"), lowest first. An operator outranks an administrator. */
+enum class Role { MEMBER = 0, ADMINISTRATOR = 1, OPERATOR = 2 };
+const char *role_name(Role r);
+std::optional<Role> role_of_name(const std::string &s);
+constexpr int64_t OFFER_KEEP_MS = 7LL * 24 * 3600 * 1000;
+constexpr size_t BAN_REASON_MAX = 500;
 
 /* Files (docs/design.md, "Files"): split into chunks of FILE_CHUNK bytes as a Puddle splits them, so a file has the same id in
  * a Pond as in a Puddle. How large a file may be is the admin's choice (`pondctl files max-size`), up to FILE_HARD_MAX. */
@@ -104,7 +111,7 @@ public:
     Task<Answer> history(int64_t channel, int64_t before, int limit);
     Task<Answer> send(std::string member, int64_t channel, std::string text, std::string nonce, std::vector<FileRef> files = {});
     /* Answers when there is something after `after`, `wait_ms` pass, or stop(). */
-    Task<Answer> events(int64_t after);
+    Task<Answer> events(int64_t after, std::string member);
     Task<Answer> members();
     Task<Answer> set_profile(std::string member, std::string profile);
     Task<Answer> leave(std::string member);
@@ -115,6 +122,19 @@ public:
     /* Its chunk hashes, or chunk `n`: to a member, of a whole file a message in a live channel carries (or they sent). */
     Task<Answer> file_chunks(std::string member, std::string id);
     Task<Answer> file_chunk(std::string member, std::string id, int64_t n);
+    /* Roles (roles.cpp). Answer the open offer `offer` made to `member`. */
+    Task<Answer> answer_offer(std::string member, int64_t offer, bool accept);
+    /* `member`'s role; MEMBER for someone who is not one. */
+    Task<Role> role(std::string member);
+    /* What an operator or administrator does from the app; `by` is checked to hold a role first (the routes). */
+    Task<Answer> admin_pond(std::string by, std::optional<std::string> name, std::optional<std::string> description);
+    Task<Answer> admin_channel_create(std::string by, std::string name, std::string topic);
+    Task<Answer> admin_channel_edit(std::string by, int64_t channel, std::optional<std::string> name, std::optional<std::string> topic);
+    Task<Answer> admin_channel_delete(std::string by, int64_t channel);
+    Task<Answer> admin_remove(std::string by, std::string member, bool ban, std::string reason);
+    Task<Answer> admin_bans();
+    Task<Answer> admin_unban(std::string by, std::string member);
+
     /* The largest file members may send (0: files are turned off). */
     Task<int64_t> files_max();
 
@@ -129,6 +149,14 @@ public:
     Task<Outcome> invite_create(int max_uses, int64_t expires_ms, std::shared_ptr<std::string> token);
     Task<Outcome> invite_revoke(std::string token);
     Task<Outcome> member_remove(std::string id);
+    /* Offer `role` to the member `id` (replacing an open offer); they accept it in their app. */
+    Task<Outcome> offer_role(std::string id, Role role);
+    /* Set their role at once: for taking one away (or giving one without asking, which pondctl does not offer). */
+    Task<Outcome> set_role(std::string id, Role role, std::string by);
+    Task<Outcome> ban(std::string id, std::string reason, std::string by);
+    Task<Outcome> unban(std::string id, std::string by);
+    /* Record an admin action. */
+    Task<> log_admin(std::string by, std::string action, std::string target, std::string detail);
     Task<std::string> setting(std::string name);
     /* `bytes` 0 turns files off. */
     Task<Outcome> set_files_max(int64_t bytes);
@@ -147,7 +175,10 @@ private:
     struct Waiter;
     struct News;
     Task<Answer> enter(Chain chain, std::string invite, std::string profile);
-    Task<int64_t> add_event(const TxPtr &tx, const char *kind, const std::string &data);
+    Task<int64_t> add_event(const TxPtr &tx, const char *kind, const std::string &data, std::string only_for = "");
+    Task<std::string> offer_json(const std::string &member);
+    /* May `by` act on `target`? "" if so, else the error code. */
+    Task<std::string> may_act(const std::string &by, const std::string &target);
     Task<std::string> member_json_of(const DbPtr &db, const std::string &id);
     Task<std::string> pond_json(const DbPtr &db);
     Task<std::string> channels_json();

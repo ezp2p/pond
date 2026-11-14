@@ -43,6 +43,18 @@ static const char *const STEPS[][8] = {
         " duration_ms BIGINT NULL, preview TEXT NULL, PRIMARY KEY (message, position), KEY (file)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         nullptr,
     },
+    {
+        /* roles (docs/design.md, "Roles"), offers of them, bans, the admin log, and events for one member */
+        "ALTER TABLE members ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'member'",
+        "ALTER TABLE events ADD COLUMN only_for CHAR(52) NULL",
+        "CREATE TABLE role_offers (id BIGINT AUTO_INCREMENT PRIMARY KEY, member CHAR(52) NOT NULL, role VARCHAR(16) NOT NULL,"
+        " created_ms BIGINT NOT NULL, KEY (member)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE bans (member CHAR(52) PRIMARY KEY, by_who VARCHAR(52) NOT NULL, reason VARCHAR(500) NOT NULL DEFAULT '',"
+        " ts_ms BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE admin_log (id BIGINT AUTO_INCREMENT PRIMARY KEY, by_who VARCHAR(52) NOT NULL, action VARCHAR(32) NOT NULL,"
+        " target VARCHAR(128) NOT NULL DEFAULT '', detail TEXT NULL, ts_ms BIGINT NOT NULL, KEY (ts_ms)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run

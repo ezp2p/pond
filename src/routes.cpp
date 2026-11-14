@@ -24,7 +24,62 @@ constexpr int UNKNOWN = -1; /* the status of an answer that must look like a pat
 
 static const Answer NOT_FOUND = {UNKNOWN, ""};
 
-enum Kind { JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, NONE };
+enum Kind {
+    JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
+    ADMIN_POND, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN, NONE
+};
+
+/* The routes only an operator or administrator may use (docs/design.md, "Roles"). */
+static bool is_admin(int k)
+{
+    return k >= ADMIN_POND && k <= ADMIN_UNBAN;
+}
+
+/* A user id: 52 of base32. */
+static bool user_id_ok(std::string_view s)
+{
+    if (s.size() != 52)
+        return false;
+    for (char c : s)
+        if (!((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7')))
+            return false;
+    return true;
+}
+
+static int64_t number_of(std::string_view s, bool zero);
+
+/* The routes under /pond/v1/admin/: the channel or member in the path, if any. */
+static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channel, std::string &member)
+{
+    if (post && p == "pond") return ADMIN_POND;
+    if (post && p == "channels/create") return ADMIN_CHANNEL_CREATE;
+    if (get && p == "bans") return ADMIN_BANS;
+    auto split = [&](std::string_view prefix, std::string_view &id, std::string_view &verb) {
+        if (p.substr(0, prefix.size()) != prefix)
+            return false;
+        std::string_view rest = p.substr(prefix.size());
+        size_t slash = rest.find('/');
+        if (slash == std::string_view::npos)
+            return false;
+        id = rest.substr(0, slash), verb = rest.substr(slash + 1);
+        return true;
+    };
+    std::string_view id, verb;
+    if (post && split("channels/", id, verb) && (channel = number_of(id, false)) > 0) {
+        if (verb == "edit") return ADMIN_CHANNEL_EDIT;
+        if (verb == "delete") return ADMIN_CHANNEL_DELETE;
+    }
+    if (post && split("members/", id, verb) && user_id_ok(id)) {
+        member = std::string(id);
+        if (verb == "remove") return ADMIN_REMOVE;
+        if (verb == "ban") return ADMIN_BAN;
+    }
+    if (post && split("bans/", id, verb) && user_id_ok(id) && verb == "unban") {
+        member = std::string(id);
+        return ADMIN_UNBAN;
+    }
+    return NONE;
+}
 
 /* A whole number of up to 18 digits with no leading zero (or "0" when `zero`), as all of `s`. -1 if it is not one. */
 static int64_t number_of(std::string_view s, bool zero)
@@ -55,7 +110,7 @@ static Kind file_route(bool get, bool post, std::string_view p, std::string &fil
 }
 
 /* Which route `method path` is, and the channel id, file id and chunk number in it if it has them. */
-static Kind route_of(const std::string &method, std::string_view p, int64_t &channel, std::string &file, int64_t &n)
+static Kind route_of(const std::string &method, std::string_view p, int64_t &channel, std::string &file, int64_t &n, std::string &member)
 {
     bool get = method == "GET", post = method == "POST";
     if (p.substr(0, 9) != "/pond/v1/")
@@ -70,6 +125,9 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     if (post && p == "leave") return LEAVE;
     if (p.substr(0, 6) == "files/")
         return file_route(get, post, p.substr(6), file, n);
+    if (post && p == "roles/answer") return ROLE_ANSWER;
+    if (p.substr(0, 6) == "admin/")
+        return admin_route(get, post, p.substr(6), channel, member);
     if (p.substr(0, 9) != "channels/")
         return NONE;
     p.remove_prefix(9);
@@ -89,7 +147,8 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 /* Routes whose body is a JSON object. FILE_PUT's is a chunk's bytes. */
 static bool takes_body(Kind k)
 {
-    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN;
+    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND ||
+           k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN;
 }
 
 static size_t body_max(Kind k)
@@ -181,8 +240,8 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req)
     std::string target = req->query().empty() ? path : path + "?" + req->query();
     std::string body(req->body());
     int64_t channel = 0, chunk = -1;
-    std::string file;
-    Kind k = route_of(method, path, channel, file, chunk);
+    std::string file, member;
+    Kind k = route_of(method, path, channel, file, chunk, member);
     if (k == NONE || (!takes_body(k) && k != FILE_PUT && !body.empty()) || body.size() > body_max(k))
         co_return NOT_FOUND;
     int64_t now = now_ms();
@@ -237,6 +296,19 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req)
     const std::string &sender = sig.id;
     if (takes_body(k) && !json_ok)
         co_return fail(400, "bad_request");
+    if (is_admin(k) && co_await svc_.role(sender) == Role::MEMBER)
+        co_return NOT_FOUND; /* to a member without a role, these do not exist */
+
+    /* an optional string member: false if it is there and not a string */
+    auto opt_string = [&](const char *key, std::optional<std::string> &out) {
+        std::string v;
+        if (!json.isMember(key))
+            return true;
+        if (!get_string(json, key, v))
+            return false;
+        out = v;
+        return true;
+    };
 
     switch (k) {
     case JOIN: {
@@ -279,7 +351,7 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req)
         std::map<std::string, int64_t> q;
         if (!query_numbers(req->query(), {"after"}, q))
             co_return fail(400, "bad_query");
-        co_return co_await svc_.events(q.count("after") ? q["after"] : 0);
+        co_return co_await svc_.events(q.count("after") ? q["after"] : 0, sender);
     }
     case MEMBERS:
         co_return co_await svc_.members();
@@ -308,6 +380,42 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req)
         co_return co_await svc_.file_chunks(sender, file);
     case FILE_GET:
         co_return co_await svc_.file_chunk(sender, file, chunk);
+    case ROLE_ANSWER:
+        if (!json.isMember("offer") || !json["offer"].isInt64() || !json.isMember("accept") || !json["accept"].isBool())
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.answer_offer(sender, json["offer"].asInt64(), json["accept"].asBool());
+    case ADMIN_POND: {
+        std::optional<std::string> name, description;
+        if (!opt_string("name", name) || !opt_string("description", description))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_pond(sender, name, description);
+    }
+    case ADMIN_CHANNEL_CREATE: {
+        std::optional<std::string> name, topic;
+        if (!opt_string("name", name) || !name || !opt_string("topic", topic))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_channel_create(sender, *name, topic.value_or(""));
+    }
+    case ADMIN_CHANNEL_EDIT: {
+        std::optional<std::string> name, topic;
+        if (!opt_string("name", name) || !opt_string("topic", topic))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_channel_edit(sender, channel, name, topic);
+    }
+    case ADMIN_CHANNEL_DELETE:
+        co_return co_await svc_.admin_channel_delete(sender, channel);
+    case ADMIN_REMOVE:
+        co_return co_await svc_.admin_remove(sender, member, false, "");
+    case ADMIN_BAN: {
+        std::optional<std::string> reason;
+        if (!opt_string("reason", reason))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_remove(sender, member, true, reason.value_or(""));
+    }
+    case ADMIN_BANS:
+        co_return co_await svc_.admin_bans();
+    case ADMIN_UNBAN:
+        co_return co_await svc_.admin_unban(sender, member);
     case NONE:
         break;
     }
