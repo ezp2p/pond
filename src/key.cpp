@@ -79,7 +79,26 @@ bool load_key(const std::string &data_dir, PondKey &out, std::string &err)
         return false;
     }
     ok = public_of(seed, out, err);
+    if (ok) {
+        out.secret.reset(EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, seed, 32), EVP_PKEY_free);
+        if (!out.secret) {
+            err = "cannot load the Pond's key";
+            ok = false;
+        }
+    }
     OPENSSL_cleanse(seed, sizeof seed);
+    return ok;
+}
+
+bool PondKey::sign(std::string_view data, unsigned char sig[64]) const
+{
+    if (!secret)
+        return false;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    size_t len = 64;
+    bool ok = ctx && EVP_DigestSignInit(ctx, nullptr, nullptr, nullptr, secret.get()) == 1 &&
+              EVP_DigestSign(ctx, sig, &len, (const unsigned char *)data.data(), data.size()) == 1 && len == 64;
+    EVP_MD_CTX_free(ctx);
     return ok;
 }
 

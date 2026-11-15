@@ -119,7 +119,7 @@ int main()
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":2,\"features\":[\"files\",\"roles\"]"));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":3,\"features\":[\"files\",\"roles\",\"receipts\"]"));
 
     std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";
@@ -215,6 +215,31 @@ int main()
     CHECK(pond.up());
     CHECK(ben.post(msgs + "/send", "{\"body\":\"after the restart\"}") == 200);
     CHECK(until([&] { return has(ann.get(msgs), "after the restart"); }, 70000)); /* a follower backs off up to 60 s */
+
+    /* ---- receipts (the Puddle Protocol, spec/05): someone else at the Pond's address can't pass for it ---- */
+    /* another key and another certificate, as someone who had taken over the address would have; even the same database */
+    pond.down();
+    std::filesystem::rename(pond.dir + "/pond.key", pond.dir + "/pond.key.real");
+    std::filesystem::remove(pond.dir + "/cert.pem");
+    std::filesystem::remove(pond.dir + "/key.pem");
+    {
+        unsigned char seed[32];
+        random_bytes(seed, sizeof seed);
+        std::ofstream(pond.dir + "/pond.key") << hex(seed, 32) << "\n";
+        chmod((pond.dir + "/pond.key").c_str(), 0600);
+    }
+    CHECK(pond.up());
+    CHECK(ann.post(msgs + "/send", "{\"body\":\"to an impostor\"}", &out) == 502 && has(out, "not_proven"));
+    CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"status\":\"not_proven\""); }, 70000));
+    /* the real Pond back, with the new certificate: renewed, as a Let's Encrypt one is every few months. Its members prove it
+     * by its receipt and carry on, where once they pinned the old one and stopped. */
+    pond.down();
+    std::filesystem::rename(pond.dir + "/pond.key.real", pond.dir + "/pond.key");
+    CHECK(pond.up());
+    CHECK(ann.post(msgs + "/send", "{\"body\":\"after a new certificate\"}") == 200);
+    CHECK(until([&] { return has(ben.get(msgs), "after a new certificate"); }, 70000));
+    CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"status\":\"connected\""); }));
+    CHECK(!has(ann.get(msgs), "to an impostor"));
 
     /* ---- roles: offered from pondctl, accepted in the app, and used from it ---- */
     CHECK(pond.ctl("member offer " + str_of(ann.get(P), "me") + " operator --yes") == 0);

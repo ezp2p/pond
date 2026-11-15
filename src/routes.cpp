@@ -233,7 +233,7 @@ static bool body_chain(const Json::Value &json, Chain &out)
     return true;
 }
 
-Task<Answer> Routes::answer(const HttpRequestPtr &req)
+Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
 {
     std::string method = req->methodString();
     const std::string &path = req->getOriginalPath();
@@ -280,7 +280,12 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req)
         return true;
     };
     std::string me = k == JOIN ? "*" : svc_.key().id;
-    switch (authenticate(header, method, target, body, me, lookup, replay_, now, sig)) {
+    Authn authn = authenticate(header, method, target, body, me, lookup, replay_, now, sig);
+    if (authn != Authn::REJECT) { /* who it says: answers to them are signed */
+        signing.nonce = sig.nonce;
+        signing.only_ok = k == JOIN;
+    }
+    switch (authn) {
     case Authn::OK:
         break;
     case Authn::REJECT:
@@ -434,8 +439,9 @@ HttpResponsePtr Routes::not_found()
 Task<HttpResponsePtr> Routes::handle(HttpRequestPtr req)
 {
     Answer a;
+    Signing signing;
     try {
-        a = co_await answer(req);
+        a = co_await answer(req, signing);
     } catch (const drogon::orm::DrogonDbException &e) {
         LOG_ERROR << "database: " << e.base().what();
         a = fail(500, "database");
@@ -449,6 +455,13 @@ Task<HttpResponsePtr> Routes::handle(HttpRequestPtr req)
     } else {
         r = HttpResponse::newHttpResponse();
         r->setStatusCode((drogon::HttpStatusCode)a.status);
+        if (!signing.nonce.empty() && (!signing.only_ok || a.status == 200)) {
+            std::string receipt = receipt_header(svc_.key(), signing.nonce, a.status, a.body, tls_fp_);
+            if (!receipt.empty())
+                r->addHeader("X-Puddle-Receipt", receipt);
+            else
+                LOG_ERROR << "cannot sign a receipt";
+        }
         if (!a.body.empty()) {
             r->setContentTypeCode(a.bytes ? drogon::CT_APPLICATION_OCTET_STREAM : drogon::CT_APPLICATION_JSON);
             r->setBody(std::move(a.body));

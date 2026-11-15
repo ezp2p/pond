@@ -100,4 +100,60 @@ Authn authenticate(std::string_view header, std::string_view method, std::string
     return Authn::BUSY;
 }
 
+std::string receipt_canonical(std::string_view id, std::string_view nonce, int status, std::string_view body, std::string_view fp)
+{
+    std::string s = "puddle-receipt-v1\n";
+    s.append(id).append("\n").append(nonce).append("\n").append(std::to_string(status)).append("\n");
+    s.append(sha256_hex(body)).append("\n").append(fp);
+    return s;
+}
+
+std::string receipt_header(const PondKey &key, std::string_view nonce, int status, std::string_view body, std::string_view fp)
+{
+    unsigned char sig[64];
+    if (!key.sign(receipt_canonical(key.id, nonce, status, body, fp), sig))
+        return "";
+    return "v1 id=" + key.id + "; kid=" + key_id(key.pub) + "; fp=" + std::string(fp) + "; sig=" + base64(sig, 64);
+}
+
+static bool hex64(std::string_view s)
+{
+    if (s.size() != 64)
+        return false;
+    for (char c : s)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
+
+Receipt check_receipt(std::string_view h, std::string_view id, const unsigned char pub[32], std::string_view nonce, int status,
+                      std::string_view body, std::string_view seen_fp)
+{
+    if (h.empty())
+        return Receipt::MISSING;
+    static const std::string_view seps[] = {"v1 id=", "; kid=", "; fp=", "; sig="};
+    if (h.size() > 1000)
+        return Receipt::BAD;
+    std::string_view vals[4];
+    size_t p = 0;
+    for (int i = 0; i < 4; i++) {
+        if (h.compare(p, seps[i].size(), seps[i]) != 0)
+            return Receipt::BAD;
+        p += seps[i].size();
+        size_t end = i < 3 ? h.find(seps[i + 1], p) : h.size();
+        if (end == std::string_view::npos || end == p || end - p >= 120)
+            return Receipt::BAD;
+        vals[i] = h.substr(p, end - p);
+        p = end;
+    }
+    unsigned char sig[64];
+    if (!id_valid(vals[0]) || !hex64(vals[1]) || !hex64(vals[2]) || !unbase64(vals[3], sig, 64))
+        return Receipt::BAD;
+    if (vals[0] != id || vals[1] != key_id(pub))
+        return Receipt::WRONG_KEY;
+    if (!verify_signature(pub, receipt_canonical(vals[0], nonce, status, body, vals[2]), sig))
+        return Receipt::BAD;
+    return vals[2] == seen_fp ? Receipt::OK : Receipt::OTHER_CERT; /* theirs, but for a certificate other than the one we saw */
+}
+
 } // namespace pond
