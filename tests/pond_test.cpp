@@ -3,8 +3,19 @@
  * path. The admin's side is pondctl. */
 
 #include "harness.h"
+#include "identity.h"
+#include "reqsig.h"
 
 using namespace pond;
+
+/* The Pond's key, as a member's Puddle learns it from a join: hex in `pond.key`, and its id the base32 of its SHA-256. */
+static unsigned char pond_pub[32];
+
+/* What a member's Puddle makes of the receipt on `r` (the Puddle Protocol, spec/02-signatures.md). */
+static Receipt receipt(const Reply &r, const std::string &pond_id)
+{
+    return check_receipt(r.receipt, pond_id, pond_pub, r.nonce, r.status, r.body, r.fp);
+}
 
 static std::string join_body(const Identity &who, const std::string &invite, const char *name)
 {
@@ -53,6 +64,28 @@ int main()
 
     a = pond.call(&ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), "*");
     CHECK(a.status == 200);
+    {
+        /* the join's answer says who the Pond is, and is signed by that key, over the certificate this connection showed */
+        std::string key = parse(a.body)["pond"]["key"].asString();
+        unsigned char h[32];
+        CHECK(unhex(key, pond_pub, 32));
+        sha256(pond_pub, 32, h);
+        CHECK(base32(h, 32) == P);
+        CHECK(!a.receipt.empty() && receipt(a, P) == Receipt::OK);
+        Reply changed = a;
+        changed.body += " ";
+        CHECK(receipt(changed, P) == Receipt::BAD); /* covers the body */
+        changed = a;
+        changed.status = 404;
+        CHECK(receipt(changed, P) == Receipt::BAD); /* and the status */
+        changed = a;
+        changed.fp = std::string(64, 'a');
+        CHECK(receipt(changed, P) == Receipt::OTHER_CERT); /* someone in the middle, passing it on over a connection of their own */
+        changed = a;
+        changed.nonce = "AAAAAAAAAAAAAAAAAAAAAA==";
+        CHECK(receipt(changed, P) == Receipt::BAD); /* and is for this request only */
+        CHECK(receipt(a, ann.id) == Receipt::WRONG_KEY);
+    }
     CHECK(has(a.body, "\"name\":\"Test Pond\"") && has(a.body, "\"name\":\"general\"") && has(a.body, ann.id) &&
           has(a.body, "\"display_name\":\"Ann\""));
     CHECK(pond.call(&ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann B"), "*").status == 200); /* again: spends nothing */
@@ -65,7 +98,19 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 2 && has(a.body, "\"features\":[\"files\",\"roles\"]"));
+    CHECK(num_of(a.body, "protocol") == 3 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\"]"));
+    CHECK(receipt(a, P) == Receipt::OK);
+    Reply b;
+    /* no receipt for what anyone may be told: a failed check, a join that did not work */
+    b = pond.call(&dan, "GET", "/pond/v1/info");
+    CHECK(b.status == 404 && b.receipt.empty());
+    b = pond.call(&dan, "POST", "/pond/v1/join", join_body(dan, forever, "Dan"), "*");
+    CHECK(b.status == 404 && b.receipt.empty());
+    b = pond.call(&dan, "POST", "/pond/v1/join", "{\"invite\":1,\"chain\":" + jstr(dan.chain) + "}", "*");
+    CHECK(b.status == 400 && b.receipt.empty());
+    /* a member's own 404 (a channel that isn't there) is the Pond's answer, and signed */
+    b = pond.call(&ann, "GET", "/pond/v1/channels/999/messages");
+    CHECK(b.status == 404 && has(b.body, "no_channel") && receipt(b, P) == Receipt::OK);
     int64_t cursor = num_of(a.body, "cursor");
     CHECK(cursor > 0);
     a = pond.call(&ann, "GET", "/pond/v1/members");
@@ -121,7 +166,7 @@ int main()
 
     /* a request that is waiting is answered as soon as something happens, here from the admin's side */
     pond.down();
-    CHECK(run("sed -i '' 's/events_wait_ms: 300/events_wait_ms: 5000/' " + pond.conf) == 0);
+    CHECK(run("sed -i.bak 's/events_wait_ms: 300/events_wait_ms: 5000/' " + pond.conf) == 0);
     CHECK(pond.up());
     Reply woke;
     std::thread waiter([&] { woke = pond.call(&cat, "GET", "/pond/v1/events?after=" + std::to_string(next)); });
@@ -181,7 +226,7 @@ int main()
                             base64((const unsigned char *)hashes.data(), hashes.size()) + "\"}";
         CHECK(pond.call(&dan, "POST", "/pond/v1/join", join_body(dan, invite(pond, ""), "Dan"), "*").status == 200);
         a = pond.call(&ann, "GET", "/pond/v1/info");
-        CHECK(has(a.body, "\"features\":[\"files\",\"roles\"]") && has(a.body, "\"files\":{\"max_size\":26214400,\"chunk_size\":1048576"));
+        CHECK(has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\"]") && has(a.body, "\"files\":{\"max_size\":26214400,\"chunk_size\":1048576"));
         CHECK(pond.ctl("files max-size 2M") == 0);
         a = pond.call(&ann, "POST", F, begin);
         CHECK(a.status == 413 && has(a.body, "\"max\":2097152")); /* over what the admin allows */
@@ -216,8 +261,11 @@ int main()
         CHECK(has(a.body, "\"name\":\"a.bin\"") && has(a.body, "\"size\":2621440"));
         CHECK(pond.call(&dan, "GET", F + "/chunks").body == hashes);
         std::string got;
-        for (int n = 0; n < 3; n++)
-            got += pond.call(&dan, "GET", F + "/chunks/" + std::to_string(n)).body;
+        for (int n = 0; n < 3; n++) {
+            Reply c = pond.call(&dan, "GET", F + "/chunks/" + std::to_string(n));
+            CHECK(receipt(c, P) == Receipt::OK); /* over the bytes of the chunk */
+            got += c.body;
+        }
         CHECK(got == bytes);
         CHECK(pond.call(&dan, "GET", F + "/chunks/3").status == 404);
         CHECK(pond.call(&ben, "GET", F + "/chunks/0").status == 404); /* not a member */
@@ -300,7 +348,7 @@ int main()
     CHECK(pond.call(&ann, "GET", "/").status == 404);
     CHECK(pond.call(&ann, "GET", "/pond/v1/info", "", std::string(52, 'a')).status == 404); /* signed for another Pond */
     a = pond.call(&ann, "GET", "/pond/v1/info", "", "", -10 * 60 * 1000);
-    CHECK(a.status == 401 && has(a.body, "clock_skew")); /* a member may be told their clock is off */
+    CHECK(a.status == 401 && has(a.body, "clock_skew") && receipt(a, P) == Receipt::OK); /* a member may be told their clock is off */
     std::string sig = ann.signature("GET", "/pond/v1/info", "", P);
     CHECK(https(pond.port, "GET", "/pond/v1/info", "", {"X-Puddle-Signature: " + sig}).status == 200);
     a = https(pond.port, "GET", "/pond/v1/info", "", {"X-Puddle-Signature: " + sig});
