@@ -48,7 +48,7 @@ which knows nothing of `kind`, working: it shows the channel as a text channel, 
 Being in a voice channel is shown to every member, so the Pond tells everyone:
 
 - `voice`: someone came into a voice channel, or changed how they are in it:
-  `{channel, member, slot, muted, deafened, camera}`.
+  `{channel, member, slot, muted, deafened, camera, screen}`.
 - `voice_left`: someone left one: `{channel, member}`.
 
 `/info` gains `voice`: for each voice channel with anyone in it, who is (the same fields). So a Puddle that missed events
@@ -67,12 +67,13 @@ The Puddle makes the connection, signed like every request a member makes, and a
 | Route | Body | Answer |
 |---|---|---|
 | `POST /pond/v1/channels/{channel}/voice/join` | `{sdp, udp}` | `200 {session, sdp, udp, slot}`; `404` not a voice channel |
-| `POST /pond/v1/voice/{session}/state` | `{muted, deafened, camera}` | `204` |
-| `POST /pond/v1/voice/{session}/watch` | `{tracks: {"v1": member, ...}}` | `204`: whose camera to send on which track ("Video") |
+| `POST /pond/v1/voice/{session}/state` | `{muted, deafened, camera, screen}` | `204` |
+| `POST /pond/v1/voice/{session}/watch` | `{tracks: {"v1": member, "v2": "<member>/screen", ...}}` | `204`: whose camera or screen to send on which track ("Video") |
 | `POST /pond/v1/voice/{session}/leave` | | `204` |
 
 - **The offer** is the Puddle's, complete with its candidates (nothing trickles), as with a phone's leg. It has an Opus
-  track `audio` and an H.264 track `video`, both sent by the Puddle; video tracks `v1` to `v16` that only come in; and a
+  track `audio`, an H.264 track `video` (the camera) and another, `screen` (a shared screen), all sent by the Puddle; video
+  tracks `v1` to `v16` that only come in; and a
   data channel `frames` (unordered, never sent again) for the voices that come back. `udp` is the port the Puddle's calls
   use, so the Pond can add the Puddle's own addresses; behind NAT those won't answer, and the peer-reflexive one will.
 - **The answer** names the Pond's UDP port for voice (`voice.port` in `pond.yaml`, the HTTPS port's number unless set),
@@ -141,7 +142,10 @@ window can show at a useful size, and 16 cameras is about 10 Mbit/s coming in.
 - When a member starts watching a camera, the Pond holds that track back until the camera's next key frame, so nobody is
   shown a picture smeared from missing the start. At most 2 seconds.
 
-Screen sharing would be a second video track from the Puddle, watched the same way; it comes after.
+**Sharing a screen** is a second video track from the Puddle, `screen`, sent while `screen` is true in its state (so everyone
+sees who is sharing). Several members may share at once. It is watched the same way, on any of v1 .. v16, as
+`"<member>/screen"` instead of the member's id; a watcher chooses which of the screens shared to look at. It may be larger
+than a camera's picture and carry more (up to 4 Mbit/s, apart from the camera's 2), so text on it stays sharp.
 
 ## Moderation
 
@@ -225,7 +229,6 @@ more than one.
 
 - **Encryption only members can undo** (SFrame): each member encrypts their frames with a key the channel's members
   share, and the Pond forwards what it can't read. Nothing above changes but the frames' contents.
-- **Screen sharing**, as a second video track.
 - **Asking for a key frame** (RTCP PLI) and resending lost packets (NACK), as for calls.
 - **A smaller picture for small tiles** (simulcast: each camera sent at two sizes, and the Pond sends each watcher the one
   that fits), and bitrate that follows each member's connection.

@@ -1,9 +1,10 @@
 #pragma once
 
 /* Voice channels (docs/voice.md): members drop into one and talk, and the Pond forwards. Each member's Puddle makes one WebRTC
- * connection to the Pond (it offers, we answer), sends its owner's voice on an Opus track and camera on an H.264 track, and
+ * connection to the Pond (it offers, we answer), sends its owner's voice on an Opus track, camera on an H.264 track (`video`)
+ * and a shared screen on another (`screen`), and
  * gets back every other voice in the channel over a data channel, `frames` (a 2-byte slot, a 4-byte RTP timestamp, the Opus
- * frame), and the cameras it asked to watch on its video tracks v1 .. v16. The Pond decodes nothing.
+ * frame), and the cameras and screens it asked to watch on its video tracks v1 .. v16. The Pond decodes nothing.
  *
  * Who is in which channel lives here, in memory: it is gone when pondd stops, as the connections are. Members hear of it as
  * ordinary events (`voice`, `voice_left`), sent once a connection is up, and in /info. Only built with libdatachannel
@@ -50,8 +51,9 @@ public:
     /* `peer_ip` is the address the request came from: the Pond adds it, at the `udp` the Puddle said, as a candidate. */
     Task<Answer> join(std::string member, int64_t channel, std::string sdp, int udp, std::string peer_ip);
     Answer state(const std::string &member, const std::string &session, std::optional<bool> muted, std::optional<bool> deafened,
-                 std::optional<bool> camera);
-    /* `tracks`: track number (1 .. VOICE_TRACKS) to the member whose camera goes on it, "" for none */
+                 std::optional<bool> camera, std::optional<bool> screen = std::nullopt);
+    /* `tracks`: track number (1 .. VOICE_TRACKS) to whose camera goes on it (a member's id), or whose shared screen ("<id>/screen");
+     * "" for none */
     Answer watch(const std::string &member, const std::string &session, const std::map<int, std::string> &tracks);
     Answer leave(const std::string &member, const std::string &session);
 

@@ -32,7 +32,7 @@ bool Voice::built() { return false; }
 void Voice::start() {}
 void Voice::stop() {}
 Task<Answer> Voice::join(std::string, int64_t, std::string, int, std::string) { co_return fail(404, "no_channel"); }
-Answer Voice::state(const std::string &, const std::string &, std::optional<bool>, std::optional<bool>, std::optional<bool>)
+Answer Voice::state(const std::string &, const std::string &, std::optional<bool>, std::optional<bool>, std::optional<bool>, std::optional<bool>)
 {
     return fail(404, "no_session");
 }
@@ -165,18 +165,20 @@ struct Session {
     int64_t channel = 0;
     int slot = 0;
     std::shared_ptr<rtc::PeerConnection> pc;
-    std::shared_ptr<rtc::Track> voice, camera_in; /* theirs to us: held here, since the connection holds its tracks weakly */
+    std::shared_ptr<rtc::Track> voice, camera_in, screen_in; /* theirs to us: held here, since the connection holds its tracks weakly */
     std::shared_ptr<rtc::DataChannel> dc;   /* the others' voices to them */
-    std::shared_ptr<rtc::Track> out[VOICE_TRACKS + 1]; /* [n]: the camera they watch on v<n> */
+    std::shared_ptr<rtc::Track> out[VOICE_TRACKS + 1]; /* [n]: the camera or screen they watch on v<n> */
     uint32_t base[VOICE_TRACKS + 1] = {};   /* our timestamps on each are the sender's, moved by this much */
     bool waiting[VOICE_TRACKS + 1] = {};    /* hold back until a key frame: the start of a picture */
-    std::string watching[VOICE_TRACKS + 1]; /* whose camera, by member id */
+    std::string watching[VOICE_TRACKS + 1]; /* whose camera (a member's id), or screen ("<id>/screen") */
     bool dc_open = false, connected = false, announced = false, gone = false;
-    bool muted = false, deafened = false, camera = false;
+    bool muted = false, deafened = false, camera = false, screen = false;
     int64_t started = 0, lost_since = 0;
     Bucket audio_limit{20, 16};             /* about 60 frames a second */
     Bucket video_limit{30, 33};             /* about 30 a second */
     int64_t video_window = 0, video_bytes = 0; /* and 2 Mbit/s */
+    Bucket screen_limit{30, 33};            /* a shared screen: as many frames */
+    int64_t screen_window = 0, screen_bytes = 0; /* and 4 Mbit/s, for text to stay sharp */
 };
 using SessionPtr = std::shared_ptr<Session>;
 
@@ -203,7 +205,7 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
     {
         return "{\"channel\":" + std::to_string(s.channel) + ",\"member\":" + jstr(s.member) + ",\"slot\":" + std::to_string(s.slot) +
                ",\"muted\":" + (s.muted ? "true" : "false") + ",\"deafened\":" + (s.deafened ? "true" : "false") +
-               ",\"camera\":" + (s.camera ? "true" : "false") + "}";
+               ",\"camera\":" + (s.camera ? "true" : "false") + ",\"screen\":" + (s.screen ? "true" : "false") + "}";
     }
 
     /* lock held */
@@ -316,7 +318,8 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
             }
     }
 
-    void on_video(const std::weak_ptr<Session> &weak, const rtc::binary &au, uint32_t ts)
+    /* A frame of a member's camera, or of the screen they share (`screen`): to each track watching it, from a key frame on */
+    void on_video(const std::weak_ptr<Session> &weak, const rtc::binary &au, uint32_t ts, bool screen)
     {
         if (au.empty() || au.size() > VOICE_VIDEO_MAX)
             return;
@@ -325,13 +328,15 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
         {
             std::lock_guard<std::mutex> g(mu);
             SessionPtr s = weak.lock();
-            if (!s || s->gone || !s->camera)
+            if (!s || s->gone || !(screen ? s->screen : s->camera))
                 return;
             int64_t now = steady_ms();
-            if (now - s->video_window >= 1000)
-                s->video_window = now, s->video_bytes = 0;
-            if (!s->video_limit.take(now) || (s->video_bytes += (int64_t)au.size()) > 2000000 / 8)
+            int64_t &window = screen ? s->screen_window : s->video_window, &bytes = screen ? s->screen_bytes : s->video_bytes;
+            if (now - window >= 1000)
+                window = now, bytes = 0;
+            if (!(screen ? s->screen_limit : s->video_limit).take(now) || (bytes += (int64_t)au.size()) > (screen ? 4000000 : 2000000) / 8)
                 return;
+            const std::string key_of = screen ? s->member + "/screen" : s->member;
             auto it = in_channel.find(s->channel);
             if (it == in_channel.end())
                 return;
@@ -339,7 +344,7 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
                 if (r == s)
                     continue;
                 for (int n = 1; n <= VOICE_TRACKS; n++) {
-                    if (r->watching[n] != s->member || !track_open(r->out[n]))
+                    if (r->watching[n] != key_of || !track_open(r->out[n]))
                         continue;
                     if (r->waiting[n] && !key)
                         continue;
@@ -395,7 +400,7 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
             SessionPtr old = of_member.count(member) ? of_member[member] : nullptr;
             if (old && old->channel == channel) { /* again, in the same channel: a new connection, the same place */
                 s->slot = old->slot;
-                s->muted = old->muted, s->deafened = old->deafened, s->camera = old->camera;
+                s->muted = old->muted, s->deafened = old->deafened, s->camera = old->camera, s->screen = old->screen;
             } else {
                 size_t in = in_channel.count(channel) ? in_channel[channel].size() : 0;
                 if (set.max_in_channel && in >= set.max_in_channel)
@@ -433,10 +438,10 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
                 if (!me)
                     return;
                 const std::string mid = track->mid();
-                if (mid == "audio" || mid == "video") {
+                if (mid == "audio" || mid == "video" || mid == "screen") {
                     std::lock_guard<std::mutex> g(me->mu);
                     if (SessionPtr s = weak.lock())
-                        (mid == "audio" ? s->voice : s->camera_in) = track;
+                        (mid == "audio" ? s->voice : mid == "video" ? s->camera_in : s->screen_in) = track;
                 }
                 if (mid == "audio") {
                     opus_in(track);
@@ -444,11 +449,12 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
                         if (auto me = self.lock())
                             me->on_voice(weak, data, info.timestamp);
                     });
-                } else if (mid == "video") {
+                } else if (mid == "video" || mid == "screen") {
                     h264_in(track);
-                    track->onFrame([self, weak](rtc::binary data, rtc::FrameInfo info) {
+                    const bool screen = mid == "screen";
+                    track->onFrame([self, weak, screen](rtc::binary data, rtc::FrameInfo info) {
                         if (auto me = self.lock())
-                            me->on_video(weak, data, info.timestamp);
+                            me->on_video(weak, data, info.timestamp, screen);
                     });
                 } else if (int n = track_number(mid)) {
                     h264_out(track);
@@ -683,13 +689,15 @@ Task<Answer> Voice::join(std::string member, int64_t channel, std::string sdp, i
 }
 
 Answer Voice::state(const std::string &member, const std::string &session, std::optional<bool> muted, std::optional<bool> deafened,
-                    std::optional<bool> camera)
+                    std::optional<bool> camera, std::optional<bool> screen)
 {
     std::lock_guard<std::mutex> g(impl_->mu);
     SessionPtr s = impl_->mine(member, session);
     if (!s)
         return fail(404, "no_session");
-    bool changed = (muted && *muted != s->muted) || (deafened && *deafened != s->deafened) || (camera && *camera != s->camera);
+    bool changed = (muted && *muted != s->muted) || (deafened && *deafened != s->deafened) || (camera && *camera != s->camera) ||
+                   (screen && *screen != s->screen);
+    s->screen = screen.value_or(s->screen);
     s->muted = muted.value_or(s->muted);
     s->deafened = deafened.value_or(s->deafened);
     s->camera = camera.value_or(s->camera);

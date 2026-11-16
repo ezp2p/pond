@@ -329,7 +329,7 @@ paths:
       requestBody:
         content:
           application/json:
-            schema: { type: object, properties: { muted: { type: boolean }, deafened: { type: boolean }, camera: { type: boolean } } }
+            schema: { type: object, properties: { muted: { type: boolean }, deafened: { type: boolean }, camera: { type: boolean }, screen: { type: boolean, description: "Sharing a screen, on the `screen` track" } } }
       responses: { "204": { description: Done }, "404": { description: "`no_session`: not this member's, or over" } }
   /pond/v1/voice/{session}/watch:
     post:
@@ -347,7 +347,7 @@ paths:
               properties:
                 tracks:
                   type: object
-                  additionalProperties: { oneOf: [{ type: string, pattern: "^[a-z2-7]{52}$" }, { type: "null" }] }
+                  additionalProperties: { oneOf: [{ type: string, pattern: "^[a-z2-7]{52}(/screen)?$", description: "A member's camera, or with /screen the screen they share" }, { type: "null" }] }
       responses: { "204": { description: Done }, "400": { description: "`bad_request`" }, "404": { description: "`no_session`" } }
   /pond/v1/voice/{session}/leave:
     post:
@@ -553,6 +553,7 @@ components:
         muted: { type: boolean }
         deafened: { type: boolean }
         camera: { type: boolean }
+        screen: { type: boolean, description: Sharing a screen }
     Message:
       type: object
       properties:
