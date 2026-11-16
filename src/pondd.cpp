@@ -7,6 +7,7 @@
 #include "pond.h"
 #include "routes.h"
 #include "tls.h"
+#include "voice.h"
 
 #include <drogon/drogon.h>
 
@@ -52,7 +53,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "pondd: cannot read %s\n", cert.c_str());
         return 1;
     }
-    Routes routes(svc, tls_fp);
+    /* voice channels (docs/voice.md): one UDP port, the HTTPS port's number unless said */
+    std::unique_ptr<Voice> voice;
+    if (cfg.voice.on && Voice::built()) {
+        VoiceSettings vs;
+        vs.port = cfg.voice.port ? cfg.voice.port : cfg.port;
+        vs.bind = cfg.listen == "0.0.0.0" || cfg.listen == "::" ? "" : cfg.listen;
+        vs.max_in_channel = cfg.voice.max_in_channel;
+        voice = std::make_unique<Voice>(svc, vs, app().getLoop());
+        svc.voice_on = true;
+        svc.voice_now = [v = voice.get()] { return v->now_json(); };
+    }
+    Routes routes(svc, tls_fp, voice.get());
     /* every request goes to the routes, whatever its path and method, so that nothing is answered differently from an
      * unknown path (no 405s) */
     app().registerHandlerViaRegex(
@@ -60,8 +72,10 @@ int main(int argc, char **argv)
         {Get, Post, Put, Delete, Patch, Options, Head});
     app().setCustom404Page(Routes::not_found(), false);
 
-    auto stop = [&svc] {
+    auto stop = [&svc, &voice] {
         LOG_INFO << "stopping";
+        if (voice)
+            voice->stop(); /* every voice connection closed */
         svc.stop(); /* answers everyone waiting for events, then gives the answers a moment to go out */
         app().getLoop()->runAfter(0.3, [] { app().quit(); });
     };
@@ -77,6 +91,10 @@ int main(int argc, char **argv)
         .setIntSignalHandler(stop);
     app().getLoop()->queueInLoop([&] {
         svc.watch();
+        if (voice) {
+            voice->start();
+            LOG_INFO << "voice channels on UDP port " << (cfg.voice.port ? cfg.voice.port : cfg.port);
+        }
         LOG_INFO << "Pond " << key.id << " listening on " << cfg.listen << ":" << cfg.port << " (certificate "
                  << tls_fp << ")";
     });

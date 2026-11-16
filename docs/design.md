@@ -4,8 +4,9 @@ A **Pond** is a community server, like a Discord server: someone runs it, it has
 an invite link. It is not a Puddle. Its members are Puddles, and each one connects to it with the same key it uses
 everywhere else. The routes are in `api/pond.yaml`.
 
-This first cut does text channels, and files in messages (see "Files"). Permissions and roles, voice, editing and
-deleting messages, and moderation beyond removing a member all come later (see "Not yet" at the end).
+This first cut does text channels, and files in messages (see "Files"). Voice channels have a page of their own,
+[voice.md](voice.md). Editing and deleting messages, and moderation beyond removing and banning members, come later (see
+"Not yet" at the end).
 
 ## What runs
 
@@ -139,6 +140,7 @@ Every change the members need to hear about is a row in the `events` table, with
 - `member`: someone joined or changed their profile, which is the member.
 - `member_left`: someone left or was removed (`{id}`).
 - `pond`: the Pond's name or description changed, or the admin changed what files may be sent.
+- `voice`, `voice_left`: someone came into a voice channel, changed how they are in it, or left ([voice.md](voice.md)).
 
 A member's Puddle holds one request open on `/pond/v1/events?after=<cursor>` at a time. The Pond answers as soon as
 there is anything after the cursor, up to 200 events at a time, or with an empty list after 25 seconds. The Puddle then
@@ -353,7 +355,7 @@ gain `role` (`operator`, `administrator` or `member`), and `/info` gains `offer`
 |---|---|
 | `settings` | `name`, `value`: the Pond's name and description, `files.max_size`, and `event_lock` (see "Events") |
 | `schema_version` | `version`: which of `db.cpp`'s steps have been run |
-| `channels` | `id`, `name`, `topic`, `position`, `created_ms`, `deleted` |
+| `channels` | `id`, `name`, `topic`, `position`, `created_ms`, `deleted`, `kind` (`text` or `voice`) |
 | `members` | `id` (user id), `sign_pub`, `kid`, `chain`, `profile` (JSON), `joined_ms`, `left_ms` |
 | `invites` | `token`, `max_uses` (NULL = unlimited), `uses`, `expires_ms` (NULL = never), `created_ms`, `revoked` |
 | `messages` | `id`, `channel`, `author`, `text`, `nonce`, `ts_ms`; one index on `(channel, id)`, and a unique one on `(author, nonce)` |
@@ -375,7 +377,7 @@ can read them.
 ```
 pondctl [-c pond.yaml] init <name>              make the key and the database tables, and name the Pond
 pondctl name <name> [--description <text>]
-pondctl channel create <name> [--topic <text>]
+pondctl channel create <name> [--voice] [--topic <text>]   --voice: a voice channel
 pondctl channel list
 pondctl channel rename <name> <new name>
 pondctl channel topic <name> <text>
@@ -408,6 +410,9 @@ address: pond.example.org:8443   # what invite links say; port left off if 443
 data_dir: /var/lib/pond   # pond.key, cert.pem, key.pem
 threads: 0                # threads answering requests; 0 is one per CPU
 events_wait_ms: 25000     # how long a request for events is held open (the tests shorten it)
+voice:                    # voice channels (voice.md); "voice: false" turns them off
+  port: 8443              # the UDP port every voice connection shares; the HTTPS port's number unless set
+  max_in_channel: 0       # people in one voice channel; 0 is no limit
 database:
   host: 127.0.0.1         # "localhost" is the client library's default Unix socket
   port: 3306
@@ -454,4 +459,3 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.
 - Redis, and several `pondd` processes. The client for Redis is already built in; nothing uses it yet.
-- Voice channels. A design draft is in [voice.md](voice.md).

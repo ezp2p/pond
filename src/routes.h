@@ -6,6 +6,7 @@
 
 #include "pond.h"
 #include "reqsig.h"
+#include "voice.h"
 
 #include <drogon/HttpRequest.h>
 #include <drogon/HttpResponse.h>
@@ -17,7 +18,8 @@ namespace pond {
 class Routes {
 public:
     /* `tls_fp`: the hex SHA-256 of the certificate pondd serves, which receipts name */
-    Routes(Service &s, std::string tls_fp) : svc_(s), tls_fp_(std::move(tls_fp)) {}
+    /* `voice`: voice channels, or nullptr when off (their routes are then unknown paths) */
+    Routes(Service &s, std::string tls_fp, Voice *voice = nullptr) : svc_(s), tls_fp_(std::move(tls_fp)), voice_(voice) {}
 
     /* Every request pondd gets comes here, whatever its method and path. */
     Task<drogon::HttpResponsePtr> handle(drogon::HttpRequestPtr req);
@@ -35,6 +37,7 @@ private:
     Task<Answer> answer(const drogon::HttpRequestPtr &req, Signing &signing);
     Service &svc_;
     std::string tls_fp_;
+    Voice *voice_;
     Replay replay_;
     std::mutex strangers_mu_;
     Bucket strangers_{20, 100}; /* joins, which anyone may send: checking a chain costs signatures */

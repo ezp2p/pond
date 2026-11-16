@@ -1,6 +1,6 @@
 # Voice channels (draft)
 
-A design draft, not built. A voice channel is a channel members drop into to talk, as on Discord: you join it and sit
+The Pond's side is built (step 1 below, in `src/voice.*`); the Puddle's isn't yet. A voice channel is a channel members drop into to talk, as on Discord: you join it and sit
 there until you leave, and everyone in the Pond can see who is in it. It is not a call: nobody is rung, nothing alerts
 anyone, and nothing is noted in a history. Members can turn their camera on in it too ("Video").
 
@@ -81,10 +81,12 @@ The Puddle makes the connection, signed like every request a member makes, and a
 - **Bound to who they are**: the offer names the Puddle's DTLS fingerprint and travels in a request signed by the member;
   the answer names the Pond's and comes with the Pond's receipt. Nobody in the middle can put their own in.
 - **Going away**: the Pond lets a member go (`voice_left`) when they leave, when the connection doesn't come up within
-  20 seconds of joining, or when it drops for 10. Being removed or banned ends it too.
+  20 seconds of joining, or when it drops (or closes, or fails) and isn't back within 10. Being removed or banned ends it
+  too, and so does the channel being deleted.
 
 Asking to join again while in, with a new offer, replaces the connection: for a Puddle whose address changed, or that
-restarted.
+restarted. In the same channel it keeps its slot, and nobody is told anything, as long as it comes within those 10
+seconds.
 
 ## Voice
 
@@ -188,23 +190,35 @@ Pond themselves.
 - `pond.yaml` gains `voice: {port, max_in_channel}`; `voice: false` turns voice off, and then no channel may be a voice
   channel (`features` doesn't say `voice`).
 
-## Building it in Pond
+## Built in Pond
 
-Pond gains libdatachannel, fetched by CMake at a fixed release as Drogon is. It runs on libdatachannel's own threads,
-beside Drogon's; joining and leaving go through the database (the `voice` events), while the frames never touch it.
-`pondctl` gains `channel create --voice` and `voice list` (who is in which channel now).
+`src/voice.*`, with libdatachannel: the system's where there is one (Arch, Homebrew), otherwise fetched by CMake at a fixed
+release as Drogon is (Debian has no package). Without it (`-DPOND_VOICE=OFF`) Pond builds with no voice, and `features`
+doesn't say `voice`. Connections run on libdatachannel's own threads, beside Drogon's; setting one up waits on them, so it
+happens on a thread of its own rather than one answering requests. Joining and leaving go through the database (the
+`voice` and `voice_left` events, sent one after another in order), while the frames never touch it.
+
+Who is in which channel is kept only in `pondd`'s memory, as the connections are, so a restart empties every voice
+channel (the members' Puddles join again). `pondctl` can't see it; it makes voice channels (`channel create --voice`),
+and a member it removes or a channel it deletes is noticed by `pondd` within a second or two, and let go.
+
+`tests/voice_test.cpp` connects members with libdatachannel as a Puddle does, and checks: only a voice channel, only a
+member; who is in it, in events and `/info`; every voice to everyone else with the sender's slot, and nobody hearing
+themselves; muted and deafened; a camera only to whoever watches it, only while it is on, and from a key frame on; text in a
+voice channel; leaving, and joining again keeping the slot unannounced; being removed by `pondctl`, and the channel deleted.
 
 Several `pondd` processes (with Redis, later) would each have to hold a whole voice channel; that's for when there is
 more than one.
 
 ## Steps
 
-1. **Pond: voice channels and forwarding.** The channel kind, joining and leaving, the events, every voice forwarded
-   over `frames`. Tested with Puddle's own call code standing in for members.
+1. **Pond: voice channels and forwarding** (built). The channel kind, joining and leaving, the events, every voice
+   forwarded over `frames`; and the Pond's half of video (cameras and `watch`), since its tracks are in the offer from
+   the start.
 2. **Puddle: joining from the window.** The voice routes, the channel list, the bar, who is talking, voice activation and
    push to talk, and "already in a call" both ways.
 3. **On a phone,** over its leg.
-4. **Video:** cameras, `watch`, the tiles.
+4. **Video in the app:** the camera, choosing whom to watch, the tiles.
 5. **Moderation:** disconnect and mute by admins.
 
 ## Later
