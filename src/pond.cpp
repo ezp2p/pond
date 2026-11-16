@@ -73,7 +73,7 @@ Service::Service(DbPtr db, PondKey key, std::string data_dir, trantor::EventLoop
 /* ---- JSON for what is kept ---- */
 
 static const char MEMBER_COLS[] = "id, profile, joined_ms, role";
-static const char CHANNEL_COLS[] = "id, name, topic, position";
+static const char CHANNEL_COLS[] = "id, name, topic, position, kind";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
 
 static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
@@ -85,7 +85,7 @@ static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
 static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
 {
     return "{\"id\":" + std::to_string(num(row[0])) + ",\"name\":" + jstr(text(row[1])) + ",\"topic\":" + jstr(text(row[2])) +
-           ",\"position\":" + std::to_string(num(row[3])) + "}";
+           ",\"position\":" + std::to_string(num(row[3])) + ",\"kind\":" + jstr(text(row[4])) + "}";
 }
 
 /* `files` is the message's "files" array, or "" for a message without any */
@@ -256,9 +256,12 @@ Task<Answer> Service::info(std::string member)
         std::string features = "[";
         for (const char *f : FEATURES)
             features += (features.size() > 1 ? "," : "") + jstr(f);
+        if (voice_now)
+            features += ",\"voice\"";
         co_return Answer{200, "{\"protocol\":" + std::to_string(PROTOCOL) + ",\"features\":" + features + "],\"pond\":" +
                                   co_await pond_json(db_) + ",\"me\":" + me + ",\"offer\":" + co_await offer_json(member) +
-                                  ",\"channels\":" + co_await channels_json() + ",\"cursor\":" + std::to_string(num(c[0][0])) + "}"};
+                                  ",\"channels\":" + co_await channels_json() + ",\"voice\":" + (voice_now ? voice_now() : "[]") +
+                                  ",\"cursor\":" + std::to_string(num(c[0][0])) + "}"};
     } catch (const DrogonDbException &e) {
         co_return server_error(e);
     }
@@ -441,6 +444,41 @@ Task<Answer> Service::leave(std::string member)
     }
     LOG_INFO << member << " left";
     co_return Answer{204, ""};
+}
+
+/* ---- voice channels ---- */
+
+Task<> Service::voice_event(std::string kind, std::string data)
+{
+    TxPtr tx;
+    try {
+        tx = co_await db_->newTransactionCoro();
+        int64_t ev = co_await add_event(tx, kind.c_str(), data);
+        if (co_await Committed(std::move(tx)))
+            bump(ev);
+    } catch (const DrogonDbException &e) {
+        if (tx)
+            tx->rollback();
+        LOG_ERROR << "database: " << e.base().what();
+    }
+}
+
+Task<std::pair<std::vector<std::string>, std::vector<int64_t>>> Service::voice_gone(std::vector<std::string> members, std::vector<int64_t> channels)
+{
+    std::pair<std::vector<std::string>, std::vector<int64_t>> gone;
+    for (auto &m : members)
+        if (!co_await is_member(m))
+            gone.first.push_back(m);
+    for (int64_t c : channels)
+        if (!co_await is_voice_channel(c))
+            gone.second.push_back(c);
+    co_return gone;
+}
+
+Task<bool> Service::is_voice_channel(int64_t channel)
+{
+    Result r = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0 AND kind = 'voice'", channel);
+    co_return !r.empty();
 }
 
 /* ---- the event log ---- */
@@ -629,19 +667,23 @@ Task<Outcome> Service::set_name(std::string name, std::optional<std::string> des
     }
 }
 
-Task<Outcome> Service::channel_create(std::string name, std::string topic)
+Task<Outcome> Service::channel_create(std::string name, std::string topic, std::string kind)
 {
     std::string t;
     if (!channel_name_ok(name))
         co_return "a channel name is 1 to 32 of a-z, 0-9 and -";
+    if (kind != "text" && kind != "voice")
+        co_return "a channel is text or voice";
+    if (kind == "voice" && !voice_on)
+        co_return "voice is turned off on this Pond";
     if (!clean_text(topic, TOPIC_MAX, false, t))
         co_return "a topic is at most " + std::to_string(TOPIC_MAX) + " characters";
     TxPtr tx;
     try {
         tx = co_await db_->newTransactionCoro();
-        Result r = co_await tx->execSqlCoro("INSERT INTO channels (name, topic, position, created_ms)"
-                                            " SELECT ?, ?, COALESCE(MAX(position), -1) + 1, ? FROM channels WHERE deleted = 0",
-                                            name, t, now_ms());
+        Result r = co_await tx->execSqlCoro("INSERT INTO channels (name, topic, position, created_ms, kind)"
+                                            " SELECT ?, ?, COALESCE(MAX(position), -1) + 1, ?, ? FROM channels WHERE deleted = 0",
+                                            name, t, now_ms(), kind);
         Result c = co_await tx->execSqlCoro(std::string("SELECT ") + CHANNEL_COLS + " FROM channels WHERE id = ?", (int64_t)r.insertId());
         int64_t ev = co_await add_event(tx, "channel", channel_json(c.at(0)));
         if (!co_await Committed(std::move(tx)))

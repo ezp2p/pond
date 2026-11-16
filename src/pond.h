@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -36,8 +37,9 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 3; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts") */
-constexpr std::array<const char *, 3> FEATURES{"files", "roles", "receipts"};
+constexpr int PROTOCOL = 4; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+                             * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice` */
+constexpr std::array<const char *, 3> FEATURES{"files", "roles", "receipts"}; /* and "voice", when voice is on */
 
 /* Roles (docs/design.md, "Roles"), lowest first. An operator outranks an administrator. */
 enum class Role { MEMBER = 0, ADMINISTRATOR = 1, OPERATOR = 2 };
@@ -128,7 +130,7 @@ public:
     Task<Role> role(std::string member);
     /* What an operator or administrator does from the app; `by` is checked to hold a role first (the routes). */
     Task<Answer> admin_pond(std::string by, std::optional<std::string> name, std::optional<std::string> description);
-    Task<Answer> admin_channel_create(std::string by, std::string name, std::string topic);
+    Task<Answer> admin_channel_create(std::string by, std::string name, std::string topic, std::string kind = "text");
     Task<Answer> admin_channel_edit(std::string by, int64_t channel, std::optional<std::string> name, std::optional<std::string> topic);
     Task<Answer> admin_channel_delete(std::string by, int64_t channel);
     Task<Answer> admin_remove(std::string by, std::string member, bool ban, std::string reason);
@@ -141,7 +143,8 @@ public:
     /* ---- for pondctl ---- */
 
     Task<Outcome> set_name(std::string name, std::optional<std::string> description);
-    Task<Outcome> channel_create(std::string name, std::string topic);
+    /* `kind`: "text" or "voice" (only while voice is on) */
+    Task<Outcome> channel_create(std::string name, std::string topic, std::string kind = "text");
     Task<Outcome> channel_rename(std::string name, std::string to);
     Task<Outcome> channel_topic(std::string name, std::string topic);
     Task<Outcome> channel_delete(std::string name);
@@ -162,6 +165,19 @@ public:
     Task<Outcome> set_files_max(int64_t bytes);
     /* How many files are kept, and the bytes they take. */
     Task<std::pair<int64_t, int64_t>> files_usage();
+
+    /* ---- voice channels (voice.h) ---- */
+
+    /* Voice channels may be made (pondd: built with voice, and `voice` not false). */
+    bool voice_on = false;
+    /* Who is in which voice channel now, as a JSON array for /info; set by pondd while voice is on. */
+    std::function<std::string()> voice_now;
+    /* Tell every member: `voice` or `voice_left` with its data. */
+    Task<> voice_event(std::string kind, std::string data);
+    /* Of `members`, those no longer members; of `channels`, those that are no longer live voice channels. */
+    Task<std::pair<std::vector<std::string>, std::vector<int64_t>>> voice_gone(std::vector<std::string> members, std::vector<int64_t> channels);
+    /* `channel` is a live voice channel */
+    Task<bool> is_voice_channel(int64_t channel);
 
     /* ---- the event log ---- */
 

@@ -12,6 +12,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "voice.h"
+
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -27,7 +29,7 @@ static const char USAGE[] =
     "  init <name>                          make the key and the database tables, and name the Pond\n"
     "  info                                 the Pond's id, link address, certificate and counts\n"
     "  name <name> [--description <text>]\n"
-    "  channel create <name> [--topic <text>]\n"
+    "  channel create <name> [--voice] [--topic <text>]   --voice: a voice channel (docs/voice.md)\n"
     "  channel list\n"
     "  channel rename <name> <new name>\n"
     "  channel topic <name> <text>\n"
@@ -219,6 +221,7 @@ int main(int argc, char **argv)
     if (!migrate(db, err))
         return die(err);
     Service svc(db, key, cfg.data_dir);
+    svc.voice_on = cfg.voice.on && Voice::built();
     try {
         return run(cfg, svc, db, key, cmd, sub, args);
     } catch (const drogon::orm::DrogonDbException &e) {
@@ -262,14 +265,17 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
     if (cmd == "channel") {
         args.erase(args.begin());
         std::string topic;
+        bool voice = std::erase(args, std::string("--voice")) > 0;
         if (!options(args, {{"--topic", &topic}}))
             return usage();
         if (sub == "create" && args.size() == 1)
-            return done(sync_wait(svc.channel_create(args[0], topic)));
+            return done(sync_wait(svc.channel_create(args[0], topic, voice ? "voice" : "text")));
+        if (voice)
+            return usage();
         if (sub == "list" && args.empty()) {
-            Result r = db->execSqlSync("SELECT name, id, topic FROM channels WHERE deleted = 0 ORDER BY position, id");
+            Result r = db->execSqlSync("SELECT name, id, topic, kind FROM channels WHERE deleted = 0 ORDER BY position, id");
             for (const auto &row : r)
-                printf("#%-24s %s  %s\n", text(row[0]).c_str(), text(row[1]).c_str(), text(row[2]).c_str());
+                printf("#%-24s %s  %-5s  %s\n", text(row[0]).c_str(), text(row[1]).c_str(), text(row[3]).c_str(), text(row[2]).c_str());
             return 0;
         }
         if (sub == "rename" && args.size() == 2)

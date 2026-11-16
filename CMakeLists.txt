@@ -48,6 +48,32 @@ endif()
 find_package(yaml-cpp REQUIRED)
 find_package(OpenSSL 3 REQUIRED)
 
+# Voice channels (docs/voice.md) need libdatachannel: the system's when it has one (Arch, Homebrew), otherwise built from
+# source at a fixed release (Debian has no package). Without it Pond builds with no voice: `features` doesn't say `voice`.
+option(POND_VOICE "Voice channels, with libdatachannel" ON)
+set(POND_DATACHANNEL "")
+if(POND_VOICE)
+  find_package(LibDataChannel QUIET)
+  if(LibDataChannel_FOUND)
+    set(POND_DATACHANNEL LibDataChannel::LibDataChannel)
+  else()
+    set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+    set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+    set(NO_TESTS ON CACHE BOOL "" FORCE)
+    set(LIBSRTP_TEST_APPS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(libdatachannel
+      GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
+      GIT_TAG v0.24.5
+      GIT_SHALLOW TRUE
+      GIT_SUBMODULES deps/libjuice deps/libsrtp deps/usrsctp deps/plog deps/json)
+    FetchContent_MakeAvailable(libdatachannel)
+    set(POND_DATACHANNEL LibDataChannel::LibDataChannelStatic)
+  endif()
+  message(STATUS "voice: with libdatachannel (${POND_DATACHANNEL})")
+else()
+  message(STATUS "voice: none (POND_VOICE off)")
+endif()
+
 add_library(pond_lib STATIC
   src/config.cpp
   src/db.cpp
@@ -62,9 +88,13 @@ add_library(pond_lib STATIC
   src/reqsig.cpp
   src/routes.cpp
   src/text.cpp
-  src/tls.cpp)
+  src/tls.cpp
+  src/voice.cpp)
 target_include_directories(pond_lib PUBLIC src)
-target_link_libraries(pond_lib PUBLIC drogon yaml-cpp::yaml-cpp OpenSSL::Crypto)
+target_link_libraries(pond_lib PUBLIC drogon yaml-cpp::yaml-cpp OpenSSL::Crypto ${POND_DATACHANNEL})
+if(POND_DATACHANNEL)
+  target_compile_definitions(pond_lib PUBLIC POND_HAVE_VOICE=1)
+endif()
 target_compile_options(pond_lib PRIVATE -Wall -Wextra)
 
 add_executable(pondd src/pondd.cpp)
@@ -80,7 +110,7 @@ set(PUDDLED ${CMAKE_CURRENT_SOURCE_DIR}/../puddle/build/puddled CACHE FILEPATH "
 enable_testing()
 # protocol checks Pond against the Puddle Protocol's test vectors, from a checkout of ezp2p/protocol beside this one (or
 # POND_PROTOCOL_DIR), and is skipped without one.
-foreach(t identity protocol pond e2e)
+foreach(t identity protocol pond e2e voice)
   add_executable(${t}_test tests/${t}_test.cpp)
   target_link_libraries(${t}_test PRIVATE pond_lib OpenSSL::SSL)
   target_compile_options(${t}_test PRIVATE -Wall -Wextra)
@@ -91,3 +121,4 @@ foreach(t identity protocol pond e2e)
 endforeach()
 add_dependencies(pond_test pondd pondctl)
 add_dependencies(e2e_test pondd pondctl)
+add_dependencies(voice_test pondd pondctl) # voice is skipped (77) when built without voice

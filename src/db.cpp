@@ -55,6 +55,11 @@ static const char *const STEPS[][8] = {
         " target VARCHAR(128) NOT NULL DEFAULT '', detail TEXT NULL, ts_ms BIGINT NOT NULL, KEY (ts_ms)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         nullptr,
     },
+    {
+        /* voice channels (docs/voice.md): who is in one is kept in pondd's memory, not here */
+        "ALTER TABLE channels ADD COLUMN kind VARCHAR(8) NOT NULL DEFAULT 'text'",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run

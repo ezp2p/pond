@@ -283,6 +283,78 @@ paths:
       responses:
         "200": { description: "The member's role now", content: { application/json: { schema: { type: object, properties: { role: { $ref: "#/components/schemas/Role" } } } } } }
         "404": { description: "`no_offer`: no such offer open to this member (answered, lapsed after 7 days, or another's)" }
+  /pond/v1/channels/{channel}/voice/join:
+    post:
+      summary: Come into a voice channel (docs/voice.md)
+      description: |
+        With `voice` in `features` (protocol 4). The Puddle offers a WebRTC connection, complete with its candidates: an Opus
+        track `audio` and an H.264 track `video` it sends, video tracks `v1` to `v16` it only receives, and a data channel
+        `frames` (unordered, never sent again). The Pond answers, and adds the address the request came from at `udp` as a
+        candidate; the Puddle adds the Pond's own address at the Pond's `udp`. Once the connection is up, every member is told
+        (a `voice` event). A member is in one voice channel at a time: joining again replaces the connection (in the same
+        channel it keeps the slot and nobody is told again; in another it leaves the first).
+      parameters: [{ $ref: "#/components/parameters/Channel" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sdp, udp]
+              properties:
+                sdp: { type: string, description: The offer }
+                udp: { type: integer, description: "The UDP port the Puddle's calls use (0: none to add)" }
+      responses:
+        "200":
+          description: In
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: { type: string, pattern: "^[a-z2-7]{26}$", description: "Names this connection in the routes below" }
+                  sdp: { type: string, description: The answer }
+                  udp: { type: integer, description: The Pond's UDP port for voice }
+                  slot: { type: integer, description: "This member's number in the channel: the frames others get carry it" }
+        "400": { description: "`bad_request`, `bad_sdp`: an offer that can't be used" }
+        "404": { description: "`no_channel`: not a voice channel" }
+        "409": { description: "`full`: the channel has as many as the operator allows" }
+  /pond/v1/voice/{session}/state:
+    post:
+      summary: Muted, deafened, camera on
+      description: |
+        Any of the three; the others stay. A change tells every member (a `voice` event). Muted: the Pond forwards nothing of
+        theirs. Deafened: the Pond sends them no voice. Camera: their video goes to those who watch it.
+      parameters: [{ $ref: "#/components/parameters/Session" }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { muted: { type: boolean }, deafened: { type: boolean }, camera: { type: boolean } } }
+      responses: { "204": { description: Done }, "404": { description: "`no_session`: not this member's, or over" } }
+  /pond/v1/voice/{session}/watch:
+    post:
+      summary: Whose camera to send on which video track
+      description: |
+        `tracks` maps a track (`v1` .. `v16`) to a member's id, or null for none; tracks left out stay as they were. A camera
+        newly on a track starts at its next key frame.
+      parameters: [{ $ref: "#/components/parameters/Session" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tracks]
+              properties:
+                tracks:
+                  type: object
+                  additionalProperties: { oneOf: [{ type: string, pattern: "^[a-z2-7]{52}$" }, { type: "null" }] }
+      responses: { "204": { description: Done }, "400": { description: "`bad_request`" }, "404": { description: "`no_session`" } }
+  /pond/v1/voice/{session}/leave:
+    post:
+      summary: Leave the voice channel
+      description: Every member is told (`voice_left`). So it is when the connection doesn't come up in 20 seconds, drops for 10, or the member is removed.
+      parameters: [{ $ref: "#/components/parameters/Session" }]
+      responses: { "204": { description: Left }, "404": { description: "`no_session`" } }
   /pond/v1/admin/pond:
     post:
       summary: Rename the Pond, or change its description
@@ -292,7 +364,8 @@ paths:
   /pond/v1/admin/channels/create:
     post:
       summary: Make a channel
-      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string, pattern: "^[a-z0-9-]{1,32}$" }, topic: { type: string } } } } } }
+      description: "`kind` (protocol 4): `text` unless said; `voice` only with `voice` in `features`."
+      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string, pattern: "^[a-z0-9-]{1,32}$" }, topic: { type: string }, kind: { enum: [text, voice] } } } } } }
       responses: { "204": { description: Made }, "400": { $ref: "#/components/responses/AdminRefused" } }
   /pond/v1/admin/channels/{channel}/edit:
     post:
@@ -368,6 +441,12 @@ components:
       required: true
       description: The SHA-256 of its chunk hashes, as Puddle makes it (Puddle's docs/files.md, "The shape of a file")
       schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+    Session:
+      name: session
+      in: path
+      required: true
+      description: A voice connection, as joining answered
+      schema: { type: string, pattern: "^[a-z2-7]{26}$" }
     Chunk:
       name: n
       in: path
@@ -393,7 +472,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts"). Missing means none.
+                  (docs/design.md, "Receipts"). `voice`: voice channels (docs/voice.md). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -402,6 +481,7 @@ components:
                   - { type: object, properties: { id: { type: integer }, role: { $ref: "#/components/schemas/Role" } } }
                   - { type: "null" }
               channels: { type: array, items: { $ref: "#/components/schemas/Channel" } }
+              voice: { type: array, items: { $ref: "#/components/schemas/InVoice" }, description: "Who is in a voice channel now (protocol 4)" }
               cursor: { type: integer, description: The newest event; follow /pond/v1/events from here }
     AdminRefused:
       description: The Pond would not do it, said in words an app may show
@@ -462,6 +542,17 @@ components:
         name: { type: string, pattern: "^[a-z0-9-]{1,32}$" }
         topic: { type: string }
         position: { type: integer }
+        kind: { enum: [text, voice], description: "Protocol 4; missing means text. A voice channel takes messages too." }
+    InVoice:
+      type: object
+      description: Someone in a voice channel (docs/voice.md, "Who is in it")
+      properties:
+        channel: { type: integer }
+        member: { type: string }
+        slot: { type: integer, description: "Their number in the channel, 1 and up: the first 2 bytes of each of their frames" }
+        muted: { type: boolean }
+        deafened: { type: boolean }
+        camera: { type: boolean }
     Message:
       type: object
       properties:
@@ -494,9 +585,10 @@ components:
       required: [id, kind, data]
       properties:
         id: { type: integer }
-        kind: { enum: [message, channel, channel_deleted, member, member_left, pond, role_offer] }
+        kind: { enum: [message, channel, channel_deleted, member, member_left, pond, role_offer, voice, voice_left] }
         data:
           description: |
             message: a Message. channel: a Channel (made or changed). channel_deleted: {id}. member: a Member (joined, or a
             new profile, or a new role). member_left: {id}. pond: a Pond (new name or description, or new limits on files).
-            role_offer: {id, role}, sent only to the member it is offered to.
+            role_offer: {id, role}, sent only to the member it is offered to. voice: an InVoice (came in, or muted, deafened
+            or camera changed). voice_left: {channel, member}.

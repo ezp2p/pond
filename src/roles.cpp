@@ -216,11 +216,11 @@ Task<Answer> Service::admin_pond(std::string by, std::optional<std::string> name
     }
 }
 
-Task<Answer> Service::admin_channel_create(std::string by, std::string name, std::string topic)
+Task<Answer> Service::admin_channel_create(std::string by, std::string name, std::string topic, std::string kind)
 {
-    Outcome o = co_await channel_create(name, topic);
+    Outcome o = co_await channel_create(name, topic, kind);
     if (o.empty())
-        co_await log_admin(by, "channel_create", name, topic);
+        co_await log_admin(by, "channel_create", name, kind == "voice" ? "voice" + (topic.empty() ? "" : ", " + topic) : topic);
     co_return outcome(o);
 }
 

@@ -20,12 +20,14 @@ using drogon::HttpResponsePtr;
 constexpr size_t BODY_MAX = 32 * 1024;
 constexpr size_t SEND_MAX = 64 * 1024;           /* ten files with previews, and the text */
 constexpr size_t BEGIN_MAX = 256 * 1024;         /* the hashes of a file of FILE_HARD_MAX, in base64 */
+constexpr size_t VOICE_JOIN_MAX = 64 * 1024;     /* an offer: eighteen media sections, each with its candidates */
 constexpr int UNKNOWN = -1; /* the status of an answer that must look like a path that does not exist */
 
 static const Answer NOT_FOUND = {UNKNOWN, ""};
 
 enum Kind {
     JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
+    VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE,
     ADMIN_POND, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN, NONE
 };
 
@@ -109,7 +111,7 @@ static Kind file_route(bool get, bool post, std::string_view p, std::string &fil
     return get ? FILE_GET : post ? FILE_PUT : NONE;
 }
 
-/* Which route `method path` is, and the channel id, file id and chunk number in it if it has them. */
+/* Which route `method path` is, and the channel id, file id (or voice session) and chunk number in it if it has them. */
 static Kind route_of(const std::string &method, std::string_view p, int64_t &channel, std::string &file, int64_t &n, std::string &member)
 {
     bool get = method == "GET", post = method == "POST";
@@ -126,6 +128,14 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     if (p.substr(0, 6) == "files/")
         return file_route(get, post, p.substr(6), file, n);
     if (post && p == "roles/answer") return ROLE_ANSWER;
+    if (post && p.substr(0, 6) == "voice/" && p.size() > 6 + 26 && p[6 + 26] == '/' && token_ok(std::string(p.substr(6, 26)))) {
+        file = std::string(p.substr(6, 26)); /* the session */
+        std::string_view verb = p.substr(6 + 27);
+        if (verb == "state") return VOICE_STATE;
+        if (verb == "watch") return VOICE_WATCH;
+        if (verb == "leave") return VOICE_LEAVE;
+        return NONE;
+    }
     if (p.substr(0, 6) == "admin/")
         return admin_route(get, post, p.substr(6), channel, member);
     if (p.substr(0, 9) != "channels/")
@@ -141,6 +151,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     std::string_view rest = p.substr(slash);
     if (get && rest == "/messages") return HISTORY;
     if (post && rest == "/send") return SEND;
+    if (post && rest == "/voice/join") return VOICE_JOIN;
     return NONE;
 }
 
@@ -148,12 +159,13 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 static bool takes_body(Kind k)
 {
     return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND ||
-           k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN;
+           k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
+           k == VOICE_WATCH;
 }
 
 static size_t body_max(Kind k)
 {
-    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : BODY_MAX;
+    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : BODY_MAX;
 }
 
 /* "files": [{id, name, mime, w?, h?, duration_ms?, preview?}], as a send says them; cleaned by the Service. */
@@ -242,6 +254,8 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
     int64_t channel = 0, chunk = -1;
     std::string file, member;
     Kind k = route_of(method, path, channel, file, chunk, member);
+    if ((k == VOICE_JOIN || k == VOICE_STATE || k == VOICE_WATCH || k == VOICE_LEAVE) && !voice_)
+        k = NONE; /* voice is off: there are no such paths */
     if (k == NONE || (!takes_body(k) && k != FILE_PUT && !body.empty()) || body.size() > body_max(k))
         co_return NOT_FOUND;
     int64_t now = now_ms();
@@ -396,11 +410,44 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
         co_return co_await svc_.admin_pond(sender, name, description);
     }
     case ADMIN_CHANNEL_CREATE: {
-        std::optional<std::string> name, topic;
-        if (!opt_string("name", name) || !name || !opt_string("topic", topic))
+        std::optional<std::string> name, topic, kind;
+        if (!opt_string("name", name) || !name || !opt_string("topic", topic) || !opt_string("kind", kind))
             co_return fail(400, "bad_request");
-        co_return co_await svc_.admin_channel_create(sender, *name, topic.value_or(""));
+        co_return co_await svc_.admin_channel_create(sender, *name, topic.value_or(""), kind.value_or("text"));
     }
+    case VOICE_JOIN: {
+        std::string sdp;
+        if (!get_string(json, "sdp", sdp) || sdp.empty() || !json.isMember("udp") || !json["udp"].isInt() || json["udp"].asInt() < 0 ||
+            json["udp"].asInt() > 65535)
+            co_return fail(400, "bad_request");
+        co_return co_await voice_->join(sender, channel, sdp, json["udp"].asInt(), req->peerAddr().toIp());
+    }
+    case VOICE_STATE: {
+        std::optional<bool> st[3];
+        const char *keys[3] = {"muted", "deafened", "camera"};
+        for (int i = 0; i < 3; i++)
+            if (json.isMember(keys[i])) {
+                if (!json[keys[i]].isBool())
+                    co_return fail(400, "bad_request");
+                st[i] = json[keys[i]].asBool();
+            }
+        co_return voice_->state(sender, file, st[0], st[1], st[2]);
+    }
+    case VOICE_WATCH: {
+        if (!json.isMember("tracks") || !json["tracks"].isObject())
+            co_return fail(400, "bad_request");
+        std::map<int, std::string> tracks;
+        for (const auto &key : json["tracks"].getMemberNames()) {
+            const Json::Value &v = json["tracks"][key];
+            int n = key.size() >= 2 && key.size() <= 3 && key[0] == 'v' ? atoi(key.c_str() + 1) : 0;
+            if (n < 1 || n > VOICE_TRACKS || key != "v" + std::to_string(n) || !(v.isNull() || (v.isString() && user_id_ok(v.asString()))))
+                co_return fail(400, "bad_request");
+            tracks[n] = v.isNull() ? "" : v.asString();
+        }
+        co_return voice_->watch(sender, file, tracks);
+    }
+    case VOICE_LEAVE:
+        co_return voice_->leave(sender, file);
     case ADMIN_CHANNEL_EDIT: {
         std::optional<std::string> name, topic;
         if (!opt_string("name", name) || !opt_string("topic", topic))

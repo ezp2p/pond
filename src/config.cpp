@@ -69,6 +69,28 @@ static bool database(const YAML::Node &map, DbConfig &db, std::string &err)
     return true;
 }
 
+static bool voice(const YAML::Node &n, VoiceConfig &v, std::string &err)
+{
+    if (n.IsScalar() && (n.Scalar() == "false" || n.Scalar() == "true")) {
+        v.on = n.Scalar() == "true";
+        return true;
+    }
+    if (!n.IsMap()) {
+        err = "voice must be false, or a map" + where(n);
+        return false;
+    }
+    for (auto it : n) {
+        std::string k = it.first.as<std::string>();
+        const YAML::Node &x = it.second;
+        bool ok = k == "port"             ? number(x, "voice.port", 1, 65535, v.port, err)
+                  : k == "max_in_channel" ? number(x, "voice.max_in_channel", 0, 65535, v.max_in_channel, err)
+                                          : (err = "unknown setting voice." + k, false);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
 bool load_config(const std::string &path, Config &out, std::string &err)
 {
     YAML::Node root;
@@ -94,6 +116,7 @@ bool load_config(const std::string &path, Config &out, std::string &err)
              : k == "threads"        ? number(v, "threads", 0, 1024, out.threads, err)
              : k == "events_wait_ms" ? number(v, "events_wait_ms", 100, 60000, wait, err) && (out.events_wait_ms = (int)wait, true)
              : k == "database"       ? database(v, out.db, err)
+             : k == "voice"          ? voice(v, out.voice, err)
                                      : (err = "unknown setting " + k, false);
     }
     if (ok && out.data_dir.empty()) {

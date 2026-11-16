@@ -119,7 +119,7 @@ int main()
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":3,\"features\":[\"files\",\"roles\",\"receipts\"]"));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":4,\"features\":[\"files\",\"roles\",\"receipts\""));
 
     std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";

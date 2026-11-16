@@ -98,7 +98,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 3 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\"]"));
+    CHECK(num_of(a.body, "protocol") == 4 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -226,7 +226,7 @@ int main()
                             base64((const unsigned char *)hashes.data(), hashes.size()) + "\"}";
         CHECK(pond.call(&dan, "POST", "/pond/v1/join", join_body(dan, invite(pond, ""), "Dan"), "*").status == 200);
         a = pond.call(&ann, "GET", "/pond/v1/info");
-        CHECK(has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\"]") && has(a.body, "\"files\":{\"max_size\":26214400,\"chunk_size\":1048576"));
+        CHECK(has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\"") && has(a.body, "\"files\":{\"max_size\":26214400,\"chunk_size\":1048576"));
         CHECK(pond.ctl("files max-size 2M") == 0);
         a = pond.call(&ann, "POST", F, begin);
         CHECK(a.status == 413 && has(a.body, "\"max\":2097152")); /* over what the admin allows */

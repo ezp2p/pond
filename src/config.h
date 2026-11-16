@@ -16,6 +16,13 @@ struct DbConfig {
     unsigned connections = 16;
 };
 
+/* Voice channels (docs/voice.md): `voice: false` turns them off; otherwise a map, every key optional. */
+struct VoiceConfig {
+    bool on = true;
+    unsigned port = 0;           /* the UDP port every voice connection shares; 0 = the HTTPS port's number */
+    unsigned max_in_channel = 0; /* people in one voice channel; 0 = no limit (but the slots: 65535) */
+};
+
 struct Config {
     std::string listen = "0.0.0.0";
     unsigned port = 8443;
@@ -24,6 +31,7 @@ struct Config {
     unsigned threads = 0;       /* threads answering requests; 0 = one per CPU */
     int events_wait_ms = 25000; /* how long a request for events is held open */
     DbConfig db;
+    VoiceConfig voice;
 };
 
 /* Read `path`. false with the reason in `err`. Unknown keys are an error, so a typo is not silently ignored. */
