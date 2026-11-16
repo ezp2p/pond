@@ -179,6 +179,28 @@ int main()
     CHECK(until([&] { return has(ben.get(P), "Ann (work)"); }));
     CHECK(ann.post(P + "/profile", "{\"profile\":\"nope\"}") == 404);
 
+    /* ---- voice channels (docs/voice.md): two Puddles join one through their owner API, connect to the Pond, and each sees
+     * the other in it; muting is heard of; leaving. Skipped with a puddled from before voice, or one built without calls. ---- */
+    if (!has(ann.get("/api/v1/voice"), "\"voice\"") || has(ann.get("/api/v1/calls"), "\"version\":0,")) {
+        printf("e2e_test: voice skipped (this puddled has no voice channels or no calls)\n");
+    } else {
+        CHECK(pond.ctl("channel create talk --voice") == 0);
+        CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"name\":\"talk\""); }));
+        std::string talk = pond.channel("talk");
+        CHECK(ann.post(P + "/channels/" + ch + "/voice/join", "", &out) == 409 && has(out, "not_voice"));
+        CHECK(ann.post(P + "/channels/" + talk + "/voice/join", "", &out) == 200 && has(out, "\"state\":\"connecting\""));
+        CHECK(ben.post(P + "/channels/" + talk + "/voice/join", "", &out) == 200);
+        CHECK(until([&] { return has(ann.get("/api/v1/voice"), "\"state\":\"active\"") && has(ben.get("/api/v1/voice"), "\"state\":\"active\""); }));
+        CHECK(until([&] { return count(ann.get("/api/v1/ponds"), "\"slot\":") == 2; })); /* both in it, as the Pond tells everyone */
+        CHECK(ann.post("/api/v1/voice/state", "{\"muted\":true}", &out) == 200 && has(out, "\"muted\":true"));
+        CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"muted\":true"); }));
+        CHECK(ann.post("/api/v1/voice/leave", "") == 204);
+        CHECK(until([&] { return count(ben.get("/api/v1/ponds"), "\"slot\":") == 1; }));
+        CHECK(has(ann.get("/api/v1/voice"), "\"voice\":null"));
+        CHECK(ben.post("/api/v1/voice/leave", "") == 204);
+        CHECK(until([&] { return count(ann.get("/api/v1/ponds"), "\"slot\":") == 0; }));
+    }
+
     /* ---- scrolling back past what a Puddle keeps ---- */
     /* a channel with history from before anyone was watching (no events), which the members then hear of */
     CHECK(db.sql("INSERT INTO channels (name, position, created_ms) VALUES ('archive', 9, 1)") == 0);
