@@ -427,3 +427,4 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
   renewed Let's Encrypt one) makes the Pond unreachable until the member joins again. A signed announcement of the
   new certificate, like a Puddle's address record, will fix this.
 - Redis, and several `pondd` processes. The client for Redis is already built in; nothing uses it yet.
+- Voice channels. A design draft is in [voice.md](voice.md).
