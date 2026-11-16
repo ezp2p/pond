@@ -35,9 +35,9 @@ constexpr int EVENTS_MAX = 200;
 constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
- * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has, none yet. */
-constexpr int PROTOCOL = 2; /* 2: roles (docs/design.md, "Roles") */
-constexpr std::array<const char *, 2> FEATURES{"files", "roles"};
+ * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
+constexpr int PROTOCOL = 3; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts") */
+constexpr std::array<const char *, 3> FEATURES{"files", "roles", "receipts"};
 
 /* Roles (docs/design.md, "Roles"), lowest first. An operator outranks an administrator. */
 enum class Role { MEMBER = 0, ADMINISTRATOR = 1, OPERATOR = 2 };

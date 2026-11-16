@@ -11,6 +11,8 @@
  *
  * Checked here independently of Puddle's own code. */
 
+#include "key.h"
+
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -65,5 +67,23 @@ using KeyLookup = std::function<bool(const std::string &id, const std::string &k
  * the signature has passed. */
 Authn authenticate(std::string_view header, std::string_view method, std::string_view target, std::string_view body,
                    std::string_view me, const KeyLookup &lookup, Replay &replay, int64_t now_ms, ReqSig &out);
+
+/* Answer receipts (the Puddle Protocol, spec/02-signatures.md, "Answer receipts"): what the Pond adds to every answer to a
+ * member, so their Puddle knows the answer is the Pond's and came over the connection it saw:
+ *
+ *   X-Puddle-Receipt: v1 id=<pond id>; kid=<hex SHA-256 of the Pond's key>; fp=<hex SHA-256 of its certificate>; sig=<base64>
+ *
+ * `sig` is the Pond's key over these lines, joined by "\n" with none at the end: puddle-receipt-v1, the Pond's id, the request's
+ * nonce, the HTTP status, the hex SHA-256 of the answer's body, and fp. */
+std::string receipt_canonical(std::string_view id, std::string_view nonce, int status, std::string_view body, std::string_view fp);
+
+/* The header's value, signed by `key` for `fp` (its own certificate); "" if it could not sign. */
+std::string receipt_header(const PondKey &key, std::string_view nonce, int status, std::string_view body, std::string_view fp);
+
+/* A receipt checked as a caller would, knowing the responder's id and key, the nonce it sent and the certificate it saw. Pond only
+ * makes receipts; this is for its tests and the protocol's vectors, and says what Puddle's checker says. */
+enum class Receipt { OK, MISSING, WRONG_KEY, BAD, OTHER_CERT };
+Receipt check_receipt(std::string_view header, std::string_view id, const unsigned char pub[32], std::string_view nonce, int status,
+                      std::string_view body, std::string_view seen_fp);
 
 } // namespace pond

@@ -45,7 +45,14 @@ int main(int argc, char **argv)
 
     Service svc(db, key, cfg.data_dir, app().getLoop());
     svc.wait_ms = cfg.events_wait_ms;
-    Routes routes(svc);
+    std::string cert = cfg.data_dir + "/cert.pem";
+    /* read once: the certificate served is the one loaded at start, so a new one (renewed) takes a restart */
+    std::string tls_fp = certificate_fingerprint(cert);
+    if (tls_fp.empty()) {
+        fprintf(stderr, "pondd: cannot read %s\n", cert.c_str());
+        return 1;
+    }
+    Routes routes(svc, tls_fp);
     /* every request goes to the routes, whatever its path and method, so that nothing is answered differently from an
      * unknown path (no 405s) */
     app().registerHandlerViaRegex(
@@ -58,7 +65,6 @@ int main(int argc, char **argv)
         svc.stop(); /* answers everyone waiting for events, then gives the answers a moment to go out */
         app().getLoop()->runAfter(0.3, [] { app().quit(); });
     };
-    std::string cert = cfg.data_dir + "/cert.pem";
     app()
         .setLogLevel(trantor::Logger::kInfo)
         .addListener(cfg.listen, (uint16_t)cfg.port, true, cert, cfg.data_dir + "/key.pem")
@@ -72,7 +78,7 @@ int main(int argc, char **argv)
     app().getLoop()->queueInLoop([&] {
         svc.watch();
         LOG_INFO << "Pond " << key.id << " listening on " << cfg.listen << ":" << cfg.port << " (certificate "
-                 << certificate_fingerprint(cert) << ")";
+                 << tls_fp << ")";
     });
     app().run();
     return 0;

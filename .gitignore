@@ -1,5 +1,5 @@
 build/
 build.log
-pond.yaml
+/pond.yaml
 .cache/
 .DS_Store

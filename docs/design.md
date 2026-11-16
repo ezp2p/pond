@@ -40,6 +40,9 @@ can't be replayed to another.
 
 There is no recovery phrase and no key rolling. A Pond that loses `pond.key` is a new Pond.
 
+The key also signs the Pond's answers (see "Receipts"), so it is the key, not the TLS certificate, that members trust.
+The certificate can change freely; `pond.key` must not.
+
 ## Invite links
 
 ```
@@ -68,8 +71,35 @@ The Pond checks the chain and that the request is signed by its newest key. It s
 `UPDATE`), and records the member with their id, current key and profile. It answers `200` with the Pond (id, name
 and description), the member as the Pond sees them, the channels, and the newest event number (`cursor`).
 
-The Puddle records the certificate fingerprint it saw, as it does on first contact with a Puddle, and compares it on
-every later call.
+The answer is signed (see "Receipts") and carries the Pond's public key in `pond.key`; the Puddle keeps it, and checks
+that its SHA-256 is the Pond's id. From then on it holds the Pond to that key.
+
+## Receipts
+
+Every answer to a member carries the Pond's receipt, the same header a Puddle puts on its answers (the Puddle Protocol,
+`spec/02-signatures.md`; `src/reqsig.cpp`):
+
+    X-Puddle-Receipt: v1 id=<pond id>; kid=<hex SHA-256 of its key>; fp=<hex SHA-256 of its certificate>; sig=<base64>
+
+signed by `pond.key` over the request's nonce, the status, the SHA-256 of the body exactly as sent, and the certificate
+pondd serves. So does the answer to a join that worked. Nothing that anyone could be sent carries one: not the plain
+`404` (a failed check, a refused invite) nor a join that went wrong, so a receipt never says to a stranger which Pond lives
+at an address.
+
+What it is for: a member's Puddle believes an answer only with a good receipt, and only over the certificate the receipt
+names, so someone in the middle can pass requests on but can't answer for the Pond. And since it is the key that
+proves the Pond, the certificate may change. When a member's Puddle is shown a certificate it hasn't seen the Pond sign
+for, it asks `GET /pond/v1/info` over it (a request that changes nothing) and checks the receipt; if it names that
+certificate, the Puddle carries on with it. A Let's Encrypt certificate can be renewed every few months without cutting
+anyone off. An answer that can't be proven stops the Puddle talking to that address (its status is `not_proven`) until
+one can.
+
+pondd reads its certificate's fingerprint when it starts, since that is when it loads the certificate: a new one takes a
+restart, as it always did.
+
+A Pond with receipts says so in `/info` (protocol 3, feature `receipts`). A member's Puddle that joined before then
+pins the certificate it saw, as it did; it learns the key from the next `/info`, over that pinned certificate, and from
+then on it checks receipts and never pins again.
 
 ## Being a member
 
@@ -401,7 +431,7 @@ the protocol, not the version of either program.
 - Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
   it does not know, so an older Puddle keeps working with a newer Pond.
 - `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
-  of optional parts this Pond has (`files`). A Puddle checks these before using an addition, rather than guessing from
+  of optional parts this Pond has (`files`, `roles`, `receipts`). A Puddle checks these before using an addition, rather than guessing from
   a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
 
 A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.
@@ -423,7 +453,4 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 - Editing, deleting and replying to messages, reactions, mentions, unread counts and typing indicators.
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.
-- A Pond changing its TLS certificate. The Puddle pins the one it saw at join, so a new certificate (for example a
-  renewed Let's Encrypt one) makes the Pond unreachable until the member joins again. A signed announcement of the
-  new certificate, like a Puddle's address record, will fix this.
 - Redis, and several `pondd` processes. The client for Redis is already built in; nothing uses it yet.

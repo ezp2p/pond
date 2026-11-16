@@ -78,11 +78,14 @@ install(TARGETS pondd pondctl RUNTIME DESTINATION bin)
 # skipped without one.
 set(PUDDLED ${CMAKE_CURRENT_SOURCE_DIR}/../puddle/build/puddled CACHE FILEPATH "A built puddled, for the e2e test")
 enable_testing()
-foreach(t identity pond e2e)
+# protocol checks Pond against the Puddle Protocol's test vectors, from a checkout of ezp2p/protocol beside this one (or
+# POND_PROTOCOL_DIR), and is skipped without one.
+foreach(t identity protocol pond e2e)
   add_executable(${t}_test tests/${t}_test.cpp)
   target_link_libraries(${t}_test PRIVATE pond_lib OpenSSL::SSL)
   target_compile_options(${t}_test PRIVATE -Wall -Wextra)
-  target_compile_definitions(${t}_test PRIVATE POND_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}" PUDDLED="${PUDDLED}")
+  target_compile_definitions(${t}_test PRIVATE POND_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}" PUDDLED="${PUDDLED}"
+                                               POND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME ${t} COMMAND ${t}_test)
   set_tests_properties(${t} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
 endforeach()

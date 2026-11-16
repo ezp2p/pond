@@ -152,6 +152,9 @@ inline bool port_open(unsigned port)
 struct Reply {
     int status = -1;
     std::string body;
+    std::string receipt; /* the X-Puddle-Receipt header, if any */
+    std::string fp;      /* the hex SHA-256 of the certificate the connection showed */
+    std::string nonce;   /* of the request, when PondProc::call signed it */
 };
 
 inline Reply https(unsigned port, const std::string &method, const std::string &target, const std::string &body,
@@ -174,6 +177,13 @@ inline Reply https(unsigned port, const std::string &method, const std::string &
     SSL *ssl = SSL_new(ctx);
     SSL_set_fd(ssl, fd);
     if (SSL_connect(ssl) == 1) {
+        if (X509 *cert = SSL_get1_peer_certificate(ssl)) {
+            unsigned char md[32];
+            unsigned len = 0;
+            if (X509_digest(cert, EVP_sha256(), md, &len) == 1 && len == 32)
+                r.fp = pond::hex(md, 32);
+            X509_free(cert);
+        }
         std::string req = method + " " + target + " HTTP/1.1\r\nHost: x\r\nContent-Length: " + std::to_string(body.size()) +
                           "\r\nConnection: close\r\n";
         for (auto &h : headers)
@@ -189,6 +199,14 @@ inline Reply https(unsigned port, const std::string &method, const std::string &
             r.status = -1;
         size_t b = all.find("\r\n\r\n");
         r.body = b == std::string::npos ? "" : all.substr(b + 4);
+        for (size_t at = all.find("\r\n"); at != std::string::npos && at < b; at = all.find("\r\n", at + 2)) {
+            std::string line = all.substr(at + 2, all.find("\r\n", at + 2) - at - 2);
+            std::string lower = line.substr(0, 17);
+            for (char &c : lower)
+                c = (char)tolower((unsigned char)c);
+            if (lower == "x-puddle-receipt:")
+                r.receipt = line.substr(line.find_first_not_of(' ', 17));
+        }
     }
     SSL_free(ssl);
     SSL_CTX_free(ctx);
@@ -402,9 +420,14 @@ struct PondProc {
                const std::string &to = "", int64_t skew_ms = 0)
     {
         std::vector<std::string> h;
+        std::string sig = who ? who->signature(method, target, body, to.empty() ? id : to, skew_ms) : "";
         if (who)
-            h.push_back("X-Puddle-Signature: " + who->signature(method, target, body, to.empty() ? id : to, skew_ms));
-        return https(port, method, target, body, h);
+            h.push_back("X-Puddle-Signature: " + sig);
+        Reply r = https(port, method, target, body, h);
+        size_t n = sig.find("; nonce="), e = sig.find("; sig=");
+        if (n != std::string::npos)
+            r.nonce = sig.substr(n + 8, e - n - 8);
+        return r;
     }
 
     /* The id of a live channel by name, or "". */
