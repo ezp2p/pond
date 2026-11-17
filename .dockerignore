@@ -1,0 +1,8 @@
+.git
+build/
+build-*/
+uploads/
+.cache/
+*.log
+/pond.yaml
+.env

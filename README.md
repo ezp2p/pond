@@ -9,6 +9,11 @@ which parts Pond implements and what the protocol asks of it next.
 - `pondd` is the service. It has no UI and serves HTTPS on one port.
 - `pondctl` is the admin's tool. It runs on the same machine and uses the same config.
 
+## Docker
+
+The quickest way to run one: `ghcr.io/ezp2p/pond` (amd64 and arm64), with MariaDB beside it from `compose.yaml`.
+`:latest` is the newest release and `:dev` the newest build of `dev`. [docs/docker.md](docs/docker.md) says how.
+
 ## Build
 
 It is C++20, built on [Drogon](https://github.com/drogonframework/drogon), which CMake fetches and builds the first time

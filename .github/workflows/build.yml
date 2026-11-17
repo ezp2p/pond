@@ -1,0 +1,72 @@
+name: build
+
+# Build and test the Pond on every pull request and push, and on a tag like 0.2.0 make a GitHub release of it (a tag with
+# a "-", such as 0.2.0-rc.1, a prerelease). What is downloaded is the container image, from docker.yml (docs/docker.md).
+
+on:
+  push:
+    branches: [dev, main]
+    tags: ['[0-9]*.[0-9]*.[0-9]*']   # releases are tags like 0.0.0 (no "v")
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:   # a newer push to the same branch replaces a build still running; tags always finish
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # the protocol test checks Pond against the Puddle Protocol's test vectors
+      - uses: actions/checkout@v5
+        with:
+          repository: ezp2p/protocol
+          path: protocol
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # mariadb-server: each test starts a throwaway MariaDB of its own (tests/harness.h)
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libssl-dev libmariadb-dev libhiredis-dev \
+            libjsoncpp-dev libyaml-cpp-dev uuid-dev zlib1g-dev mariadb-server
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 4
+
+      - name: Test
+        env:
+          POND_PROTOCOL_DIR: ${{ github.workspace }}/protocol
+        run: |
+          # e2e needs a built Puddle and skips without one
+          if ! ctest --test-dir build --output-on-failure 2>&1 | tee test.log; then
+            # which tests failed, and the end of what they said, as an annotation: readable without signing in for the log
+            tail -n 80 test.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' | sed 's/^/::error title=Tests failed::/'; echo
+            exit 1
+          fi
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > notes.md <<EOF
+          The Pond is a container image: \`ghcr.io/$GITHUB_REPOSITORY:$TAG\` (amd64 and arm64). \`compose.yaml\` runs it with
+          MariaDB; docs/docker.md says how.
+          EOF
+          case "$TAG" in *-*) PRE=--prerelease ;; *) PRE= ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --generate-notes $PRE
