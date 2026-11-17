@@ -1,0 +1,22 @@
+# Pond configuration (docs/design.md, "pond.yaml")
+
+# Where pondd listens. Put IPv6 addresses in quotes.
+listen: 0.0.0.0
+port: 8443
+
+# What invite links say: how people reach this Pond, host[:port] (the port is left off when it is 443).
+address: pond.example.org:8443
+
+# The Pond's key (pond.key) and TLS certificate (cert.pem, key.pem; a self-signed one is made if there is none).
+data_dir: /var/lib/pond
+
+# Threads answering requests; 0 is one per CPU.
+threads: 0
+
+database:
+  host: 127.0.0.1     # "localhost" is the client library's default Unix socket
+  port: 3306
+  user: pond
+  password: secret
+  name: pond
+  connections: 16

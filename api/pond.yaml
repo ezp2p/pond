@@ -1,0 +1,595 @@
+openapi: 3.1.0
+info:
+  title: Pond API
+  version: 0.1.0
+  description: |
+    What a member's Puddle calls on a Pond (docs/design.md). Every request carries `X-Puddle-Signature`, made exactly as for
+    a request between Puddles (Puddle's docs/streams.md, "Request signatures"), signed for the Pond's id: a Pond's id is made
+    like a user id, from its key. Joining is the one exception, signed for `*`, since the Puddle does not know the Pond's id
+    until it has joined.
+
+    Anything that fails a check (no signature, a bad one, someone who is not a member, an unknown, used-up, expired or
+    revoked invite, a path that does not exist) gets the same `404` as a path that does not exist, so nobody learns anything
+    from a refusal.
+    Once a request is known to be from a member, mistakes are answered with `{"error": "<code>"}`.
+
+    Every answer to a member, and the answer to a join that worked, carries `X-Puddle-Receipt` (protocol 3, feature
+    `receipts`): the Pond's signature over the request's nonce, the status, the SHA-256 of the body, and the SHA-256 of the
+    Pond's own TLS certificate, exactly as a Puddle signs its answers (the Puddle Protocol, spec/02-signatures.md). A
+    member's Puddle checks it with the key in `pond.key`, so it trusts the Pond's key rather than its certificate, and a
+    renewed certificate is proven by the next receipt. The plain `404` carries none.
+
+    Within /pond/v1 things are only added, and a Puddle ignores fields and event kinds it does not know; `/info` says which
+    additions a Pond has (`protocol`, `features`). A change an older Puddle would misread gets new paths, /pond/v2.
+
+    Only GET and POST are used. Bodies are JSON, up to 32 KiB, except a send (64 KiB), beginning a file (256 KiB), and a
+    file's chunk, which is its bytes (up to 1 MiB).
+servers:
+  - url: https://pond.example.org
+paths:
+  /pond/v1/join:
+    post:
+      summary: Join with an invite
+      description: |
+        Signed for `*`, by the newest key in `chain`. Spends one use of the invite, unless the sender is already a member, in
+        which case it spends nothing and only updates their keys and profile.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite, chain]
+              properties:
+                invite: { type: string, pattern: "^[a-z2-7]{26}$" }
+                chain: { type: string, description: "The Puddle's key chain, one record per line" }
+                profile: { $ref: "#/components/schemas/Profile" }
+      responses:
+        "200": { $ref: "#/components/responses/Info" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { description: Not joined }
+  /pond/v1/keys:
+    post:
+      summary: The member's keys changed
+      description: Signed by the new key and proven by `chain`, which must belong to the member and be no older than the one held.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chain]
+              properties:
+                chain: { type: string }
+      responses:
+        "204": { description: Recorded (an older chain is ignored) }
+  /pond/v1/info:
+    get:
+      summary: The Pond, the member, the channels and the newest event
+      responses:
+        "200": { $ref: "#/components/responses/Info" }
+  /pond/v1/channels/{channel}/messages:
+    get:
+      summary: History, newest first
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+        - { name: before, in: query, schema: { type: integer, minimum: 1 }, description: Only messages with a lower id }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        "200":
+          description: The messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages: { type: array, items: { $ref: "#/components/schemas/Message" } }
+        "404": { description: "No such channel (`no_channel`)" }
+  /pond/v1/channels/{channel}/send:
+    post:
+      summary: Post a message
+      description: |
+        A second send with the same `nonce` from the same member posts nothing and answers with the first message, so a
+        Puddle that lost an answer can send again safely. Each member may send 5 a second, with bursts of up to 20 (`429`).
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text:
+                  type: string
+                  description: "Up to 4000 characters once trimmed, and at least 1 unless there are files (`bad_text`). Required without files."
+                nonce: { type: string, pattern: "^[A-Za-z0-9_-]{1,32}$" }
+                files:
+                  type: array
+                  maxItems: 10
+                  description: |
+                    Files the message carries (docs/design.md, "Files"), each one whole on the Pond already (sent with
+                    /pond/v1/files/{file}). The size is the Pond's own; anything else in an entry is ignored.
+                  items: { $ref: "#/components/schemas/FileRef" }
+      responses:
+        "200":
+          description: The message as posted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "400": { description: "`bad_text`, `bad_file` (a name with a folder in it, a preview that is not base64...), `too_many_files`" }
+        "404": { description: "No such channel (`no_channel`)" }
+        "409": { description: "`no_file`, with `file`: one of the files is not here whole; `files_off`: the Pond takes no files" }
+        "429": { description: "Too many (`slow_down`)" }
+  /pond/v1/files/{file}:
+    post:
+      summary: Begin sending a file
+      description: |
+        Say a file's size and chunk hashes; the answer is which chunks the Pond still wants. Beginning one that is here
+        already, or partly, is how a Puddle picks up where it stopped. A file no message carries is thrown away a day after
+        it was begun.
+      parameters:
+        - { $ref: "#/components/parameters/File" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [size, chunks]
+              properties:
+                size: { type: integer, minimum: 1, description: "At most the Pond's `files.max_size`" }
+                chunks:
+                  type: string
+                  description: Base64 of the chunk hashes, 32 bytes each, in order. Their SHA-256 must be the file's id.
+      responses:
+        "200":
+          description: The chunks still wanted; none if the file is here whole
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  missing: { type: array, items: { type: integer } }
+        "400": { description: "`bad_file`: the hashes are not this file's, or do not fit the size" }
+        "409": { description: "`files_off`; or `other_size`: someone began it with another size" }
+        "413":
+          description: Larger than the Pond takes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { const: too_large }
+                  max: { type: integer }
+  /pond/v1/files/{file}/chunks:
+    get:
+      summary: A file's chunk hashes
+      description: |
+        Of a whole file a message in a channel carries (or one the member sent). Anything else is `404` (`no_file`).
+      parameters:
+        - { $ref: "#/components/parameters/File" }
+      responses:
+        "200":
+          description: The hashes, 32 bytes each, in order
+          content:
+            application/octet-stream: {}
+        "404": { description: "`no_file`" }
+  /pond/v1/files/{file}/chunks/{n}:
+    get:
+      summary: One chunk of a file
+      description: As for its hashes. Each member may fetch or send 20 chunks a second, with bursts of 64 (`429`).
+      parameters:
+        - { $ref: "#/components/parameters/File" }
+        - { $ref: "#/components/parameters/Chunk" }
+      responses:
+        "200":
+          description: Its bytes
+          content:
+            application/octet-stream: {}
+        "404": { description: "`no_file`, `no_chunk`" }
+        "429": { description: "`slow_down`" }
+    post:
+      summary: Send one chunk of a file
+      description: |
+        The body is the chunk's bytes: 1 MiB, or what is left for the last. It is kept only if it hashes to what the file
+        was begun with. Once every chunk is here the file is whole, and a message may carry it.
+      parameters:
+        - { $ref: "#/components/parameters/File" }
+        - { $ref: "#/components/parameters/Chunk" }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: {}
+      responses:
+        "204": { description: Kept (or the file was already whole) }
+        "400": { description: "`bad_chunk`: no such chunk, the wrong length, or not the bytes it should be" }
+        "404": { description: "`no_file`: not begun" }
+        "429": { description: "`slow_down`" }
+  /pond/v1/events:
+    get:
+      summary: What happened after an event, waiting for something to happen
+      description: |
+        Answers as soon as there is an event after `after`, with up to 200, or with none after 25 seconds. Ask again from the
+        `cursor` in the answer. `{"reset": true}` means `after` is older than the events kept (7 days): fetch `/info` and
+        history again rather than replaying.
+      parameters:
+        - { name: after, in: query, required: true, schema: { type: integer, minimum: 0 } }
+      responses:
+        "200":
+          description: Events, or a reset
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [events, cursor]
+                    properties:
+                      events: { type: array, items: { $ref: "#/components/schemas/Event" } }
+                      cursor: { type: integer }
+                  - type: object
+                    required: [reset]
+                    properties:
+                      reset: { const: true }
+  /pond/v1/members:
+    get:
+      summary: Everyone in the Pond
+      responses:
+        "200":
+          description: The members, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members: { type: array, items: { $ref: "#/components/schemas/Member" } }
+  /pond/v1/profile:
+    post:
+      summary: Change how the member appears in this Pond
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profile]
+              properties:
+                profile: { $ref: "#/components/schemas/Profile" }
+      responses:
+        "204": { description: Changed }
+        "400": { $ref: "#/components/responses/Error" }
+  /pond/v1/leave:
+    post:
+      summary: Stop being a member
+      description: Their messages stay. Joining again needs an invite.
+      responses:
+        "204": { description: Left }
+  /pond/v1/roles/answer:
+    post:
+      summary: Accept or decline a role the Pond offers
+      description: |
+        The offer arrives as a `role_offer` event for this member alone, and in `/info` as `offer` (docs/design.md, "Roles").
+        Accepting gives the role at once, and a `member` event tells everyone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [offer, accept]
+              properties:
+                offer: { type: integer }
+                accept: { type: boolean }
+      responses:
+        "200": { description: "The member's role now", content: { application/json: { schema: { type: object, properties: { role: { $ref: "#/components/schemas/Role" } } } } } }
+        "404": { description: "`no_offer`: no such offer open to this member (answered, lapsed after 7 days, or another's)" }
+  /pond/v1/channels/{channel}/voice/join:
+    post:
+      summary: Come into a voice channel (docs/voice.md)
+      description: |
+        With `voice` in `features` (protocol 4). The Puddle offers a WebRTC connection, complete with its candidates: an Opus
+        track `audio` and an H.264 track `video` it sends, video tracks `v1` to `v16` it only receives, and a data channel
+        `frames` (unordered, never sent again). The Pond answers, and adds the address the request came from at `udp` as a
+        candidate; the Puddle adds the Pond's own address at the Pond's `udp`. Once the connection is up, every member is told
+        (a `voice` event). A member is in one voice channel at a time: joining again replaces the connection (in the same
+        channel it keeps the slot and nobody is told again; in another it leaves the first).
+      parameters: [{ $ref: "#/components/parameters/Channel" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sdp, udp]
+              properties:
+                sdp: { type: string, description: The offer }
+                udp: { type: integer, description: "The UDP port the Puddle's calls use (0: none to add)" }
+      responses:
+        "200":
+          description: In
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: { type: string, pattern: "^[a-z2-7]{26}$", description: "Names this connection in the routes below" }
+                  sdp: { type: string, description: The answer }
+                  udp: { type: integer, description: The Pond's UDP port for voice }
+                  slot: { type: integer, description: "This member's number in the channel: the frames others get carry it" }
+        "400": { description: "`bad_request`, `bad_sdp`: an offer that can't be used" }
+        "404": { description: "`no_channel`: not a voice channel" }
+        "409": { description: "`full`: the channel has as many as the operator allows" }
+  /pond/v1/voice/{session}/state:
+    post:
+      summary: Muted, deafened, camera on
+      description: |
+        Any of the three; the others stay. A change tells every member (a `voice` event). Muted: the Pond forwards nothing of
+        theirs. Deafened: the Pond sends them no voice. Camera: their video goes to those who watch it.
+      parameters: [{ $ref: "#/components/parameters/Session" }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { muted: { type: boolean }, deafened: { type: boolean }, camera: { type: boolean }, screen: { type: boolean, description: "Sharing a screen, on the `screen` track" } } }
+      responses: { "204": { description: Done }, "404": { description: "`no_session`: not this member's, or over" } }
+  /pond/v1/voice/{session}/watch:
+    post:
+      summary: Whose camera to send on which video track
+      description: |
+        `tracks` maps a track (`v1` .. `v16`) to a member's id, or null for none; tracks left out stay as they were. A camera
+        newly on a track starts at its next key frame.
+      parameters: [{ $ref: "#/components/parameters/Session" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tracks]
+              properties:
+                tracks:
+                  type: object
+                  additionalProperties: { oneOf: [{ type: string, pattern: "^[a-z2-7]{52}(/screen)?$", description: "A member's camera, or with /screen the screen they share" }, { type: "null" }] }
+      responses: { "204": { description: Done }, "400": { description: "`bad_request`" }, "404": { description: "`no_session`" } }
+  /pond/v1/voice/{session}/leave:
+    post:
+      summary: Leave the voice channel
+      description: Every member is told (`voice_left`). So it is when the connection doesn't come up in 20 seconds, drops for 10, or the member is removed.
+      parameters: [{ $ref: "#/components/parameters/Session" }]
+      responses: { "204": { description: Left }, "404": { description: "`no_session`" } }
+  /pond/v1/admin/pond:
+    post:
+      summary: Rename the Pond, or change its description
+      description: "For operators and administrators; to anyone else, every /pond/v1/admin route is a `404` like any refusal."
+      requestBody: { content: { application/json: { schema: { type: object, properties: { name: { type: string }, description: { type: string } } } } } }
+      responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" } }
+  /pond/v1/admin/channels/create:
+    post:
+      summary: Make a channel
+      description: "`kind` (protocol 4): `text` unless said; `voice` only with `voice` in `features`."
+      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string, pattern: "^[a-z0-9-]{1,32}$" }, topic: { type: string }, kind: { enum: [text, voice] } } } } } }
+      responses: { "204": { description: Made }, "400": { $ref: "#/components/responses/AdminRefused" } }
+  /pond/v1/admin/channels/{channel}/edit:
+    post:
+      summary: Rename a channel, or change its topic
+      parameters: [{ $ref: "#/components/parameters/Channel" }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { name: { type: string }, topic: { type: string } } } } } }
+      responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" }, "404": { description: "`no_channel`" } }
+  /pond/v1/admin/channels/{channel}/delete:
+    post:
+      summary: Delete a channel
+      parameters: [{ $ref: "#/components/parameters/Channel" }]
+      responses: { "204": { description: Deleted }, "404": { description: "`no_channel`" } }
+  /pond/v1/admin/members/{member}/remove:
+    post:
+      summary: Remove a member (they may come back with an invite)
+      description: Only on a lower rank, never an operator, never oneself.
+      parameters: [{ $ref: "#/components/parameters/Member" }]
+      responses:
+        "204": { description: Removed }
+        "404": { description: "`no_member`" }
+        "409": { description: "`outranked` (they are your rank or above, or an operator), `not_yourself`" }
+  /pond/v1/admin/members/{member}/ban:
+    post:
+      summary: Ban a member, who is removed and refused if they try to join again
+      parameters: [{ $ref: "#/components/parameters/Member" }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { reason: { type: string, maxLength: 500 } } } } } }
+      responses:
+        "204": { description: Banned }
+        "400": { $ref: "#/components/responses/AdminRefused" }
+        "409": { description: "`outranked`, `not_yourself`" }
+  /pond/v1/admin/bans:
+    get:
+      summary: Who is banned
+      responses:
+        "200":
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bans:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        member: { type: string }
+                        by: { type: string, description: "The member who banned them, or `pondctl`" }
+                        reason: { type: string }
+                        ts: { type: integer }
+                        profile: { $ref: "#/components/schemas/Profile" }
+  /pond/v1/admin/bans/{member}/unban:
+    post:
+      summary: Lift a ban
+      parameters: [{ $ref: "#/components/parameters/Member" }]
+      responses: { "204": { description: Lifted }, "404": { description: "`no_ban`" } }
+components:
+  parameters:
+    Channel:
+      name: channel
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    Member:
+      name: member
+      in: path
+      required: true
+      description: A member's user id
+      schema: { type: string, pattern: "^[a-z2-7]{52}$" }
+    File:
+      name: file
+      in: path
+      required: true
+      description: The SHA-256 of its chunk hashes, as Puddle makes it (Puddle's docs/files.md, "The shape of a file")
+      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+    Session:
+      name: session
+      in: path
+      required: true
+      description: A voice connection, as joining answered
+      schema: { type: string, pattern: "^[a-z2-7]{26}$" }
+    Chunk:
+      name: n
+      in: path
+      required: true
+      schema: { type: integer, minimum: 0 }
+  responses:
+    Info:
+      description: The Pond as the member sees it
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [pond, me, channels, cursor]
+            properties:
+              protocol:
+                type: integer
+                minimum: 1
+                description: |
+                  Which additions to /pond/v1 this Pond has; it goes up with each (docs/design.md, "Versions"). Missing means 1.
+              features:
+                type: array
+                items: { type: string }
+                description: |
+                  Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
+                  and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
+                  (docs/design.md, "Receipts"). `voice`: voice channels (docs/voice.md). Missing means none.
+              pond: { $ref: "#/components/schemas/Pond" }
+              me: { $ref: "#/components/schemas/Member" }
+              offer:
+                description: A role the Pond offers this member, waiting for their answer (protocol 2)
+                oneOf:
+                  - { type: object, properties: { id: { type: integer }, role: { $ref: "#/components/schemas/Role" } } }
+                  - { type: "null" }
+              channels: { type: array, items: { $ref: "#/components/schemas/Channel" } }
+              voice: { type: array, items: { $ref: "#/components/schemas/InVoice" }, description: "Who is in a voice channel now (protocol 4)" }
+              cursor: { type: integer, description: The newest event; follow /pond/v1/events from here }
+    AdminRefused:
+      description: The Pond would not do it, said in words an app may show
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { const: bad_request }
+              message: { type: string }
+    Error:
+      description: A mistake in a request from a member
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+  schemas:
+    Profile:
+      description: |
+        The profile the member chose for this Pond (Puddle's api/wire/profile.yaml), or null for none. The Pond keeps it as
+        sent, if it is a JSON object of up to 16 KiB; a Puddle cleans what it receives before showing it.
+      oneOf:
+        - type: object
+        - type: "null"
+    Pond:
+      type: object
+      properties:
+        id: { type: string, description: "52 characters of base32: base32(SHA-256(key))" }
+        key:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: The Pond's Ed25519 public key, hex (protocol 3), which signs its receipts. Its SHA-256 is the id.
+        name: { type: string }
+        description: { type: string }
+        files:
+          type: object
+          description: What members may send, with `files` in `features`
+          properties:
+            max_size: { type: integer, description: "The largest file, in bytes; 0 means the admin has turned files off" }
+            chunk_size: { type: integer, description: "1048576" }
+            per_message: { type: integer, description: "10" }
+    Member:
+      type: object
+      properties:
+        id: { type: string, description: The member's user id }
+        profile: { $ref: "#/components/schemas/Profile" }
+        joined: { type: integer, description: ms }
+        role: { $ref: "#/components/schemas/Role" }
+    Role:
+      enum: [operator, administrator, member]
+      description: "docs/design.md, \"Roles\". Missing (protocol 1) means member."
+    Channel:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string, pattern: "^[a-z0-9-]{1,32}$" }
+        topic: { type: string }
+        position: { type: integer }
+        kind: { enum: [text, voice], description: "Protocol 4; missing means text. A voice channel takes messages too." }
+    InVoice:
+      type: object
+      description: Someone in a voice channel (docs/voice.md, "Who is in it")
+      properties:
+        channel: { type: integer }
+        member: { type: string }
+        slot: { type: integer, description: "Their number in the channel, 1 and up: the first 2 bytes of each of their frames" }
+        muted: { type: boolean }
+        deafened: { type: boolean }
+        camera: { type: boolean }
+        screen: { type: boolean, description: Sharing a screen }
+    Message:
+      type: object
+      properties:
+        id: { type: integer, description: Increasing across the whole Pond }
+        channel: { type: integer }
+        author: { type: string, description: The author's user id }
+        text: { type: string, description: May be empty when there are files }
+        ts: { type: integer, description: ms, by the Pond's clock }
+        files: { type: array, items: { $ref: "#/components/schemas/File" }, description: Left out when there are none }
+    FileRef:
+      type: object
+      required: [id, name, mime]
+      description: A file as the sender describes it in a send
+      properties:
+        id: { type: string, pattern: "^[0-9a-f]{64}$" }
+        name: { type: string, description: "A file name only (no / or \\), at most 255 bytes" }
+        mime: { type: string, description: "As the sender says; anything that is not a type/subtype becomes application/octet-stream" }
+        w: { type: integer, description: Width, for a photo or video }
+        h: { type: integer }
+        duration_ms: { type: integer, description: For a video or sound }
+        preview: { type: string, description: "Base64 of a tiny picture (at most 1400 characters)" }
+    File:
+      allOf:
+        - { $ref: "#/components/schemas/FileRef" }
+        - type: object
+          properties:
+            size: { type: integer, description: The size of the file as the Pond has it }
+    Event:
+      type: object
+      required: [id, kind, data]
+      properties:
+        id: { type: integer }
+        kind: { enum: [message, channel, channel_deleted, member, member_left, pond, role_offer, voice, voice_left] }
+        data:
+          description: |
+            message: a Message. channel: a Channel (made or changed). channel_deleted: {id}. member: a Member (joined, or a
+            new profile, or a new role). member_left: {id}. pond: a Pond (new name or description, or new limits on files).
+            role_offer: {id, role}, sent only to the member it is offered to. voice: an InVoice (came in, or muted, deafened
+            or camera changed). voice_left: {channel, member}.
