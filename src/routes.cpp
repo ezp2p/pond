@@ -423,15 +423,15 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
         co_return co_await voice_->join(sender, channel, sdp, json["udp"].asInt(), req->peerAddr().toIp());
     }
     case VOICE_STATE: {
-        std::optional<bool> st[3];
-        const char *keys[3] = {"muted", "deafened", "camera"};
-        for (int i = 0; i < 3; i++)
+        std::optional<bool> st[4];
+        const char *keys[4] = {"muted", "deafened", "camera", "screen"};
+        for (int i = 0; i < 4; i++)
             if (json.isMember(keys[i])) {
                 if (!json[keys[i]].isBool())
                     co_return fail(400, "bad_request");
                 st[i] = json[keys[i]].asBool();
             }
-        co_return voice_->state(sender, file, st[0], st[1], st[2]);
+        co_return voice_->state(sender, file, st[0], st[1], st[2], st[3]);
     }
     case VOICE_WATCH: {
         if (!json.isMember("tracks") || !json["tracks"].isObject())
@@ -440,7 +440,9 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
         for (const auto &key : json["tracks"].getMemberNames()) {
             const Json::Value &v = json["tracks"][key];
             int n = key.size() >= 2 && key.size() <= 3 && key[0] == 'v' ? atoi(key.c_str() + 1) : 0;
-            if (n < 1 || n > VOICE_TRACKS || key != "v" + std::to_string(n) || !(v.isNull() || (v.isString() && user_id_ok(v.asString()))))
+            /* a member's camera (their id), or their shared screen ("<id>/screen") */
+            auto whose = [](const std::string &w) { return user_id_ok(w) || (w.size() == 59 && w.substr(52) == "/screen" && user_id_ok(w.substr(0, 52))); };
+            if (n < 1 || n > VOICE_TRACKS || key != "v" + std::to_string(n) || !(v.isNull() || (v.isString() && whose(v.asString()))))
                 co_return fail(400, "bad_request");
             tracks[n] = v.isNull() ? "" : v.asString();
         }

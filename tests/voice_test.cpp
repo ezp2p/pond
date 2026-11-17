@@ -66,7 +66,7 @@ struct Member {
     Identity id;
     std::string name;
     std::shared_ptr<rtc::PeerConnection> pc;
-    std::shared_ptr<rtc::Track> audio, video, watch[VOICE_TRACKS + 1];
+    std::shared_ptr<rtc::Track> audio, video, screen, watch[VOICE_TRACKS + 1];
     std::shared_ptr<rtc::DataChannel> dc;
     std::atomic<bool> connected{false}, dc_open{false};
     std::mutex mu;
@@ -107,18 +107,20 @@ struct Member {
                                                                   rtc::OpusRtpPacketizer::DefaultClockRate);
         audio->setMediaHandler(std::make_shared<rtc::OpusRtpPacketizer>(artp));
 
-        for (int n = 0; n <= VOICE_TRACKS; n++) {
-            std::string mid = n ? "v" + std::to_string(n) : "video";
-            rtc::Description::Video v(mid, n ? rtc::Description::Direction::RecvOnly : rtc::Description::Direction::SendOnly);
+        for (int n = -1; n <= VOICE_TRACKS; n++) { /* -1: the screen shared, 0: the camera, 1 .. 16: what is watched */
+            std::string mid = n > 0 ? "v" + std::to_string(n) : n == 0 ? "video" : "screen";
+            rtc::Description::Video v(mid, n > 0 ? rtc::Description::Direction::RecvOnly : rtc::Description::Direction::SendOnly);
             v.addH264Codec(96);
             auto t = pc->addTrack(v);
-            auto rtp = std::make_shared<rtc::RtpPacketizationConfig>(own_ssrc(t, 5000 + (uint32_t)n * 2 + 1), "member", 96,
+            auto rtp = std::make_shared<rtc::RtpPacketizationConfig>(own_ssrc(t, 5003 + (uint32_t)n * 2), "member", 96,
                                                                      rtc::H264RtpPacketizer::ClockRate);
             auto pack = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, rtp, 1200);
             pack->addToChain(std::make_shared<rtc::RtcpSrReporter>(rtp));
             pack->addToChain(std::make_shared<rtc::H264RtpDepacketizer>(rtc::NalUnit::Separator::LongStartSequence));
             t->setMediaHandler(pack);
-            if (n) {
+            if (n < 0) {
+                screen = t;
+            } else if (n) {
                 watch[n] = t;
                 t->onFrame([this, n](rtc::binary data, rtc::FrameInfo) {
                     std::lock_guard<std::mutex> g(mu);
@@ -161,7 +163,7 @@ struct Member {
 
     bool up()
     {
-        bool ok = until([&] { return connected && dc_open && audio->isOpen() && video->isOpen(); }, 15000);
+        bool ok = until([&] { return connected && dc_open && audio->isOpen() && video->isOpen() && screen->isOpen(); }, 15000);
         if (!ok)
             fprintf(stderr, "%s: connected %d, frames %d, audio %d, video %d\n", name.c_str(), (int)connected, (int)dc_open,
                     (int)audio->isOpen(), (int)video->isOpen());
@@ -177,10 +179,10 @@ struct Member {
         ts += 960;
     }
 
-    void show(const std::string &au, uint32_t at)
+    void show(const std::string &au, uint32_t at, bool on_screen = false)
     {
         try {
-            video->sendFrame(bytes(au), rtc::FrameInfo(at));
+            (on_screen ? screen : video)->sendFrame(bytes(au), rtc::FrameInfo(at));
         } catch (const std::exception &) {
         }
     }
@@ -364,6 +366,26 @@ int main()
     ann.show(access_unit(true, 5), 114000);
     until([] { return false; }, 300);
     CHECK(ben.on(1).size() == 2);
+
+    /* ---- a shared screen: its own track, watched as "<id>/screen", apart from the camera ---- */
+    CHECK(watch(ben, "{\"v2\":\"" + ann.id.id + "/screen\"}") == 204);
+    CHECK(watch(ben, "{\"v3\":\"nobody/screen\"}") == 400);
+    ann.show(access_unit(true, 20), 200000, true); /* not sharing yet: goes nowhere */
+    until([] { return false; }, 300);
+    CHECK(ben.on(2).empty());
+    CHECK(state(ann, "{\"screen\":true}") == 204);
+    CHECK(event_with(pond, ben.id, cursor, "\"screen\":true"));
+    ann.show(access_unit(false, 21), 206000, true); /* waits for a key frame */
+    until([] { return false; }, 200);
+    ann.show(access_unit(true, 22, 30000), 212000, true); /* a screen's key frame is big */
+    ann.show(access_unit(true, 23), 218000);             /* the camera: not on v2 */
+    CHECK(until([&] { return ben.on(2).size() >= 1; }));
+    until([] { return false; }, 300);
+    {
+        auto got = ben.on(2);
+        CHECK(got.size() == 1 && got[0].size() == 30000 && got[0][20] == 22);
+    }
+    CHECK(state(ann, "{\"screen\":false}") == 204);
 
     /* ---- a voice channel takes text too ---- */
     CHECK(pond.call(&ann.id, "POST", "/pond/v1/channels/" + std::to_string(talk) + "/send", "{\"text\":\"a link\"}").status == 200);
