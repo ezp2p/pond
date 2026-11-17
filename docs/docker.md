@@ -14,20 +14,17 @@ It needs MariaDB beside it; `compose.yaml` runs the two.
 `dev` publishes `dev`, and a tag like `0.2.0` publishes the release (`build.yml` makes its GitHub release). A tag with a
 `-`, such as `0.2.0-rc.1`, is a prerelease and doesn't move `latest`.
 
-## Running one
+## Quick start
 
-Put `compose.yaml` in a directory, and beside it a `.env`:
-
-```sh
-POND_ADDRESS=pond.example.org:8443   # how people reach this Pond; what invite links say
-POND_NAME=My Pond
-POND_DB_PASSWORD=a-long-random-password
-# POND_IMAGE=ghcr.io/ezp2p/pond:dev  # the newest build of dev instead of the newest release
-```
+`compose.yaml` and `.env.example` in the repository are all it takes, without the rest of the checkout:
 
 ```sh
+mkdir pond && cd pond
+curl -fsSLO https://raw.githubusercontent.com/ezp2p/pond/main/compose.yaml
+curl -fsSL https://raw.githubusercontent.com/ezp2p/pond/main/.env.example -o .env
+$EDITOR .env                       # the address, the name, a database password; POND_IMAGE=…:dev for the newest build
 docker compose up -d
-docker compose exec pond pondctl invite create --uses 10 --expires 7d   # prints the pond://… link to give out
+docker exec pond pondctl invite create --uses 10 --expires 7d   # prints the pond://… link to give out
 ```
 
 Open the port both ways the router lets people in: **TCP** for HTTPS and **UDP** for voice, the same number (8443 unless
@@ -35,14 +32,14 @@ Open the port both ways the router lets people in: **TCP** for HTTPS and **UDP**
 
 On its first start the container writes `/data/pond.yaml` from those variables, waits for MariaDB, and runs `pondctl init`
 with `POND_NAME`, which makes the Pond's key and its `#general`. After that the variables aren't read again. To change a
-setting, copy `pond.yaml` out (`docker compose cp pond:/data/pond.yaml .`), edit it, copy it back, and
-`docker compose restart pond`.
+setting, copy `pond.yaml` out (`docker cp pond:/data/pond.yaml .`), edit it, copy it back, and
+`docker restart pond`.
 
-Everything else `pondctl` does works the same way, `docker compose exec pond pondctl <command>`:
+Everything else `pondctl` does works the same way, `docker exec pond pondctl <command>`:
 
 ```sh
-docker compose exec pond pondctl channel create random --topic "Anything goes"
-docker compose exec pond pondctl info
+docker exec pond pondctl channel create random --topic "Anything goes"
+docker exec pond pondctl info
 ```
 
 ## Without compose
