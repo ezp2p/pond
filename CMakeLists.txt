@@ -46,6 +46,9 @@ if(NOT USE_MYSQL)
 endif()
 
 find_package(yaml-cpp REQUIRED)
+if(NOT TARGET yaml-cpp::yaml-cpp AND TARGET yaml-cpp)   # before 0.8 (Debian 12) its target had no namespace
+  add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
+endif()
 find_package(OpenSSL 3 REQUIRED)
 
 # Voice channels (docs/voice.md) need libdatachannel: the system's when it has one (Arch, Homebrew), otherwise built from
