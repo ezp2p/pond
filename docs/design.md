@@ -77,6 +77,11 @@ that its SHA-256 is the Pond's id. From then on it holds the Pond to that key.
 
 ## Receipts
 
+> **Being replaced** (the protocol's `spec/09-sealing.md`): requests and answers will be sealed to keys, and receipts will
+> stop naming the certificate. A Pond can then sit behind any reverse proxy and renew its certificate without a restart
+> or a shared certificate. Its sealing key will be derived from `pond.key`'s seed, so there is no new file to keep. This
+> section describes what is built today.
+
 Every answer to a member carries the Pond's receipt, the same header a Puddle puts on its answers (the Puddle Protocol,
 `spec/02-signatures.md`; `src/reqsig.cpp`):
 
