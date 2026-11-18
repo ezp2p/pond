@@ -246,7 +246,7 @@ static bool body_chain(const Json::Value &json, Chain &out)
     return true;
 }
 
-Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
+Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
 {
     std::string method = req->methodString();
     const std::string &path = req->getOriginalPath();
@@ -355,7 +355,9 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
         if (!get_string(json, "invite", invite) || !token_ok(invite) || !body_profile(body, json, profile))
             co_return fail(400, "bad_request");
         Answer a = co_await svc_.join(chain, invite, profile);
-        co_return a.status == 404 ? NOT_FOUND : a; /* a spent or unknown invite says nothing */
+        if (a.status == 404)
+            co_return NOT_FOUND; /* a spent or unknown invite says nothing */
+        co_return a; /* if, not ?: (docs/design.md, "Coroutines") */
     }
     case KEYS:
         if (!co_await svc_.is_member(sender))

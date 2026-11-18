@@ -51,11 +51,13 @@ Task<Role> Service::role(std::string member)
     co_return r.empty() ? Role::MEMBER : role_of_name(text(r[0][0])).value_or(Role::MEMBER);
 }
 
-Task<std::string> Service::offer_json(const std::string &member)
+Task<std::string> Service::offer_json(std::string member)
 {
     Result r = co_await db_->execSqlCoro("SELECT id, role FROM role_offers WHERE member = ? AND created_ms > ? ORDER BY id DESC LIMIT 1",
                                          member, now_ms() - OFFER_KEEP_MS);
-    co_return r.empty() ? "null" : "{\"id\":" + std::to_string(num(r[0][0])) + ",\"role\":" + jstr(text(r[0][1])) + "}";
+    if (r.empty())
+        co_return "null"; /* if, not ?: (docs/design.md, "Coroutines") */
+    co_return "{\"id\":" + std::to_string(num(r[0][0])) + ",\"role\":" + jstr(text(r[0][1])) + "}";
 }
 
 Task<> Service::log_admin(std::string by, std::string action, std::string target, std::string detail)
@@ -114,7 +116,8 @@ Task<Answer> Service::answer_offer(std::string member, int64_t offer, bool accep
         int64_t ev = 0;
         if (accept) {
             co_await tx->execSqlCoro("UPDATE members SET role = ? WHERE id = ? AND left_ms IS NULL", role, member);
-            ev = co_await add_event(tx, "member", co_await member_json_of(tx, member));
+            std::string mj = co_await member_json_of(tx, member);
+            ev = co_await add_event(tx, "member", mj);
         }
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
@@ -125,7 +128,12 @@ Task<Answer> Service::answer_offer(std::string member, int64_t offer, bool accep
         co_return server_error(e);
     }
     co_await log_admin(member, accept ? "accept_role" : "decline_role", member, role);
-    co_return Answer{200, "{\"role\":" + jstr(accept ? role : std::string(role_name(co_await this->role(member)))) + "}"};
+    std::string shown = role; /* no co_await inside a ?: (docs/design.md, "Coroutines") */
+    if (!accept) {
+        Role now = co_await this->role(member);
+        shown = role_name(now);
+    }
+    co_return Answer{200, "{\"role\":" + jstr(shown) + "}"};
 }
 
 Task<Outcome> Service::set_role(std::string id, Role role, std::string by)
@@ -136,10 +144,13 @@ Task<Outcome> Service::set_role(std::string id, Role role, std::string by)
         Result r = co_await tx->execSqlCoro("UPDATE members SET role = ? WHERE id = ? AND left_ms IS NULL", std::string(role_name(role)), id);
         if (r.affectedRows() == 0) {
             tx->rollback();
-            co_return co_await is_member(id) ? "" : "no member " + id;
+            if (co_await is_member(id))
+                co_return "";
+            co_return "no member " + id;
         }
         co_await tx->execSqlCoro("DELETE FROM role_offers WHERE member = ?", id);
-        int64_t ev = co_await add_event(tx, "member", co_await member_json_of(tx, id));
+        std::string mj = co_await member_json_of(tx, id);
+        int64_t ev = co_await add_event(tx, "member", mj);
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);
@@ -190,7 +201,7 @@ Task<Outcome> Service::unban(std::string id, std::string by)
 
 /* ---- from the app ---- */
 
-Task<std::string> Service::may_act(const std::string &by, const std::string &target)
+Task<std::string> Service::may_act(std::string by, std::string target)
 {
     if (by == target)
         co_return "not_yourself";
@@ -206,7 +217,11 @@ Task<Answer> Service::admin_pond(std::string by, std::optional<std::string> name
     if (!name && !description)
         co_return fail(400, "bad_request");
     try {
-        std::string n = name ? *name : co_await setting("name");
+        std::string n;
+        if (name)
+            n = *name;
+        else
+            n = co_await setting("name");
         Outcome o = co_await set_name(n, description);
         if (o.empty())
             co_await log_admin(by, "set_name", "", n);
@@ -225,10 +240,12 @@ Task<Answer> Service::admin_channel_create(std::string by, std::string name, std
 }
 
 /* The name of live channel `id`, or "" */
-static Task<std::string> channel_name_of(const DbPtr &db, int64_t id)
+static Task<std::string> channel_name_of(DbPtr db, int64_t id)
 {
     Result r = co_await db->execSqlCoro("SELECT name FROM channels WHERE id = ? AND deleted = 0", id);
-    co_return r.empty() ? "" : text(r[0][0]);
+    if (r.empty())
+        co_return "";
+    co_return text(r[0][0]);
 }
 
 Task<Answer> Service::admin_channel_edit(std::string by, int64_t channel, std::optional<std::string> name, std::optional<std::string> topic)
@@ -277,8 +294,10 @@ Task<Answer> Service::admin_remove(std::string by, std::string member, bool bann
         std::string no = co_await may_act(by, member);
         if (!no.empty())
             co_return fail(409, no.c_str());
-        if (banning)
-            co_return outcome(co_await ban(member, reason, by));
+        if (banning) {
+            auto banned = co_await ban(member, reason, by);
+            co_return outcome(banned);
+        }
         if (!co_await is_member(member))
             co_return fail(404, "no_member");
         Outcome o = co_await remove_member(member);
@@ -309,7 +328,9 @@ Task<Answer> Service::admin_bans()
 Task<Answer> Service::admin_unban(std::string by, std::string member)
 {
     Outcome o = co_await unban(member, by);
-    co_return o.empty() ? Answer{204, ""} : fail(404, "no_ban");
+    if (o.empty())
+        co_return Answer{204, ""};
+    co_return fail(404, "no_ban");
 }
 
 } // namespace pond

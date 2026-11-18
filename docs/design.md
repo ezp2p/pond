@@ -459,6 +459,21 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 - Each member may send or fetch 20 file chunks a second (about 20 MiB/s), with bursts of 64.
 - A file is at most what the admin allows (25 MiB unless changed), and never more than 4 GiB. A message carries up to 10.
 
+## Coroutines
+
+pondd's handlers are C++20 coroutines over drogon (`Task<...>`, `co_await` on the database). Debian 12's GCC 12, which builds
+the image, gets some of them wrong when optimising, and the result is a crash only in the release build (`free(): double free`
+on the `DbLoop` thread), never in the debug build the tests use. Every join crashed pondd that way until these rules were kept:
+
+- **One `co_await` per statement**, its result in a named variable, and the text built from those afterwards. Never
+  `"..." + co_await f() + "..."`, never `f(co_await g())`, never `co_await f(co_await g())`.
+- **No `?:` in a `co_return` that makes an object** (a string, an `Answer`), and no `co_await` inside a `?:`: write `if`.
+- **Coroutines take their arguments by value** (`std::string`, `DbPtr`, `Result`), never `const &`: a reference to a caller's
+  temporary (a `TxPtr` turned into a `DbPtr`, a string built in the call) has to outlive a suspension, which GCC 12 doesn't
+  always manage. `Signing &` in `Routes::answer` stays a reference: it is an output, and names the caller's own variable.
+
+drogon's `execSqlCoro` copies its SQL text before it suspends, so building that text in the call is fine.
+
 ## Not yet
 
 - Permissions finer than the three roles, such as who may post where.
