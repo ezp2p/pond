@@ -11,8 +11,15 @@ which parts Pond implements and what the protocol asks of it next.
 
 ## Docker
 
-The quickest way to run one: `ghcr.io/ezp2p/pond` (amd64 and arm64), with MariaDB beside it from `compose.yaml`.
-`:latest` is the newest release and `:dev` the newest build of `dev`. [docs/docker.md](docs/docker.md) says how.
+The quickest way to run one: `ghcr.io/ezp2p/pond` (amd64 and arm64), with MariaDB beside it. Take
+[compose.yaml](compose.yaml) and [.env.example](.env.example) (as `.env`, filled in), then:
+
+```sh
+docker compose up -d
+docker exec pond pondctl invite create     # the pond://… link to give out
+```
+
+`:latest` is the newest release and `:dev` the newest build of `dev`. [docs/docker.md](docs/docker.md) says more.
 
 ## Build
 

@@ -1,25 +1,31 @@
-# A Pond and its MariaDB (docs/docker.md). Set these in a .env file beside this one, or in the environment:
-#   POND_ADDRESS      how people reach this Pond, host[:port]: "pond.example.org:8443"
-#   POND_NAME         the Pond's name, given to it on the first start
-#   POND_DB_PASSWORD  the database password (anything long; nothing outside these two containers uses it)
-#   POND_IMAGE        optional: ghcr.io/ezp2p/pond:dev for the newest build of dev (default: the newest release)
-#   POND_PORT         optional: the port published, TCP for HTTPS and UDP for voice (default 8443)
-# Then: docker compose up -d, and docker compose exec pond pondctl invite create for a link to give out.
+# A Pond and its MariaDB, in Docker (docs/docker.md). The file on its own is enough: no checkout needed.
+#
+#   1. Beside this file, a .env (copy .env.example) with:
+#        POND_ADDRESS      how people reach this Pond, host[:port]: "pond.example.org:8443", with that port (TCP and UDP)
+#                          forwarded to this machine
+#        POND_NAME         the Pond's name, given to it on the first start
+#        POND_DB_PASSWORD  the database password (anything long; nothing outside these two containers uses it)
+#      and optionally POND_IMAGE (ghcr.io/ezp2p/pond:dev for the newest build of dev) and POND_PORT (8443).
+#   2. docker compose up -d
+#   3. docker exec pond pondctl invite create      the pond://… link to give out
+#
+# Updating: docker compose pull && docker compose up -d. The Pond keeps its key in the "pond" volume and everything else
+# in MariaDB's, "db": back up both.
 
 services:
   pond:
     image: ${POND_IMAGE:-ghcr.io/ezp2p/pond:latest}
-    build: .
+    container_name: pond   # so docker exec pond … (docs/docker.md) finds it
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
-      POND_ADDRESS: ${POND_ADDRESS:?set POND_ADDRESS, e.g. pond.example.org:8443}
-      POND_NAME: ${POND_NAME:?set POND_NAME, the Pond's name}
+      POND_ADDRESS: ${POND_ADDRESS:?set POND_ADDRESS in .env, e.g. pond.example.org:8443}
+      POND_NAME: ${POND_NAME:?set POND_NAME in .env, the Pond's name}
       POND_PORT: ${POND_PORT:-8443}
       POND_DB_HOST: db
-      POND_DB_PASSWORD: ${POND_DB_PASSWORD:?set POND_DB_PASSWORD}
+      POND_DB_PASSWORD: ${POND_DB_PASSWORD:?set POND_DB_PASSWORD in .env}
     ports:
       - "${POND_PORT:-8443}:${POND_PORT:-8443}/tcp"
       - "${POND_PORT:-8443}:${POND_PORT:-8443}/udp"
@@ -28,11 +34,12 @@ services:
 
   db:
     image: mariadb:11
+    container_name: pond-db
     restart: unless-stopped
     environment:
       MARIADB_DATABASE: pond
       MARIADB_USER: pond
-      MARIADB_PASSWORD: ${POND_DB_PASSWORD:?set POND_DB_PASSWORD}
+      MARIADB_PASSWORD: ${POND_DB_PASSWORD:?set POND_DB_PASSWORD in .env}
       MARIADB_RANDOM_ROOT_PASSWORD: "1"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
