@@ -1,6 +1,7 @@
 #include "key.h"
 
 #include "encoding.h"
+#include "seal.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -44,7 +45,14 @@ bool create_key(const std::string &data_dir, PondKey &out, std::string &err)
         return false;
     }
     std::string line = hex(seed, 32) + "\n";
+    unsigned char seal_sk[32];
+    bool sealed = pond_seal_key(seed, seal_sk, out.seal_pub);
+    OPENSSL_cleanse(seal_sk, sizeof seal_sk);
     OPENSSL_cleanse(seed, sizeof seed);
+    if (!sealed) {
+        err = "cannot make the Pond's sealing key";
+        return false;
+    }
     FILE *f = fopen(path.c_str(), "wx"); /* never over a key that is there: a Pond with a new key is a different Pond */
     if (!f) {
         OPENSSL_cleanse(line.data(), line.size());
@@ -81,7 +89,11 @@ bool load_key(const std::string &data_dir, PondKey &out, std::string &err)
     ok = public_of(seed, out, err);
     if (ok) {
         out.secret.reset(EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, seed, 32), EVP_PKEY_free);
-        if (!out.secret) {
+        out.seal_secret.reset(new unsigned char[32], [](unsigned char *p) {
+            OPENSSL_cleanse(p, 32);
+            delete[] p;
+        });
+        if (!out.secret || !pond_seal_key(seed, out.seal_secret.get(), out.seal_pub)) {
             err = "cannot load the Pond's key";
             ok = false;
         }

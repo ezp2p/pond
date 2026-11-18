@@ -3,6 +3,7 @@
  * path. The admin's side is pondctl. */
 
 #include "harness.h"
+#include "seal.h"
 #include "identity.h"
 #include "reqsig.h"
 
@@ -14,7 +15,7 @@ static unsigned char pond_pub[32];
 /* What a member's Puddle makes of the receipt on `r` (the Puddle Protocol, spec/02-signatures.md). */
 static Receipt receipt(const Reply &r, const std::string &pond_id)
 {
-    return check_receipt(r.receipt, pond_id, pond_pub, r.nonce, r.status, r.body, r.fp);
+    return check_receipt(r.receipt, pond_id, pond_pub, r.nonce, r.status, r.raw); /* over the answer as sent: sealed */
 }
 
 static std::string join_body(const Identity &who, const std::string &invite, const char *name)
@@ -65,22 +66,22 @@ int main()
     a = pond.call(&ann, "POST", "/pond/v1/join", join_body(ann, two, "Ann"), "*");
     CHECK(a.status == 200);
     {
-        /* the join's answer says who the Pond is, and is signed by that key, over the certificate this connection showed */
+        /* the join's answer says who the Pond is, and is signed by that key; it came sealed, so only Ann could read it */
         std::string key = parse(a.body)["pond"]["key"].asString();
         unsigned char h[32];
         CHECK(unhex(key, pond_pub, 32));
         sha256(pond_pub, 32, h);
         CHECK(base32(h, 32) == P);
         CHECK(!a.receipt.empty() && receipt(a, P) == Receipt::OK);
+        CHECK(a.type == SEALED_TYPE && a.raw.size() == a.body.size() + SEAL_TAG && !has(a.raw, "Test Pond"));
+        unsigned char seal_pub[32];
+        CHECK(unhex(parse(a.body)["pond"]["seal_key"].asString(), seal_pub, 32) && !memcmp(seal_pub, pond.seal_pub, 32));
         Reply changed = a;
-        changed.body += " ";
+        changed.raw += " ";
         CHECK(receipt(changed, P) == Receipt::BAD); /* covers the body */
         changed = a;
         changed.status = 404;
         CHECK(receipt(changed, P) == Receipt::BAD); /* and the status */
-        changed = a;
-        changed.fp = std::string(64, 'a');
-        CHECK(receipt(changed, P) == Receipt::OTHER_CERT); /* someone in the middle, passing it on over a connection of their own */
         changed = a;
         changed.nonce = "AAAAAAAAAAAAAAAAAAAAAA==";
         CHECK(receipt(changed, P) == Receipt::BAD); /* and is for this request only */
@@ -98,7 +99,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 4 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\""));
+    CHECK(num_of(a.body, "protocol") == 5 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -108,6 +109,19 @@ int main()
     CHECK(b.status == 404 && b.receipt.empty());
     b = pond.call(&dan, "POST", "/pond/v1/join", "{\"invite\":1,\"chain\":" + jstr(dan.chain) + "}", "*");
     CHECK(b.status == 400 && b.receipt.empty());
+    /* only sealed requests (spec/09): a member who sends one plain is told so; sealed to another key, nobody is anybody */
+    pond.sealed = false;
+    b = pond.call(&ann, "GET", "/pond/v1/info");
+    CHECK(b.status == 400 && has(b.body, "not_sealed") && receipt(b, P) == Receipt::OK);
+    pond.sealed = true;
+    {
+        unsigned char real[32];
+        memcpy(real, pond.seal_pub, 32);
+        pond.seal_pub[0] ^= 1;
+        b = pond.call(&ann, "GET", "/pond/v1/info");
+        CHECK(b.status == 404 && b.receipt.empty());
+        memcpy(pond.seal_pub, real, 32);
+    }
     /* a member's own 404 (a channel that isn't there) is the Pond's answer, and signed */
     b = pond.call(&ann, "GET", "/pond/v1/channels/999/messages");
     CHECK(b.status == 404 && has(b.body, "no_channel") && receipt(b, P) == Receipt::OK);
@@ -226,7 +240,7 @@ int main()
                             base64((const unsigned char *)hashes.data(), hashes.size()) + "\"}";
         CHECK(pond.call(&dan, "POST", "/pond/v1/join", join_body(dan, invite(pond, ""), "Dan"), "*").status == 200);
         a = pond.call(&ann, "GET", "/pond/v1/info");
-        CHECK(has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\"") && has(a.body, "\"files\":{\"max_size\":26214400,\"chunk_size\":1048576"));
+        CHECK(has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\"") && has(a.body, "\"files\":{\"max_size\":26214400,\"chunk_size\":1048576"));
         CHECK(pond.ctl("files max-size 2M") == 0);
         a = pond.call(&ann, "POST", F, begin);
         CHECK(a.status == 413 && has(a.body, "\"max\":2097152")); /* over what the admin allows */
@@ -349,10 +363,18 @@ int main()
     CHECK(pond.call(&ann, "GET", "/pond/v1/info", "", std::string(52, 'a')).status == 404); /* signed for another Pond */
     a = pond.call(&ann, "GET", "/pond/v1/info", "", "", -10 * 60 * 1000);
     CHECK(a.status == 401 && has(a.body, "clock_skew") && receipt(a, P) == Receipt::OK); /* a member may be told their clock is off */
-    std::string sig = ann.signature("GET", "/pond/v1/info", "", P);
-    CHECK(https(pond.port, "GET", "/pond/v1/info", "", {"X-Puddle-Signature: " + sig}).status == 200);
-    a = https(pond.port, "GET", "/pond/v1/info", "", {"X-Puddle-Signature: " + sig});
-    CHECK(a.status == 401 && has(a.body, "replayed"));
+    {   /* the very same sealed request twice: the second is a replay */
+        unsigned char raw[16], enc[32], key[32];
+        random_bytes(raw, sizeof raw);
+        std::string nonce = base64(raw, sizeof raw), opened;
+        Hpke ctx;
+        CHECK(hpke_sender(pond.seal_pub, seal_info(ann.id, P, nonce), enc, ctx) && answer_key(ctx, key));
+        std::vector<std::string> h = {"X-Puddle-Signature: " + ann.signature("GET", "/pond/v1/info", "", P, 0, nonce),
+                                      "X-Puddle-Seal: v1 kid=" + sha256_hex(std::string_view((const char *)pond.seal_pub, 32)) + "; enc=" + base64(enc, 32)};
+        CHECK(https(pond.port, "GET", "/pond/v1/info", "", h).status == 200);
+        a = https(pond.port, "GET", "/pond/v1/info", "", h);
+        CHECK(a.status == 401 && open_answer(key, 401, a.raw, opened) && has(opened, "replayed"));
+    }
 
     /* ---- stopping answers everyone waiting ---- */
     std::thread held([&] { woke = pond.call(&ann, "GET", "/pond/v1/events?after=999999"); });

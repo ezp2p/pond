@@ -103,6 +103,7 @@ int main()
     open = out.substr(out.find("invite=") + 7, 26);
     CHECK(pond.up());
     std::string base = "pond://127.0.0.1:" + std::to_string(pond.port) + "?invite=";
+    std::string k = "&k=" + base32(pond.seal_pub, 32); /* the Pond's sealing key, as invites carry it (spec/09) */
 
     Node ann, ben;
     CHECK(ann.make(db.dir, "ann", "Ann"));
@@ -110,16 +111,17 @@ int main()
 
     /* ---- joining ---- */
     CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"puddle://127.0.0.1:1\"}", &out) == 400 && has(out, "bad_link"));
-    CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + "aaaaaaaaaaaaaaaaaaaaaaaaaa\"}", &out) == 409 && has(out, "invite_refused"));
-    CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"nope\"}", &out) == 404);
-    CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 201);
+    CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\"}", &out) == 400 && has(out, "bad_link")); /* no key: the old kind */
+    CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + "aaaaaaaaaaaaaaaaaaaaaaaaaa" + k + "\"}", &out) == 409 && has(out, "invite_refused"));
+    CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + k + "\",\"profile\":\"nope\"}", &out) == 404);
+    CHECK(ann.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + k + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(out, "Lily Pad") && has(out, "\"name\":\"general\"") && has(out, "\"display_name\":\"Ann\""));
     std::string pid = str_of(out, "id");
     CHECK(pid == pond.id);
-    CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
-    CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + "\",\"profile\":\"main\"}", &out) == 201);
+    CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + k + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
+    CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + k + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":4,\"features\":[\"files\",\"roles\",\"receipts\""));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":5,\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
 
     std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";
@@ -238,7 +240,8 @@ int main()
     CHECK(ben.post(msgs + "/send", "{\"body\":\"after the restart\"}") == 200);
     CHECK(until([&] { return has(ann.get(msgs), "after the restart"); }, 70000)); /* a follower backs off up to 60 s */
 
-    /* ---- receipts (the Puddle Protocol, spec/05): someone else at the Pond's address can't pass for it ---- */
+    /* ---- receipts and sealing (the Puddle Protocol, spec/05 and spec/09): someone else at the Pond's address can't pass for
+     * it, nor read what is sent there ---- */
     /* another key and another certificate, as someone who had taken over the address would have; even the same database */
     pond.down();
     std::filesystem::rename(pond.dir + "/pond.key", pond.dir + "/pond.key.real");
@@ -253,8 +256,8 @@ int main()
     CHECK(pond.up());
     CHECK(ann.post(msgs + "/send", "{\"body\":\"to an impostor\"}", &out) == 502 && has(out, "not_proven"));
     CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"status\":\"not_proven\""); }, 70000));
-    /* the real Pond back, with the new certificate: renewed, as a Let's Encrypt one is every few months. Its members prove it
-     * by its receipt and carry on, where once they pinned the old one and stopped. */
+    /* the real Pond back, with the new certificate: renewed, as a Let's Encrypt one is every few months. Nothing depends on a
+     * certificate, so its members just carry on. */
     pond.down();
     std::filesystem::rename(pond.dir + "/pond.key.real", pond.dir + "/pond.key");
     CHECK(pond.up());

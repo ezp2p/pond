@@ -3,6 +3,7 @@
 
 #include "config.h"
 #include "db.h"
+#include "encoding.h"
 #include "key.h"
 #include "pond.h"
 #include "tls.h"
@@ -119,12 +120,14 @@ static std::string when(int64_t ms)
     return buf;
 }
 
-static std::string link_for(const Config &cfg, const std::string &token)
+/* An invite carries the Pond's sealing key, `k` (spec/09, "First contact"): the join is sealed to it, so nothing in it can be
+ * read on the way, whatever carries it. */
+static std::string link_for(const Config &cfg, const PondKey &key, const std::string &token)
 {
     std::string a = link_address(cfg);
     if (a.size() > 4 && a.compare(a.size() - 4, 4, ":443") == 0)
         a.resize(a.size() - 4);
-    return "pond://" + a + "?invite=" + token;
+    return "pond://" + a + "?invite=" + token + "&k=" + base32(key.seal_pub, 32);
 }
 
 /* `--name value` options after the positional words; false if one is unknown or has no value. */
@@ -247,10 +250,9 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
     if (cmd == "info") {
         Result r = db->execSqlSync("SELECT (SELECT COUNT(*) FROM members WHERE left_ms IS NULL),"
                                    " (SELECT COUNT(*) FROM channels WHERE deleted = 0), (SELECT COUNT(*) FROM messages)");
-        std::string err, fp = ensure_certificate(cfg.data_dir, err) ? certificate_fingerprint(cfg.data_dir + "/cert.pem") : err;
-        printf("name         %s\nid           %s\naddress      %s\ncertificate  %s\nmembers      %s\nchannels     %s\nmessages     %s\n",
-               sync_wait(svc.setting("name")).c_str(), key.id.c_str(), link_address(cfg).c_str(), fp.c_str(), text(r[0][0]).c_str(),
-               text(r[0][1]).c_str(), text(r[0][2]).c_str());
+        printf("name         %s\nid           %s\nseal key     %s\naddress      %s\nmembers      %s\nchannels     %s\nmessages     %s\n",
+               sync_wait(svc.setting("name")).c_str(), key.id.c_str(), hex(key.seal_pub, 32).c_str(), link_address(cfg).c_str(),
+               text(r[0][0]).c_str(), text(r[0][1]).c_str(), text(r[0][2]).c_str());
         return 0;
     }
     if (cmd == "name") {
@@ -300,7 +302,7 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
             Outcome o = sync_wait(svc.invite_create(n, until, token));
             if (!o.empty())
                 return die(o);
-            printf("%s\n", link_for(cfg, *token).c_str());
+            printf("%s\n", link_for(cfg, key, *token).c_str());
             fprintf(stderr, "%s, %s\n", n ? (std::to_string(n) + (n == 1 ? " use" : " uses")).c_str() : "unlimited uses",
                     until ? ("expires " + when(until)).c_str() : "never expires");
             return 0;

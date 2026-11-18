@@ -6,6 +6,7 @@
 
 #include "identity.h"
 #include "reqsig.h"
+#include "seal.h"
 #include "text.h"
 
 using namespace pond;
@@ -44,8 +45,49 @@ static void replace(std::string &s, const std::string &from, const std::string &
         s.replace(at, from.size(), to);
 }
 
+/* Sealing (spec/09) is HPKE, and RFC 9180's own vectors for the suite (A.2.1) are what keep this and Puddle's agreeing. */
+static std::string bytes_of(const char *hexs)
+{
+    std::string out(strlen(hexs) / 2, '\0');
+    unhex(hexs, (unsigned char *)out.data(), out.size());
+    return out;
+}
+
+static void sealing()
+{
+    std::string ikm_e = bytes_of("909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b"),
+                ikm_r = bytes_of("1ac01f181fdf9f352797655161c58b75c656a6cc2716dcb66372da835542e1df"),
+                info = bytes_of("4f6465206f6e2061204772656369616e2055726e"),
+                pt = bytes_of("4265617574792069732074727574682c20747275746820626561757479");
+    unsigned char sk_e[32], pk_e[32], sk_r[32], pk_r[32], enc[32];
+    CHECK(x25519_derive(ikm_e.data(), 32, sk_e, pk_e) && hex(pk_e, 32) == "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a");
+    CHECK(x25519_derive(ikm_r.data(), 32, sk_r, pk_r) && hex(sk_r, 32) == "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb");
+    Hpke s, r;
+    CHECK(hpke_sender_with(sk_e, pk_r, info, enc, s) && hpke_receiver(enc, sk_r, info, r));
+    CHECK(hex(s.key, 32) == "ad2744de8e17f4ebba575b3f5f5a8fa1f69c2a07f6e7500bc60ca6e3e3ec1c91" && hex(s.base_nonce, 12) == "5c4d98150661b848853b547f");
+    std::string ct, back;
+    s.seq = r.seq = 1;
+    CHECK(hpke_seal(s, bytes_of("436f756e742d31"), pt, ct) &&
+          hex((const unsigned char *)ct.data(), ct.size()) ==
+              "6b53c051e4199c518de79594e1c4ab18b96f081549d45ce015be002090bb119e85285337cc95ba5f59992dc98c");
+    CHECK(hpke_open(r, bytes_of("436f756e742d31"), ct, back) && back == pt);
+    unsigned char out[32];
+    CHECK(hpke_export(s, bytes_of("54657374436f6e74657874"), out, 32) &&
+          hex(out, 32) == "5acb09211139c43b3090489a9da433e8a30ee7188ba8b0a9a1ccf0c229283e53");
+    /* answers: records bound to their status and place, and the last one marked */
+    unsigned char key[32];
+    CHECK(answer_key(s, key));
+    std::string big(3 * SEAL_RECORD + 5, 'x'), sealed, opened;
+    CHECK(seal_answer(key, 200, big, sealed) && sealed.size() == big.size() + 4 * SEAL_TAG);
+    CHECK(open_answer(key, 200, sealed, opened) && opened == big);
+    CHECK(!open_answer(key, 404, sealed, opened));
+    CHECK(!open_answer(key, 200, sealed.substr(0, SEAL_RECORD + SEAL_TAG), opened)); /* cut short after a whole record */
+    CHECK(seal_answer(key, 202, "", sealed) && sealed.size() == SEAL_TAG && open_answer(key, 202, sealed, opened) && opened.empty());
+}
+
 int main()
 {
+    sealing();
     /* ---- encodings (RFC 4648 test vectors) ---- */
     const unsigned char foobar[] = "foobar";
     CHECK(base32(foobar, 6) == "mzxw6ytboi");

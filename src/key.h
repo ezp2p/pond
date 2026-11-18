@@ -15,6 +15,10 @@ struct PondKey {
     unsigned char pub[32];
     std::string id; /* 52 characters */
     std::shared_ptr<EVP_PKEY> secret; /* the private key, held for signing receipts (load_key fills it; create_key does not) */
+    /* The sealing key (X25519), derived from the same seed (spec/09): members seal their requests to `seal_pub`. load_key fills
+     * both halves; create_key only the public one. */
+    unsigned char seal_pub[32] = {};
+    std::shared_ptr<unsigned char> seal_secret;
 
     /* Ed25519 over `data`. false if this key has no private half, or signing failed. */
     bool sign(std::string_view data, unsigned char sig[64]) const;

@@ -41,7 +41,8 @@ can't be replayed to another.
 
 There is no recovery phrase and no key rolling. A Pond that loses `pond.key` is a new Pond.
 
-The key also signs the Pond's answers (see "Receipts"), so it is the key, not the TLS certificate, that members trust.
+The key also signs the Pond's answers, and a key derived from it seals them (see "Receipts and sealing"), so it is the
+key, not the TLS certificate, that members trust.
 The certificate can change freely; `pond.key` must not.
 
 ## Invite links
@@ -72,40 +73,41 @@ The Pond checks the chain and that the request is signed by its newest key. It s
 `UPDATE`), and records the member with their id, current key and profile. It answers `200` with the Pond (id, name
 and description), the member as the Pond sees them, the channels, and the newest event number (`cursor`).
 
-The answer is signed (see "Receipts") and carries the Pond's public key in `pond.key`; the Puddle keeps it, and checks
+The answer is sealed and signed (see "Receipts and sealing") and carries the Pond's public key in `pond.key` and its
+sealing key in `pond.seal_key`; the Puddle keeps it, and checks
 that its SHA-256 is the Pond's id. From then on it holds the Pond to that key.
 
-## Receipts
+## Receipts and sealing
 
-> **Being replaced** (the protocol's `spec/09-sealing.md`): requests and answers will be sealed to keys, and receipts will
-> stop naming the certificate. A Pond can then sit behind any reverse proxy and renew its certificate without a restart
-> or a shared certificate. Its sealing key will be derived from `pond.key`'s seed, so there is no new file to keep. This
-> section describes what is built today.
+TLS only carries what members and the Pond say (the Puddle Protocol, `spec/09-sealing.md`): no certificate is named,
+pinned or compared, so a Pond can sit behind any reverse proxy, on any certificate, renewed whenever, with nothing to
+copy or restart.
 
-Every answer to a member carries the Pond's receipt, the same header a Puddle puts on its answers (the Puddle Protocol,
-`spec/02-signatures.md`; `src/reqsig.cpp`):
+**Sealing.** The Pond has a sealing key (X25519), derived from `pond.key`'s seed (HKDF-SHA256, info `pond-seal-v1`), so
+there is no other file to keep. It is in `/info` and the join's answer as `pond.seal_key`, and in every invite as `k`
+(`pond://pond.example.org?invite=<token>&k=<base32>`). Every request is sealed to it (`X-Puddle-Seal`, `src/seal.cpp`:
+HPKE, RFC 9180), and the answer goes back sealed under a key exported from that request, so only that member can read it.
+A request that can't be opened is the plain `404`; one from a member that wasn't sealed is `400 not_sealed`.
 
-    X-Puddle-Receipt: v1 id=<pond id>; kid=<hex SHA-256 of its key>; fp=<hex SHA-256 of its certificate>; sig=<base64>
+**Receipts.** Every answer to a member carries the Pond's receipt, the same header a Puddle puts on its answers
+(`spec/02-signatures.md`; `src/reqsig.cpp`):
 
-signed by `pond.key` over the request's nonce, the status, the SHA-256 of the body exactly as sent, and the certificate
-pondd serves. So does the answer to a join that worked. Nothing that anyone could be sent carries one: not the plain
-`404` (a failed check, a refused invite) nor a join that went wrong, so a receipt never says to a stranger which Pond lives
-at an address.
+    X-Puddle-Receipt: v2 id=<pond id>; kid=<hex SHA-256 of its key>; sig=<base64>
 
-What it is for: a member's Puddle believes an answer only with a good receipt, and only over the certificate the receipt
-names, so someone in the middle can pass requests on but can't answer for the Pond. And since it is the key that
-proves the Pond, the certificate may change. When a member's Puddle is shown a certificate it hasn't seen the Pond sign
-for, it asks `GET /pond/v1/info` over it (a request that changes nothing) and checks the receipt; if it names that
-certificate, the Puddle carries on with it. A Let's Encrypt certificate can be renewed every few months without cutting
-anyone off. An answer that can't be proven stops the Puddle talking to that address (its status is `not_proven`) until
-one can.
+signed by `pond.key` over the request's nonce, the status and the SHA-256 of the body exactly as sent (sealed). So does
+the answer to a join that worked. Nothing that anyone could be sent carries one: not the `404` (a failed check, a refused
+invite) nor a join that went wrong, so a receipt never says to a stranger which Pond lives at an address.
 
-pondd reads its certificate's fingerprint when it starts, since that is when it loads the certificate: a new one takes a
-restart, as it always did.
+What they are for: a member's Puddle believes an answer only with a good receipt, so someone in the middle can pass
+requests on but can't read them or answer for the Pond. An answer that can't be proven stops the Puddle talking to that
+address (its status is `not_proven`) until one can.
 
-A Pond with receipts says so in `/info` (protocol 3, feature `receipts`). A member's Puddle that joined before then
-pins the certificate it saw, as it did; it learns the key from the next `/info`, over that pinned certificate, and from
-then on it checks receipts and never pins again.
+**A member we removed.** A request the Pond opened, from someone who is not (or no longer) a member, gets the same `404`
+as an unknown path, but sealed under that request's key and unsigned. Only this Pond could seal it, so the Puddle can tell
+it really was removed; a plain `404` from someone else at the address proves nothing.
+
+A Pond with this says so in `/info` (protocol 5, features `receipts` and `sealed`). Puddles that joined before (no
+`seal_key` kept) have to join again with a new invite.
 
 ## Being a member
 

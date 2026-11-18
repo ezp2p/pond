@@ -58,6 +58,19 @@ docker run -d --name pond -p 8443:8443 -p 8443:8443/udp -v pond:/data \
 
 Without `POND_NAME` it waits instead, until `docker exec -it pond pondctl init "My Pond"`.
 
+## Behind a reverse proxy
+
+A Pond can sit behind Apache, nginx, Caddy, Traefik or anything else that terminates TLS, with whatever certificate the
+proxy has (Let's Encrypt, renewed whenever). Nothing depends on it: members seal what they send to the Pond's own key
+and check its signed receipts (the Puddle Protocol, spec/09), so the certificate only carries the bytes. Point the proxy
+at `https://<pond container>:8443` (pondd always speaks TLS; the proxy need not check its self-signed certificate) and:
+
+- pass the request path and query **exactly as sent** (Apache: `ProxyPass ... nocanon`), since members sign them;
+- pass the `X-Puddle-Signature`, `X-Puddle-Seal` and `X-Puddle-Receipt` headers and the bodies untouched (no
+  compression or rewriting of `application/puddle-sealed`);
+- allow answers to wait up to 30 seconds (members hold a request for events open for up to 25);
+- leave voice out of it: it is UDP, straight to the Pond's voice port (`voice.port` in `pond.yaml`), forwarded on its own.
+
 ## What is kept where
 
 - the `pond` volume (`/data`): `pond.yaml`, and under `data/` the Pond's key (`pond.key`: a Pond with a new key is a

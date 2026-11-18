@@ -17,9 +17,8 @@ namespace pond {
 
 class Routes {
 public:
-    /* `tls_fp`: the hex SHA-256 of the certificate pondd serves, which receipts name */
     /* `voice`: voice channels, or nullptr when off (their routes are then unknown paths) */
-    Routes(Service &s, std::string tls_fp, Voice *voice = nullptr) : svc_(s), tls_fp_(std::move(tls_fp)), voice_(voice) {}
+    explicit Routes(Service &s, Voice *voice = nullptr) : svc_(s), voice_(voice) {}
 
     /* Every request pondd gets comes here, whatever its method and path. */
     Task<drogon::HttpResponsePtr> handle(drogon::HttpRequestPtr req);
@@ -33,10 +32,11 @@ private:
     struct Signing {
         std::string nonce;
         bool only_ok = false;
+        bool sealed = false;      /* the request was sealed: the answer is, under `key` (spec/09) */
+        unsigned char key[32] = {};
     };
     Task<Answer> answer(const drogon::HttpRequestPtr &req, Signing &signing);
     Service &svc_;
-    std::string tls_fp_;
     Voice *voice_;
     Replay replay_;
     std::mutex strangers_mu_;
