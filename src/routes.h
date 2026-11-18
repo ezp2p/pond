@@ -35,7 +35,7 @@ private:
         bool sealed = false;      /* the request was sealed: the answer is, under `key` (spec/09) */
         unsigned char key[32] = {};
     };
-    Task<Answer> answer(const drogon::HttpRequestPtr &req, Signing &signing);
+    Task<Answer> answer(drogon::HttpRequestPtr req, Signing &signing);
     Service &svc_;
     Voice *voice_;
     Replay replay_;

@@ -107,7 +107,7 @@ bool load_config(const std::string &path, Config &out, std::string &err)
     }
     for (auto it = root.begin(); ok && it != root.end(); ++it) {
         std::string k = it->first.as<std::string>();
-        const YAML::Node &v = it->second;
+        YAML::Node v = it->second; /* a copy: it-> is a temporary the iterator makes, gone after this line */
         long wait;
         ok = k == "listen"           ? scalar(v, "listen", out.listen, err)
              : k == "port"           ? number(v, "port", 1, 65535, out.port, err)

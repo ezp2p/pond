@@ -96,7 +96,7 @@ static std::string message_json(const drogon::orm::Row &row, const std::string &
 }
 
 /* Rows of MESSAGE_COLS as a JSON array, each with the files it carries. */
-Task<std::string> Service::messages_json(const DbPtr &db, const Result &r)
+Task<std::string> Service::messages_json(DbPtr db, Result r)
 {
     std::map<int64_t, std::string> files;
     if (!r.empty()) {
@@ -129,13 +129,15 @@ Task<std::string> Service::messages_json(const DbPtr &db, const Result &r)
     co_return out + "]";
 }
 
-Task<std::string> Service::member_json_of(const DbPtr &db, const std::string &id)
+Task<std::string> Service::member_json_of(DbPtr db, std::string id)
 {
     Result r = co_await db->execSqlCoro(std::string("SELECT ") + MEMBER_COLS + " FROM members WHERE id = ?", id);
-    co_return r.empty() ? "" : member_json(r[0]);
+    if (r.empty())
+        co_return "";
+    co_return member_json(r[0]);
 }
 
-Task<std::string> Service::pond_json(const DbPtr &db)
+Task<std::string> Service::pond_json(DbPtr db)
 {
     Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size')");
     std::string name, description, max = std::to_string(FILES_DEFAULT_MAX);
@@ -159,7 +161,9 @@ Task<std::string> Service::channels_json()
 Task<std::string> Service::setting(std::string name)
 {
     Result r = co_await db_->execSqlCoro("SELECT value FROM settings WHERE name = ?", name);
-    co_return r.empty() ? "" : text(r[0][0]);
+    if (r.empty())
+        co_return "";
+    co_return text(r[0][0]);
 }
 
 /* ---- members ---- */
@@ -186,7 +190,9 @@ Task<bool> Service::is_member(std::string id)
 Task<Answer> Service::join(Chain chain, std::string invite, std::string profile)
 {
     Answer a = co_await enter(chain, invite, profile);
-    co_return a.status == 200 ? co_await info(chain.id) : a;
+    if (a.status != 200)
+        co_return a; /* if, not ?: (docs/design.md, "Coroutines") */
+    co_return co_await info(chain.id);
 }
 
 Task<Answer> Service::enter(Chain chain, std::string invite, std::string profile)
@@ -258,10 +264,15 @@ Task<Answer> Service::info(std::string member)
             features += (features.size() > 1 ? "," : "") + jstr(f);
         if (voice_now)
             features += ",\"voice\"";
-        co_return Answer{200, "{\"protocol\":" + std::to_string(PROTOCOL) + ",\"features\":" + features + "],\"pond\":" +
-                                  co_await pond_json(db_) + ",\"me\":" + me + ",\"offer\":" + co_await offer_json(member) +
-                                  ",\"channels\":" + co_await channels_json() + ",\"voice\":" + (voice_now ? voice_now() : "[]") +
-                                  ",\"cursor\":" + std::to_string(num(c[0][0])) + "}"};
+        /* each co_await on its own, then the text (docs/design.md, "Coroutines") */
+        const std::string pond = co_await pond_json(db_);
+        const std::string offer = co_await offer_json(member);
+        const std::string channels = co_await channels_json();
+        const std::string voice = voice_now ? voice_now() : "[]";
+        std::string body = "{\"protocol\":" + std::to_string(PROTOCOL) + ",\"features\":" + features + "],\"pond\":" + pond +
+                           ",\"me\":" + me + ",\"offer\":" + offer + ",\"channels\":" + channels + ",\"voice\":" + voice +
+                           ",\"cursor\":" + std::to_string(num(c[0][0])) + "}";
+        co_return Answer{200, std::move(body)};
     } catch (const DrogonDbException &e) {
         co_return server_error(e);
     }
@@ -276,7 +287,8 @@ Task<Answer> Service::history(int64_t channel, int64_t before, int limit)
         Result r = co_await db_->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS +
                                                  " FROM messages WHERE channel = ? AND id < ? ORDER BY id DESC LIMIT ?",
                                              channel, before > 0 ? before : INT64_MAX, (int64_t)limit);
-        co_return Answer{200, "{\"messages\":" + co_await messages_json(db_, r) + "}"};
+        const std::string messages = co_await messages_json(db_, r);
+        co_return Answer{200, "{\"messages\":" + messages + "}"};
     } catch (const DrogonDbException &e) {
         co_return server_error(e);
     }
@@ -376,7 +388,9 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
         Result r = co_await db_->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS + " FROM messages WHERE author = ? AND nonce = ?", member,
                                              nonce);
         std::string list = co_await messages_json(db_, r);
-        co_return r.empty() ? fail(500, "database") : Answer{200, list.substr(1, list.size() - 2)};
+        if (r.empty())
+            co_return fail(500, "database");
+        co_return Answer{200, list.substr(1, list.size() - 2)};
     } catch (const DrogonDbException &e) {
         co_return server_error(e);
     }
@@ -402,7 +416,8 @@ Task<Answer> Service::set_profile(std::string member, std::string profile)
         tx = co_await db_->newTransactionCoro();
         co_await tx->execSqlCoro("UPDATE members SET profile = ? WHERE id = ? AND left_ms IS NULL",
                                  profile.empty() ? std::nullopt : std::optional<std::string>(profile), member);
-        int64_t ev = co_await add_event(tx, "member", co_await member_json_of(tx, member));
+        std::string mj = co_await member_json_of(tx, member);
+        int64_t ev = co_await add_event(tx, "member", mj);
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
         bump(ev);
@@ -423,7 +438,11 @@ Task<Outcome> Service::remove_member(std::string id)
         /* a role does not outlast membership: someone who comes back comes back a member */
         Result r = co_await tx->execSqlCoro("UPDATE members SET left_ms = ?, role = 'member' WHERE id = ? AND left_ms IS NULL", now_ms(), id);
         co_await tx->execSqlCoro("DELETE FROM role_offers WHERE member = ?", id);
-        int64_t ev = r.affectedRows() ? co_await add_event(tx, "member_left", "{\"id\":" + jstr(id) + "}") : 0;
+        int64_t ev = 0;
+        if (r.affectedRows()) {
+            const std::string left = "{\"id\":" + jstr(id) + "}";
+            ev = co_await add_event(tx, "member_left", left);
+        }
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);
@@ -483,7 +502,7 @@ Task<bool> Service::is_voice_channel(int64_t channel)
 
 /* ---- the event log ---- */
 
-Task<int64_t> Service::add_event(const TxPtr &tx, const char *kind, const std::string &data, std::string only_for)
+Task<int64_t> Service::add_event(TxPtr tx, const char *kind, std::string data, std::string only_for)
 {
     co_await tx->execSqlCoro("SELECT value FROM settings WHERE name = 'event_lock' FOR UPDATE");
     Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms, only_for) VALUES (?, ?, ?, ?)", std::string(kind), data,
@@ -655,7 +674,8 @@ Task<Outcome> Service::set_name(std::string name, std::optional<std::string> des
         co_await tx->execSqlCoro("REPLACE INTO settings (name, value) VALUES ('name', ?)", n);
         if (description)
             co_await tx->execSqlCoro("REPLACE INTO settings (name, value) VALUES ('description', ?)", d);
-        int64_t ev = co_await add_event(tx, "pond", co_await pond_json(tx));
+        std::string pj = co_await pond_json(tx);
+        int64_t ev = co_await add_event(tx, "pond", pj);
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);
@@ -693,7 +713,9 @@ Task<Outcome> Service::channel_create(std::string name, std::string topic, std::
     } catch (const DrogonDbException &e) {
         if (tx)
             tx->rollback();
-        co_return sql_errno(e) == 1062 ? "there is already a channel called " + name : refused(e);
+        if (sql_errno(e) == 1062)
+            co_return "there is already a channel called " + name;
+        co_return refused(e);
     }
 }
 
@@ -707,7 +729,9 @@ Task<Outcome> Service::channel_set(std::string name, const char *column, std::st
         if (r.affectedRows() == 0) { /* none by that name, or nothing changed */
             tx->rollback();
             Result e = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE name = ? AND deleted = 0", name);
-            co_return e.empty() ? "no channel called " + name : "";
+            if (e.empty())
+                co_return "no channel called " + name;
+            co_return "";
         }
         Result c = co_await tx->execSqlCoro(std::string("SELECT ") + CHANNEL_COLS + " FROM channels WHERE name = ? AND deleted = 0",
                                             std::string(column) == "name" ? value : name);
@@ -719,7 +743,9 @@ Task<Outcome> Service::channel_set(std::string name, const char *column, std::st
     } catch (const DrogonDbException &e) {
         if (tx)
             tx->rollback();
-        co_return sql_errno(e) == 1062 ? "there is already a channel called " + value : refused(e);
+        if (sql_errno(e) == 1062)
+            co_return "there is already a channel called " + value;
+        co_return refused(e);
     }
 }
 

@@ -192,20 +192,20 @@ private:
     struct Waiter;
     struct News;
     Task<Answer> enter(Chain chain, std::string invite, std::string profile);
-    Task<int64_t> add_event(const TxPtr &tx, const char *kind, const std::string &data, std::string only_for = "");
-    Task<std::string> offer_json(const std::string &member);
+    Task<int64_t> add_event(TxPtr tx, const char *kind, std::string data, std::string only_for = "");
+    Task<std::string> offer_json(std::string member);
     /* May `by` act on `target`? "" if so, else the error code. */
-    Task<std::string> may_act(const std::string &by, const std::string &target);
-    Task<std::string> member_json_of(const DbPtr &db, const std::string &id);
-    Task<std::string> pond_json(const DbPtr &db);
+    Task<std::string> may_act(std::string by, std::string target);
+    Task<std::string> member_json_of(DbPtr db, std::string id);
+    Task<std::string> pond_json(DbPtr db);
     Task<std::string> channels_json();
     Task<Outcome> channel_set(std::string name, const char *column, std::string value);
     Task<Outcome> remove_member(std::string id);
     void bump(int64_t id);
     Task<> tick();
     Task<> sweep_files();
-    Task<bool> may_read(const std::string &member, const std::string &id);
-    Task<std::string> messages_json(const DbPtr &db, const drogon::orm::Result &r);
+    Task<bool> may_read(std::string member, std::string id);
+    Task<std::string> messages_json(DbPtr db, drogon::orm::Result r);
     std::string file_path(const std::string &id, bool partial) const;
 
     DbPtr db_;

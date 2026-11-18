@@ -172,7 +172,7 @@ Task<Answer> Service::file_put(std::string member, std::string id, int64_t n, st
 }
 
 /* A member may fetch a whole file that a message in a live channel carries, or that they sent themselves. */
-Task<bool> Service::may_read(const std::string &member, const std::string &id)
+Task<bool> Service::may_read(std::string member, std::string id)
 {
     Result r = co_await db_->execSqlCoro(
         "SELECT 1 FROM files f WHERE f.id = ? AND f.whole = 1 AND (f.uploader = ? OR EXISTS (SELECT 1 FROM message_files mf"
@@ -255,7 +255,8 @@ Task<Outcome> Service::set_files_max(int64_t bytes)
     try {
         tx = co_await db_->newTransactionCoro();
         co_await tx->execSqlCoro("REPLACE INTO settings (name, value) VALUES ('files.max_size', ?)", std::to_string(bytes));
-        int64_t ev = co_await add_event(tx, "pond", co_await pond_json(tx));
+        std::string pj = co_await pond_json(tx); /* one co_await per statement (GCC 12: docs/design.md, "Coroutines") */
+        int64_t ev = co_await add_event(tx, "pond", pj);
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);
