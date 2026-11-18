@@ -46,13 +46,9 @@ int main(int argc, char **argv)
 
     Service svc(db, key, cfg.data_dir, app().getLoop());
     svc.wait_ms = cfg.events_wait_ms;
+    /* TLS only carries what members and the Pond say to each other, sealed (spec/09): any certificate will do, the Pond's own
+     * or a reverse proxy's in front of it, and nothing depends on which. */
     std::string cert = cfg.data_dir + "/cert.pem";
-    /* read once: the certificate served is the one loaded at start, so a new one (renewed) takes a restart */
-    std::string tls_fp = certificate_fingerprint(cert);
-    if (tls_fp.empty()) {
-        fprintf(stderr, "pondd: cannot read %s\n", cert.c_str());
-        return 1;
-    }
     /* voice channels (docs/voice.md): one UDP port, the HTTPS port's number unless said */
     std::unique_ptr<Voice> voice;
     if (cfg.voice.on && Voice::built()) {
@@ -64,7 +60,7 @@ int main(int argc, char **argv)
         svc.voice_on = true;
         svc.voice_now = [v = voice.get()] { return v->now_json(); };
     }
-    Routes routes(svc, tls_fp, voice.get());
+    Routes routes(svc, voice.get());
     /* every request goes to the routes, whatever its path and method, so that nothing is answered differently from an
      * unknown path (no 405s) */
     app().registerHandlerViaRegex(
@@ -95,8 +91,7 @@ int main(int argc, char **argv)
             voice->start();
             LOG_INFO << "voice channels on UDP port " << (cfg.voice.port ? cfg.voice.port : cfg.port);
         }
-        LOG_INFO << "Pond " << key.id << " listening on " << cfg.listen << ":" << cfg.port << " (certificate "
-                 << tls_fp << ")";
+        LOG_INFO << "Pond " << key.id << " listening on " << cfg.listen << ":" << cfg.port;
     });
     app().run();
     return 0;

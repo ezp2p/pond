@@ -55,7 +55,6 @@ static const char *said(Receipt r)
     case Receipt::MISSING: return "missing";
     case Receipt::WRONG_KEY: return "wrong_key";
     case Receipt::BAD: return "bad";
-    case Receipt::OTHER_CERT: return "other_cert";
     }
     return "?";
 }
@@ -100,7 +99,7 @@ int main()
     for (const auto &t : v["receipts"]) {
         std::string name = t["name"].asString();
         Receipt r = check_receipt(t["header"].asString(), responder_id, responder, t["nonce"].asString(), t["status"].asInt(),
-                                  t["body"].asString(), t["seen_fp"].asString());
+                                  t["body"].asString());
         expect(said(r) == t["expect"].asString(), "receipt \"" + name + "\": said " + said(r) + ", expected " + t["expect"].asString());
     }
     expect(v["requests"].size() > 0 && v["receipts"].size() > 0, "the file has vectors");

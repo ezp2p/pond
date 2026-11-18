@@ -13,11 +13,12 @@ info:
     from a refusal.
     Once a request is known to be from a member, mistakes are answered with `{"error": "<code>"}`.
 
-    Every answer to a member, and the answer to a join that worked, carries `X-Puddle-Receipt` (protocol 3, feature
-    `receipts`): the Pond's signature over the request's nonce, the status, the SHA-256 of the body, and the SHA-256 of the
-    Pond's own TLS certificate, exactly as a Puddle signs its answers (the Puddle Protocol, spec/02-signatures.md). A
-    member's Puddle checks it with the key in `pond.key`, so it trusts the Pond's key rather than its certificate, and a
-    renewed certificate is proven by the next receipt. The plain `404` carries none.
+    Every request is sealed to the Pond's sealing key (`X-Puddle-Seal`; `pond.seal_key`, and `k` in invites) and every
+    answer is sealed back to the member (protocol 5, feature `sealed`; the Puddle Protocol, spec/09-sealing.md), so TLS only
+    carries it and any certificate will do. Every answer to a member, and the answer to a join that worked, carries
+    `X-Puddle-Receipt` v2 (feature `receipts`): the Pond's signature over the request's nonce, the status and the SHA-256 of
+    the body as sent, exactly as a Puddle signs its answers (spec/02-signatures.md), checked with the key in `pond.key`.
+    The `404` carries none; to a request the Pond opened, it comes sealed, so a removed member knows it is the Pond's.
 
     Within /pond/v1 things are only added, and a Puddle ignores fields and event kinds it does not know; `/info` says which
     additions a Pond has (`protocol`, `features`). A change an older Puddle would misread gets new paths, /pond/v2.
@@ -472,7 +473,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts"). `voice`: voice channels (docs/voice.md). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `voice`: voice channels (docs/voice.md). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -516,6 +517,10 @@ components:
           type: string
           pattern: "^[0-9a-f]{64}$"
           description: The Pond's Ed25519 public key, hex (protocol 3), which signs its receipts. Its SHA-256 is the id.
+        seal_key:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: The Pond's sealing key (X25519), hex (protocol 5), which members seal their requests to. An invite's `k`.
         name: { type: string }
         description: { type: string }
         files:

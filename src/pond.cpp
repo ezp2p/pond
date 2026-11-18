@@ -142,7 +142,7 @@ Task<std::string> Service::pond_json(const DbPtr &db)
     for (const auto &row : r)
         (text(row[0]) == "name" ? name : text(row[0]) == "description" ? description : max) = text(row[1]);
     /* what members may send: "files" (docs/design.md, "Files"); max_size 0 is files turned off */
-    co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"name\":" + jstr(name) + ",\"description\":" + jstr(description) +
+    co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"seal_key\":" + jstr(hex(key_.seal_pub, 32)) + ",\"name\":" + jstr(name) + ",\"description\":" + jstr(description) +
               ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
               std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "}}";
 }

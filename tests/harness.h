@@ -11,6 +11,7 @@
 
 #include "encoding.h"
 #include "json.h"
+#include "seal.h"
 
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -151,9 +152,10 @@ inline bool port_open(unsigned port)
 
 struct Reply {
     int status = -1;
-    std::string body;
+    std::string body;    /* opened, when it came sealed to a request PondProc::call made */
+    std::string raw;     /* as it came: what the receipt covers */
     std::string receipt; /* the X-Puddle-Receipt header, if any */
-    std::string fp;      /* the hex SHA-256 of the certificate the connection showed */
+    std::string type;    /* its Content-Type */
     std::string nonce;   /* of the request, when PondProc::call signed it */
 };
 
@@ -177,13 +179,6 @@ inline Reply https(unsigned port, const std::string &method, const std::string &
     SSL *ssl = SSL_new(ctx);
     SSL_set_fd(ssl, fd);
     if (SSL_connect(ssl) == 1) {
-        if (X509 *cert = SSL_get1_peer_certificate(ssl)) {
-            unsigned char md[32];
-            unsigned len = 0;
-            if (X509_digest(cert, EVP_sha256(), md, &len) == 1 && len == 32)
-                r.fp = pond::hex(md, 32);
-            X509_free(cert);
-        }
         std::string req = method + " " + target + " HTTP/1.1\r\nHost: x\r\nContent-Length: " + std::to_string(body.size()) +
                           "\r\nConnection: close\r\n";
         for (auto &h : headers)
@@ -198,7 +193,7 @@ inline Reply https(unsigned port, const std::string &method, const std::string &
         if (sscanf(all.c_str(), "HTTP/1.1 %d", &r.status) != 1)
             r.status = -1;
         size_t b = all.find("\r\n\r\n");
-        r.body = b == std::string::npos ? "" : all.substr(b + 4);
+        r.body = r.raw = b == std::string::npos ? "" : all.substr(b + 4);
         for (size_t at = all.find("\r\n"); at != std::string::npos && at < b; at = all.find("\r\n", at + 2)) {
             std::string line = all.substr(at + 2, all.find("\r\n", at + 2) - at - 2);
             std::string lower = line.substr(0, 17);
@@ -206,6 +201,11 @@ inline Reply https(unsigned port, const std::string &method, const std::string &
                 c = (char)tolower((unsigned char)c);
             if (lower == "x-puddle-receipt:")
                 r.receipt = line.substr(line.find_first_not_of(' ', 17));
+            std::string ct = line.substr(0, 13);
+            for (char &c : ct)
+                c = (char)tolower((unsigned char)c);
+            if (ct == "content-type:")
+                r.type = line.substr(line.find_first_not_of(' ', 13));
         }
     }
     SSL_free(ssl);
@@ -310,13 +310,15 @@ struct Identity {
 
     std::string kid() const { return sign.hash_hex(); }
 
-    /* The X-Puddle-Signature header for a request to `to` (a Pond's id, or "*"), made `skew_ms` from now. */
+    /* The X-Puddle-Signature header for a request to `to` (a Pond's id, or "*"), made `skew_ms` from now, with `nonce` (new if
+     * none). */
     std::string signature(const std::string &method, const std::string &target, const std::string &body, const std::string &to,
-                          int64_t skew_ms = 0) const
+                          int64_t skew_ms = 0, std::string nonce = "") const
     {
         unsigned char raw[16];
         pond::random_bytes(raw, sizeof raw);
-        std::string nonce = pond::base64(raw, sizeof raw);
+        if (nonce.empty())
+            nonce = pond::base64(raw, sizeof raw);
         int64_t ts = wall_ms() + skew_ms;
         std::string canon = "puddle-request-v1\n" + method + "\n" + target + "\n" + pond::sha256_hex(body) + "\n" + std::to_string(ts) +
                             "\n" + nonce + "\n" + to;
@@ -374,6 +376,8 @@ struct PondProc {
     unsigned port = 0;
     pid_t pid = 0;
     std::string id; /* the Pond's */
+    unsigned char seal_pub[32] = {}; /* its sealing key: what members seal their requests to (spec/09) */
+    bool sealed = true;              /* call() seals what it sends, as a member's Puddle does; false to send it plain */
 
     explicit PondProc(TestDb &d) : db(d) {}
 
@@ -396,7 +400,8 @@ struct PondProc {
         ctl("info", &info);
         size_t at = info.find("id ");
         id = at == std::string::npos ? "" : info.substr(info.find_first_not_of(' ', at + 2), 52);
-        return id.size() == 52;
+        size_t k = info.find("seal key");
+        return id.size() == 52 && k != std::string::npos && pond::unhex(info.substr(info.find_first_not_of(' ', k + 8), 64), seal_pub, 32);
     }
 
     int ctl(const std::string &args, std::string *out = nullptr)
@@ -416,17 +421,37 @@ struct PondProc {
     ~PondProc() { down(); }
 
     /* A request signed by `who` for `to` (the Pond's id unless given), straight to pondd. */
+    /* Sealed to the Pond's key (spec/09) unless `sealed` is false, and its answer opened. */
     Reply call(const Identity *who, const std::string &method, const std::string &target, const std::string &body = "",
                const std::string &to = "", int64_t skew_ms = 0)
     {
         std::vector<std::string> h;
-        std::string sig = who ? who->signature(method, target, body, to.empty() ? id : to, skew_ms) : "";
+        std::string recipient = to.empty() ? id : to, sent = body, sig;
+        unsigned char key[32] = {};
+        bool seal = who && sealed;
+        if (seal) {
+            unsigned char raw[16], enc[32];
+            pond::random_bytes(raw, sizeof raw);
+            std::string nonce = pond::base64(raw, sizeof raw);
+            pond::Hpke ctx;
+            if (!pond::hpke_sender(seal_pub, pond::seal_info(who->id, recipient, nonce), enc, ctx) || !pond::answer_key(ctx, key) ||
+                (!body.empty() && !pond::hpke_seal(ctx, pond::seal_aad(method, target), body, sent)))
+                return Reply{};
+            sig = who->signature(method, target, sent, recipient, skew_ms, nonce);
+            h.push_back("X-Puddle-Seal: v1 kid=" + pond::sha256_hex(std::string_view((const char *)seal_pub, 32)) + "; enc=" + pond::base64(enc, 32));
+            h.push_back("Content-Type: application/puddle-sealed");
+        } else if (who) {
+            sig = who->signature(method, target, body, recipient, skew_ms);
+        }
         if (who)
             h.push_back("X-Puddle-Signature: " + sig);
-        Reply r = https(port, method, target, body, h);
+        Reply r = https(port, method, target, sent, h);
         size_t n = sig.find("; nonce="), e = sig.find("; sig=");
         if (n != std::string::npos)
             r.nonce = sig.substr(n + 8, e - n - 8);
+        std::string opened;
+        if (seal && r.type == pond::SEALED_TYPE && pond::open_answer(key, r.status, r.raw, opened))
+            r.body = opened;
         return r;
     }
 

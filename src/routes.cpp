@@ -3,6 +3,7 @@
 #include "encoding.h"
 #include "identity.h"
 #include "json.h"
+#include "seal.h"
 
 #include <drogon/orm/Exception.h>
 #include <trantor/utils/Logger.h>
@@ -250,15 +251,37 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
     std::string method = req->methodString();
     const std::string &path = req->getOriginalPath();
     std::string target = req->query().empty() ? path : path + "?" + req->query();
-    std::string body(req->body());
+    std::string sent(req->body()); /* as it came: sealed (spec/09), and what the signature covers */
     int64_t channel = 0, chunk = -1;
     std::string file, member;
     Kind k = route_of(method, path, channel, file, chunk, member);
     if ((k == VOICE_JOIN || k == VOICE_STATE || k == VOICE_WATCH || k == VOICE_LEAVE) && !voice_)
         k = NONE; /* voice is off: there are no such paths */
-    if (k == NONE || (!takes_body(k) && k != FILE_PUT && !body.empty()) || body.size() > body_max(k))
+    bool has_seal = !req->getHeader("x-puddle-seal").empty();
+    size_t limit = body_max(k) + (has_seal && body_max(k) ? SEAL_TAG : 0);
+    if (k == NONE || (!takes_body(k) && k != FILE_PUT && !sent.empty() && !has_seal) || sent.size() > limit)
         co_return NOT_FOUND;
     int64_t now = now_ms();
+
+    /* Whoever it says it is from: the seal is opened with that (a join's chain is inside it), the signature checked after */
+    std::string header = req->getHeader("x-puddle-signature");
+    ReqSig claimed, sig;
+    if (!parse_reqsig(header, claimed))
+        co_return NOT_FOUND;
+    std::string me = k == JOIN ? "*" : svc_.key().id;
+    std::string body; /* opened: what the request says */
+    if (has_seal) {
+        std::string kid;
+        unsigned char enc[32];
+        Hpke hc;
+        if (!parse_seal_header(req->getHeader("x-puddle-seal"), kid, enc) || kid != sha256_hex(std::string_view((const char *)svc_.key().seal_pub, 32)) ||
+            !hpke_receiver(enc, svc_.key().seal_secret.get(), seal_info(claimed.id, me, claimed.nonce), hc) ||
+            (!sent.empty() && !hpke_open(hc, seal_aad(method, target), sent, body)) || !answer_key(hc, signing.key))
+            co_return NOT_FOUND; /* not sealed to us, for this request: a stranger learns nothing */
+        signing.sealed = true;
+        if ((!takes_body(k) && k != FILE_PUT && !body.empty()) || body.size() > body_max(k))
+            co_return NOT_FOUND;
+    }
 
     Json::Value json;
     bool json_ok = takes_body(k) && parse_object(body, json);
@@ -275,10 +298,6 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
     }
 
     /* whose key the signature must be by: for join and keys the chain's, otherwise the member's as kept */
-    std::string header = req->getHeader("x-puddle-signature");
-    ReqSig claimed, sig;
-    if (!parse_reqsig(header, claimed))
-        co_return NOT_FOUND;
     std::array<unsigned char, 32> pub;
     if (k == JOIN || k == KEYS) {
         if (claimed.id != chain.id || claimed.kid != chain.kid || !unhex(chain.sign_pub_hex, pub.data(), 32))
@@ -293,8 +312,7 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
         memcpy(out, pub.data(), 32);
         return true;
     };
-    std::string me = k == JOIN ? "*" : svc_.key().id;
-    Authn authn = authenticate(header, method, target, body, me, lookup, replay_, now, sig);
+    Authn authn = authenticate(header, method, target, sent, me, lookup, replay_, now, sig);
     if (authn != Authn::REJECT) { /* who it says: answers to them are signed */
         signing.nonce = sig.nonce;
         signing.only_ok = k == JOIN;
@@ -312,6 +330,8 @@ Task<Answer> Routes::answer(const HttpRequestPtr &req, Signing &signing)
     case Authn::BUSY:
         co_return fail(503, "busy");
     }
+    if (!signing.sealed) /* only sealed requests: a Pond's invites carry its key, so there is no first contact without one */
+        co_return fail(400, "not_sealed");
     const std::string &sender = sig.id;
     if (takes_body(k) && !json_ok)
         co_return fail(400, "bad_request");
@@ -499,19 +519,41 @@ Task<HttpResponsePtr> Routes::handle(HttpRequestPtr req)
         a = fail(500, "internal");
     }
     HttpResponsePtr r;
-    if (a.status == UNKNOWN) {
+    if (a.status == UNKNOWN && signing.sealed) {
+        /* Opened, then refused (someone who is not a member): the same "not found", but sealed under their request's key. Only
+         * this Pond could have, so a member we removed can tell it is us saying so, and nobody else can say it for us
+         * (spec/09). Someone who couldn't seal to our key gets the plain one below, like any unknown path. */
+        std::string ct;
+        r = not_found();
+        if (seal_answer(signing.key, 404, "{\"error\":\"not_found\"}", ct)) {
+            r->setContentTypeString(SEALED_TYPE);
+            r->setBody(std::move(ct));
+        }
+    } else if (a.status == UNKNOWN) {
         r = not_found();
     } else {
         r = HttpResponse::newHttpResponse();
         r->setStatusCode((drogon::HttpStatusCode)a.status);
+        bool sealed = signing.sealed && a.status != 204; /* a 204 has no body, so nothing to seal */
+        if (sealed) {
+            std::string ct;
+            if (!seal_answer(signing.key, a.status, a.body, ct)) {
+                LOG_ERROR << "cannot seal an answer";
+                co_return not_found();
+            }
+            a.body = std::move(ct);
+        }
         if (!signing.nonce.empty() && (!signing.only_ok || a.status == 200)) {
-            std::string receipt = receipt_header(svc_.key(), signing.nonce, a.status, a.body, tls_fp_);
+            std::string receipt = receipt_header(svc_.key(), signing.nonce, a.status, a.body);
             if (!receipt.empty())
                 r->addHeader("X-Puddle-Receipt", receipt);
             else
                 LOG_ERROR << "cannot sign a receipt";
         }
-        if (!a.body.empty()) {
+        if (sealed) {
+            r->setContentTypeString(SEALED_TYPE);
+            r->setBody(std::move(a.body));
+        } else if (!a.body.empty()) {
             r->setContentTypeCode(a.bytes ? drogon::CT_APPLICATION_OCTET_STREAM : drogon::CT_APPLICATION_JSON);
             r->setBody(std::move(a.body));
         } else {

@@ -85,6 +85,7 @@ add_library(pond_lib STATIC
   src/identity.cpp
   src/json.cpp
   src/key.cpp
+  src/seal.cpp
   src/ratelimit.cpp
   src/roles.cpp
   src/pond.cpp
