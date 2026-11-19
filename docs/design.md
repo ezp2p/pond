@@ -463,11 +463,14 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 
 pondd's handlers are C++20 coroutines over drogon (`Task<...>`, `co_await` on the database). Debian 12's GCC 12, which builds
 the image, gets some of them wrong when optimising, and the result is a crash only in the release build (`free(): double free`
-on the `DbLoop` thread), never in the debug build the tests use. Every join crashed pondd that way until these rules were kept:
+on the `DbLoop` thread), never in the debug build the tests use. Every join crashed pondd that way, and later every join with a profile, until these rules were kept:
 
 - **One `co_await` per statement**, its result in a named variable, and the text built from those afterwards. Never
   `"..." + co_await f() + "..."`, never `f(co_await g())`, never `co_await f(co_await g())`.
-- **No `?:` in a `co_return` that makes an object** (a string, an `Answer`), and no `co_await` inside a `?:`: write `if`.
+- **No `?:` that makes an object anywhere in a `co_await` or `co_return` statement**: not in what is returned (a string, an
+  `Answer`), and not in an argument either (`s.empty() ? std::nullopt : std::optional<std::string>(s)` passed to
+  `execSqlCoro` double-freed every join with a profile). Put it in a named variable first (`nullable()` in `pond.cpp`), or
+  write `if`. A `?:` between numbers or string literals is harmless. And no `co_await` inside a `?:`.
 - **Coroutines take their arguments by value** (`std::string`, `DbPtr`, `Result`), never `const &`: a reference to a caller's
   temporary (a `TxPtr` turned into a `DbPtr`, a string built in the call) has to outlive a suspension, which GCC 12 doesn't
   always manage. `Signing &` in `Routes::answer` stays a reference: it is an output, and names the caller's own variable.

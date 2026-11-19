@@ -392,7 +392,8 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         std::map<std::string, int64_t> q;
         if (!query_numbers(req->query(), {"after"}, q))
             co_return fail(400, "bad_query");
-        co_return co_await svc_.events(q.count("after") ? q["after"] : 0, sender);
+        const int64_t after = q.count("after") ? q["after"] : 0;
+        co_return co_await svc_.events(after, sender);
     }
     case MEMBERS:
         co_return co_await svc_.members();

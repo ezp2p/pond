@@ -234,8 +234,12 @@ Task<Answer> Service::admin_pond(std::string by, std::optional<std::string> name
 Task<Answer> Service::admin_channel_create(std::string by, std::string name, std::string topic, std::string kind)
 {
     Outcome o = co_await channel_create(name, topic, kind);
-    if (o.empty())
-        co_await log_admin(by, "channel_create", name, kind == "voice" ? "voice" + (topic.empty() ? "" : ", " + topic) : topic);
+    if (o.empty()) {
+        std::string detail = topic;
+        if (kind == "voice")
+            detail = topic.empty() ? std::string("voice") : "voice, " + topic;
+        co_await log_admin(by, "channel_create", name, detail);
+    }
     co_return outcome(o);
 }
 
@@ -266,7 +270,14 @@ Task<Answer> Service::admin_channel_edit(std::string by, int64_t channel, std::o
             if (!o.empty())
                 co_return outcome(o);
         }
-        co_await log_admin(by, "channel_edit", was, (name ? "name " + *name : "") + (name && topic ? ", " : "") + (topic ? "topic" : ""));
+        std::string detail;
+        if (name)
+            detail = "name " + *name;
+        if (name && topic)
+            detail += ", ";
+        if (topic)
+            detail += "topic";
+        co_await log_admin(by, "channel_edit", was, detail);
         co_return Answer{204, ""};
     } catch (const DrogonDbException &e) {
         co_return server_error(e);

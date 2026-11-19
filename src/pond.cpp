@@ -72,6 +72,14 @@ Service::Service(DbPtr db, PondKey key, std::string data_dir, trantor::EventLoop
 
 /* ---- JSON for what is kept ---- */
 
+/* "" is stored as NULL. Built here, outside any coroutine, and held in a named variable by the caller (docs/design.md, "Coroutines") */
+static std::optional<std::string> nullable(const std::string &s)
+{
+    if (s.empty())
+        return std::nullopt;
+    return s;
+}
+
 static const char MEMBER_COLS[] = "id, profile, joined_ms, role";
 static const char CHANNEL_COLS[] = "id, name, topic, position, kind";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
@@ -218,12 +226,12 @@ Task<Answer> Service::enter(Chain chain, std::string invite, std::string profile
                 co_return fail(404, "not_found");
             }
         }
+        const std::optional<std::string> shown = nullable(profile);
         co_await tx->execSqlCoro("INSERT INTO members (id, sign_pub, kid, seq, chain, profile, joined_ms) VALUES (?, ?, ?, ?, ?, ?, ?)"
                                  " ON DUPLICATE KEY UPDATE sign_pub = VALUES(sign_pub), kid = VALUES(kid), seq = VALUES(seq),"
                                  " chain = VALUES(chain), profile = VALUES(profile),"
                                  " joined_ms = IF(left_ms IS NULL, joined_ms, VALUES(joined_ms)), left_ms = NULL",
-                                 chain.id, chain.sign_pub_hex, chain.kid, (int64_t)chain.seq, chain.text,
-                                 profile.empty() ? std::nullopt : std::optional<std::string>(profile), now);
+                                 chain.id, chain.sign_pub_hex, chain.kid, (int64_t)chain.seq, chain.text, shown, now);
         std::string me = co_await member_json_of(tx, chain.id);
         int64_t ev = co_await add_event(tx, "member", me);
         if (!co_await Committed(std::move(tx)))
@@ -352,16 +360,18 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
             }
             sizes.push_back(num(w[0][0]));
         }
+        const std::optional<std::string> nonce_or_null = nullable(nonce);
         Result ins = co_await tx->execSqlCoro("INSERT INTO messages (channel, author, text, nonce, ts_ms) VALUES (?, ?, ?, ?, ?)", channel,
-                                              member, body, nonce.empty() ? std::nullopt : std::optional<std::string>(nonce), now_ms());
+                                              member, body, nonce_or_null, now_ms());
         int64_t mid = (int64_t)ins.insertId();
         for (size_t i = 0; i < files.size(); i++) {
             const FileRef &f = files[i];
             auto opt = [](int64_t v) { return v > 0 ? std::optional<int64_t>(v) : std::nullopt; };
+            const std::optional<std::string> preview = nullable(f.preview);
             co_await tx->execSqlCoro("INSERT INTO message_files (message, position, file, name, mime, size, w, h, duration_ms, preview)"
                                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                      mid, (int64_t)i, f.id, f.name, f.mime, sizes[i], opt(f.w), opt(f.h), opt(f.duration_ms),
-                                     f.preview.empty() ? std::nullopt : std::optional<std::string>(f.preview));
+                                     preview);
         }
         Result r = co_await tx->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS + " FROM messages WHERE id = ?", mid);
         std::string list = co_await messages_json(tx, r);
@@ -414,8 +424,8 @@ Task<Answer> Service::set_profile(std::string member, std::string profile)
     TxPtr tx;
     try {
         tx = co_await db_->newTransactionCoro();
-        co_await tx->execSqlCoro("UPDATE members SET profile = ? WHERE id = ? AND left_ms IS NULL",
-                                 profile.empty() ? std::nullopt : std::optional<std::string>(profile), member);
+        const std::optional<std::string> shown = nullable(profile);
+        co_await tx->execSqlCoro("UPDATE members SET profile = ? WHERE id = ? AND left_ms IS NULL", shown, member);
         std::string mj = co_await member_json_of(tx, member);
         int64_t ev = co_await add_event(tx, "member", mj);
         if (!co_await Committed(std::move(tx)))
@@ -505,8 +515,9 @@ Task<bool> Service::is_voice_channel(int64_t channel)
 Task<int64_t> Service::add_event(TxPtr tx, const char *kind, std::string data, std::string only_for)
 {
     co_await tx->execSqlCoro("SELECT value FROM settings WHERE name = 'event_lock' FOR UPDATE");
-    Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms, only_for) VALUES (?, ?, ?, ?)", std::string(kind), data,
-                                        now_ms(), only_for.empty() ? std::nullopt : std::optional<std::string>(only_for));
+    const std::string k(kind);
+    const std::optional<std::string> to = nullable(only_for);
+    Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms, only_for) VALUES (?, ?, ?, ?)", k, data, now_ms(), to);
     co_return (int64_t)r.insertId();
 }
 
@@ -733,8 +744,8 @@ Task<Outcome> Service::channel_set(std::string name, const char *column, std::st
                 co_return "no channel called " + name;
             co_return "";
         }
-        Result c = co_await tx->execSqlCoro(std::string("SELECT ") + CHANNEL_COLS + " FROM channels WHERE name = ? AND deleted = 0",
-                                            std::string(column) == "name" ? value : name);
+        const std::string now_called = std::string(column) == "name" ? value : name;
+        Result c = co_await tx->execSqlCoro(std::string("SELECT ") + CHANNEL_COLS + " FROM channels WHERE name = ? AND deleted = 0", now_called);
         int64_t ev = co_await add_event(tx, "channel", channel_json(c.at(0)));
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
@@ -792,9 +803,10 @@ Task<Outcome> Service::invite_create(int max_uses, int64_t expires_ms, std::shar
 {
     *token = new_token();
     try {
-        co_await db_->execSqlCoro("INSERT INTO invites (token, max_uses, expires_ms, created_ms) VALUES (?, ?, ?, ?)", *token,
-                                  max_uses > 0 ? std::optional<int64_t>(max_uses) : std::nullopt,
-                                  expires_ms > 0 ? std::optional<int64_t>(expires_ms) : std::nullopt, now_ms());
+        const std::optional<int64_t> uses = max_uses > 0 ? std::optional<int64_t>(max_uses) : std::nullopt;
+        const std::optional<int64_t> until = expires_ms > 0 ? std::optional<int64_t>(expires_ms) : std::nullopt;
+        co_await db_->execSqlCoro("INSERT INTO invites (token, max_uses, expires_ms, created_ms) VALUES (?, ?, ?, ?)", *token, uses, until,
+                                  now_ms());
         co_return "";
     } catch (const DrogonDbException &e) {
         co_return refused(e);
