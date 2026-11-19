@@ -461,21 +461,36 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 
 ## Coroutines
 
-pondd's handlers are C++20 coroutines over drogon (`Task<...>`, `co_await` on the database). Debian 12's GCC 12, which builds
-the image, gets some of them wrong when optimising, and the result is a crash only in the release build (`free(): double free`
-on the `DbLoop` thread), never in the debug build the tests use. Every join crashed pondd that way, and later every join with a profile, until these rules were kept:
+pondd's handlers are C++20 coroutines over drogon (`Task<...>`, `co_await` on the database). **GCC 12 builds some of them
+wrong when optimising**: the heap is damaged, and pondd dies of it (`free(): double free`, `free(): invalid pointer`) on
+whichever request happens to run that code, never in a debug build. With the image built on Debian 12 it was every join,
+then every join with a profile, then every voice channel joined; fixing each in the code only found the next.
+
+So **pondd is built with GCC 13 or later** (or Clang). The image is built on Debian 13 (GCC 14), CI on Ubuntu 24.04
+(GCC 13), and `CMakeLists.txt` refuses an optimised build on GCC 12 or older. The code that crashed on GCC 12, built on
+Debian 13, joins with a profile and joins voice channels without a fault.
+
+The code still keeps to the rules that worked around it, because they are also simply clearer:
 
 - **One `co_await` per statement**, its result in a named variable, and the text built from those afterwards. Never
   `"..." + co_await f() + "..."`, never `f(co_await g())`, never `co_await f(co_await g())`.
-- **No `?:` that makes an object anywhere in a `co_await` or `co_return` statement**: not in what is returned (a string, an
-  `Answer`), and not in an argument either (`s.empty() ? std::nullopt : std::optional<std::string>(s)` passed to
-  `execSqlCoro` double-freed every join with a profile). Put it in a named variable first (`nullable()` in `pond.cpp`), or
-  write `if`. A `?:` between numbers or string literals is harmless. And no `co_await` inside a `?:`.
+- **No `?:` that makes an object in a `co_await` or `co_return` statement**, in what is returned or in an argument: put it
+  in a named variable first (`nullable()` in `pond.cpp`), or write `if`. And no `co_await` inside a `?:`.
+- **An awaiter that hands `this` to another thread is a named variable** (`OffLoop` in `voice.cpp`), not a temporary.
 - **Coroutines take their arguments by value** (`std::string`, `DbPtr`, `Result`), never `const &`: a reference to a caller's
-  temporary (a `TxPtr` turned into a `DbPtr`, a string built in the call) has to outlive a suspension, which GCC 12 doesn't
-  always manage. `Signing &` in `Routes::answer` stays a reference: it is an output, and names the caller's own variable.
+  temporary has to outlive a suspension. `Signing &` in `Routes::answer` stays a reference: it is an output, and names the
+  caller's own variable.
 
-drogon's `execSqlCoro` copies its SQL text before it suspends, so building that text in the call is fine.
+### When pondd crashes anyway
+
+A crash can't be caught and carried on from: by the time glibc says `free(): ...` or a pointer faults, memory pondd relies
+on is already wrong, and going on could write wrong data to the database. pondd dies, and Docker or the service manager
+starts it again in a second. Errors that can be caught (a database refusing, a bad request, an exception in a handler) are
+caught, logged and answered, and pondd carries on.
+
+What it does before dying (`src/crash.h`) is say what it was doing: the signal, every request it was answering at that
+moment (`POST /pond/v1/channels/2/voice/join from 172.19.0.1`), and a backtrace with pondd's function names. That is the line
+to report.
 
 ## Not yet
 
