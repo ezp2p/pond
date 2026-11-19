@@ -1,3 +1,4 @@
+#include "crash.h"
 #include "routes.h"
 
 #include "encoding.h"
@@ -443,7 +444,10 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         if (!get_string(json, "sdp", sdp) || sdp.empty() || !json.isMember("udp") || !json["udp"].isInt() || json["udp"].asInt() < 0 ||
             json["udp"].asInt() > 65535)
             co_return fail(400, "bad_request");
-        co_return co_await voice_->join(sender, channel, sdp, json["udp"].asInt(), req->peerAddr().toIp());
+        const int udp = json["udp"].asInt();
+        const std::string ip = req->peerAddr().toIp();
+        Answer joined = co_await voice_->join(sender, channel, sdp, udp, ip);
+        co_return joined;
     }
     case VOICE_STATE: {
         std::optional<bool> st[4];
@@ -510,6 +514,7 @@ HttpResponsePtr Routes::not_found()
 
 Task<HttpResponsePtr> Routes::handle(HttpRequestPtr req)
 {
+    const InFlight doing(req->methodString(), req->getOriginalPath(), req->peerAddr().toIp()); /* named in a crash report */
     Answer a;
     Signing signing;
     try {

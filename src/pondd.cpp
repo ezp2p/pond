@@ -2,6 +2,7 @@
  * Usage: pondd [-c pond.yaml] */
 
 #include "config.h"
+#include "crash.h"
 #include "db.h"
 #include "key.h"
 #include "pond.h"
@@ -31,6 +32,7 @@ int main(int argc, char **argv)
     /* each line as it is logged, also when stdout is a file or a pipe (a service manager's journal) */
     trantor::Logger::setOutputFunction([](const char *msg, uint64_t len) { fwrite(msg, 1, len, stdout); }, [] { fflush(stdout); });
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    crash_report_install();
     Config cfg;
     std::string err;
     PondKey key;

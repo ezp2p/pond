@@ -682,10 +682,14 @@ void Voice::stop()
 
 Task<Answer> Voice::join(std::string member, int64_t channel, std::string sdp, int udp, std::string peer_ip)
 {
-    if (!co_await impl_->svc.is_voice_channel(channel))
+    const bool voice = co_await impl_->svc.is_voice_channel(channel);
+    if (!voice)
         co_return fail(404, "no_channel");
     auto impl = impl_;
-    co_return co_await OffLoop{[impl, member, channel, sdp, udp, peer_ip] { return impl->connect(member, channel, sdp, udp, peer_ip); }, {}};
+    /* a named awaiter: its thread writes the answer back through `this`, so it must stay put until then (docs/design.md) */
+    OffLoop off{[impl, member, channel, sdp, udp, peer_ip] { return impl->connect(member, channel, sdp, udp, peer_ip); }, {}};
+    Answer a = co_await off;
+    co_return a;
 }
 
 Answer Voice::state(const std::string &member, const std::string &session, std::optional<bool> muted, std::optional<bool> deafened,

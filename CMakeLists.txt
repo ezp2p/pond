@@ -5,6 +5,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# GCC 12 and older build some of pondd's coroutines wrong once optimising: the heap is damaged and pondd dies of it, on a join,
+# a voice channel, wherever it happens to (docs/design.md, "Coroutines"). A debug build is right, so the tests can use one;
+# anything faster needs GCC 13 or later, or Clang.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13
+   AND NOT (CMAKE_BUILD_TYPE STREQUAL "" OR CMAKE_BUILD_TYPE STREQUAL "Debug") AND NOT POND_ALLOW_OLD_GCC)
+  message(FATAL_ERROR "GCC ${CMAKE_CXX_COMPILER_VERSION} builds pondd's coroutines wrong when optimising (docs/design.md, \"Coroutines\"). "
+                      "Use GCC 13 or later (Debian 13, Ubuntu 24.04), or Clang; or a Debug build. "
+                      "-DPOND_ALLOW_OLD_GCC=ON builds it anyway.")
+endif()
+
 # Homebrew: the system OpenSSL is LibreSSL, and MariaDB's client lives under its own prefix. Use Homebrew's default OpenSSL
 # (3 or later): its headers are the ones in /opt/homebrew/include, which other libraries' include paths also bring in, so any
 # other version would be compiled against one OpenSSL's headers and linked with another's library.
@@ -79,6 +89,7 @@ endif()
 
 add_library(pond_lib STATIC
   src/config.cpp
+  src/crash.cpp
   src/db.cpp
   src/encoding.cpp
   src/files.cpp
@@ -103,6 +114,8 @@ target_compile_options(pond_lib PRIVATE -Wall -Wextra)
 
 add_executable(pondd src/pondd.cpp)
 target_link_libraries(pondd PRIVATE pond_lib)
+# names in the crash backtrace (src/crash.h), also in the stripped image: strip keeps the dynamic symbols
+target_link_options(pondd PRIVATE -rdynamic)
 add_executable(pondctl src/pondctl.cpp)
 target_link_libraries(pondctl PRIVATE pond_lib)
 install(TARGETS pondd pondctl RUNTIME DESTINATION bin)

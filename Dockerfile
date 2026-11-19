@@ -5,7 +5,7 @@
 #
 # What the Pond keeps besides the database (pond.yaml, its key, its certificate, uploads) is in the /data volume.
 
-FROM debian:bookworm-slim AS build
+FROM debian:trixie-slim AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential cmake git ca-certificates \
       libssl-dev libmariadb-dev libhiredis-dev libjsoncpp-dev libyaml-cpp-dev uuid-dev zlib1g-dev \
@@ -20,9 +20,9 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
  && cmake --build build --parallel 4 --target pondd pondctl \
  && strip build/pondd build/pondctl
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libssl3 libmariadb3 libhiredis0.14 libjsoncpp25 libyaml-cpp0.7 libuuid1 zlib1g \
+ && apt-get install -y --no-install-recommends libssl3t64 libmariadb3 libhiredis1.1.0 libjsoncpp26 libyaml-cpp0.8 libuuid1 zlib1g \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin pond \
  && mkdir /data && chown pond:pond /data && chmod 700 /data
