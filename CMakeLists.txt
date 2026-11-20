@@ -94,6 +94,7 @@ add_library(pond_lib STATIC
   src/encoding.cpp
   src/files.cpp
   src/pictures.cpp
+  src/dms.cpp
   src/identity.cpp
   src/json.cpp
   src/key.cpp

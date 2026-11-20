@@ -3,6 +3,8 @@
  * path. The admin's side is pondctl. */
 
 #include "harness.h"
+
+#include <thread>
 #include "seal.h"
 #include "identity.h"
 #include "reqsig.h"
@@ -99,7 +101,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 7 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 8 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -445,6 +447,101 @@ int main()
             CHECK(pond.call(&eve, "POST", send, "{\"text\":\"muted again\"}").status == 409);
             CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + eve.id + "/unmute").status == 204);
             CHECK(pond.ctl("log", &out) == 0 && has(out, "mute") && has(out, "unmute"));
+        }
+
+        /* ---- direct messages (docs/dms.md): relayed from memory, never kept; files a piece at a time ---- */
+        {
+            std::string tok = invite(pond, "--uses 3");
+            Identity hal, ivy, jo;
+            CHECK(pond.call(&hal, "POST", "/pond/v1/join", join_body(hal, tok, "Hal"), "*").status == 200);
+            CHECK(pond.call(&ivy, "POST", "/pond/v1/join", join_body(ivy, tok, "Ivy"), "*").status == 200);
+            CHECK(pond.call(&jo, "POST", "/pond/v1/join", join_body(jo, tok, "Jo"), "*").status == 200);
+            a = pond.call(&hal, "GET", "/pond/v1/info");
+            CHECK(has(a.body, "\"dms\",\"dm_files\"") && has(a.body, "\"dms\":{\"on\":true,\"files_max\":26214400}"));
+            const int64_t hc = num_of(a.body, "cursor");
+            CHECK(has(pond.call(&hal, "GET", "/pond/v1/members").body, "\"dms\":true"));
+            /* a member's chain, to seal to them; a stranger's is nobody's */
+            a = pond.call(&hal, "GET", "/pond/v1/members/" + ivy.id + "/chain");
+            CHECK(a.status == 200 && parse(a.body)["chain"].asString() == ivy.chain);
+            CHECK(pond.call(&hal, "GET", "/pond/v1/members/" + Identity().id + "/chain").status == 404);
+            CHECK(has(pond.call(&ivy, "GET", "/pond/v1/dms/files/" + std::string(64, 'a') + "/0/0?from=" + jo.id).body, "away")); /* Jo's Puddle isn't following */
+            const std::string L(64, 'a'), K(64, 'b'), E = std::string(43, 'A') + "=";
+            auto letter = [&](const std::string &to, const std::string &id) {
+                return "{\"to\":\"" + to + "\",\"id\":\"" + id + "\",\"kid\":\"" + K + "\",\"enc\":\"" + E + "\",\"sealed\":\"c2VhbGVk\"}";
+            };
+            CHECK(pond.call(&hal, "POST", "/pond/v1/dms/send", letter("short", L)).status == 400);
+            CHECK(pond.call(&hal, "POST", "/pond/v1/dms/send", letter(Identity().id, L)).status == 404); /* not a member */
+            CHECK(pond.call(&hal, "POST", "/pond/v1/dms/send", letter(hal.id, L)).status == 404);        /* themself */
+            /* Ivy's Puddle isn't following: not relayed, and nothing kept. When it asks for events, Hal's is told she's back. */
+            a = pond.call(&hal, "POST", "/pond/v1/dms/send", letter(ivy.id, L));
+            CHECK(a.status == 200 && has(a.body, "\"relayed\":false"));
+            a = pond.call(&ivy, "GET", "/pond/v1/events?after=" + std::to_string(hc));
+            CHECK(a.status == 200 && !has(a.body, "\"kind\":\"dm\""));
+            a = pond.call(&hal, "GET", "/pond/v1/events?after=" + std::to_string(hc));
+            CHECK(has(a.body, "\"kind\":\"dm_back\"") && has(a.body, "\"member\":\"" + ivy.id + "\"") && num_of(a.body, "cursor") >= hc);
+            {
+                std::string n;
+                CHECK(db.sql("SELECT COUNT(*) FROM events WHERE kind LIKE 'dm%'", &n) == 0 && has(n, "0")); /* none stored */
+            }
+            /* now she is: relayed, to her alone, from memory */
+            a = pond.call(&hal, "POST", "/pond/v1/dms/send", letter(ivy.id, L));
+            CHECK(a.status == 200 && has(a.body, "\"relayed\":true"));
+            a = pond.call(&ivy, "GET", "/pond/v1/events?after=" + std::to_string(hc));
+            CHECK(has(a.body, "\"kind\":\"dm\"") && has(a.body, "\"from\":\"" + hal.id + "\"") && has(a.body, "\"sealed\":\"c2VhbGVk\""));
+            CHECK(!has(pond.call(&jo, "GET", "/pond/v1/events?after=" + std::to_string(hc)).body, "\"kind\":\"dm\""));
+            CHECK(!has(pond.call(&ivy, "GET", "/pond/v1/events?after=" + std::to_string(hc)).body, "\"kind\":\"dm\"")); /* once */
+            /* a request held open is woken by a letter */
+            {
+                Reply got;
+                std::thread w([&] { got = pond.call(&ivy, "GET", "/pond/v1/events?after=999999999"); });
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                auto t1 = std::chrono::steady_clock::now();
+                CHECK(pond.call(&hal, "POST", "/pond/v1/dms/send", letter(ivy.id, std::string(64, 'c'))).status == 200);
+                w.join();
+                CHECK(has(got.body, std::string(64, 'c')) &&
+                      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t1).count() < 2000);
+            }
+            /* a file's piece: Ivy asks, Hal's Puddle is told and sends it, Ivy gets it */
+            {
+                Reply got;
+                std::thread w([&] { got = pond.call(&ivy, "GET", "/pond/v1/dms/files/" + L + "/0/hashes?from=" + hal.id); });
+                bool asked = false;
+                CHECK(until([&] {
+                    a = pond.call(&hal, "GET", "/pond/v1/events?after=999999999");
+                    return asked = has(a.body, "\"kind\":\"dm_want\"") && has(a.body, "\"part\":\"hashes\"") && has(a.body, "\"to\":\"" + ivy.id + "\"");
+                }));
+                CHECK(pond.call(&jo, "POST", "/pond/v1/dms/files/" + L + "/0/hashes?to=" + ivy.id, "nope").status == 404); /* not who was asked */
+                CHECK(pond.call(&hal, "POST", "/pond/v1/dms/files/" + L + "/0/hashes?to=" + ivy.id, "the hashes").status == 204);
+                w.join();
+                CHECK(asked && got.status == 200 && got.body == "the hashes");
+                CHECK(pond.call(&hal, "POST", "/pond/v1/dms/files/" + L + "/0/hashes?to=" + ivy.id, "again").status == 404); /* taken */
+                CHECK(pond.call(&ivy, "GET", "/pond/v1/dms/files/" + L + "/0/99999?from=" + hal.id).status == 400); /* past the largest file */
+            }
+            /* taking none: refused, and everyone is told */
+            CHECK(pond.call(&jo, "POST", "/pond/v1/dms/settings", "{\"accept\":false}").status == 200);
+            CHECK(has(pond.call(&hal, "GET", "/pond/v1/members").body, "\"dms\":false"));
+            a = pond.call(&hal, "POST", "/pond/v1/dms/send", letter(jo.id, L));
+            CHECK(a.status == 409 && has(a.body, "not_accepted"));
+            CHECK(pond.call(&jo, "POST", "/pond/v1/dms/settings", "{\"accept\":true}").status == 200);
+            /* the admin turns them off for the whole Pond, and files on their own */
+            CHECK(pond.ctl("dms off") == 0);
+            CHECK(!has(pond.call(&hal, "GET", "/pond/v1/info").body, "\"dms\",") && has(pond.call(&hal, "GET", "/pond/v1/info").body, "\"on\":false"));
+            CHECK(has(pond.call(&hal, "POST", "/pond/v1/dms/send", letter(ivy.id, L)).body, "dms_off"));
+            CHECK(pond.ctl("dms on") == 0 && pond.ctl("dms files max-size off") == 0);
+            a = pond.call(&hal, "GET", "/pond/v1/info");
+            CHECK(has(a.body, "\"dms\"]") || has(a.body, "\"dms\","));
+            CHECK(!has(a.body, "dm_files") && has(a.body, "\"files_max\":0"));
+            CHECK(has(pond.call(&ivy, "GET", "/pond/v1/dms/files/" + L + "/0/0?from=" + hal.id).body, "files_off"));
+            CHECK(pond.ctl("dms", &out) == 0 && has(out, "on") && has(out, "no files"));
+            CHECK(pond.ctl("dms files max-size 25M") == 0);
+            /* one a second, ten at once */
+            int refused = 0;
+            for (int i = 0; i < 15; i++)
+                refused += has(pond.call(&jo, "POST", "/pond/v1/dms/send", letter(hal.id, L)).body, "slow_down");
+            CHECK(refused >= 3);
+            /* someone who leaves can't be written to */
+            CHECK(pond.call(&jo, "POST", "/pond/v1/leave").status == 204);
+            CHECK(pond.call(&hal, "POST", "/pond/v1/dms/send", letter(jo.id, std::string(64, 'd'))).status == 404);
         }
 
         /* taking a role away, and the record */

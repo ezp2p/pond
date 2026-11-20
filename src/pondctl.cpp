@@ -50,7 +50,10 @@ static const char USAGE[] =
     "  log [N]                                                the last N admin actions (20)\n"
     "    <member> is a user id, or part of a member's display name\n"
     "  files                                the largest file members may send, and the room files take\n"
-    "  files max-size <size>|off            e.g. 25M, 1G, 500K; off stops members sending files\n";
+    "  files max-size <size>|off            e.g. 25M, 1G, 500K; off stops members sending files\n"
+    "  dms                                  whether members may write to each other here, and the largest file\n"
+    "  dms on|off                           direct messages between members (relayed, never kept)\n"
+    "  dms files max-size <size>|off        the largest file a direct message may carry\n";
 
 static int usage()
 {
@@ -351,6 +354,25 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
             if (b < 0)
                 return die("a size is like 25M, 1G or 500K, or off");
             return done(sync_wait(svc.set_files_max(b)));
+        }
+        return usage();
+    }
+    if (cmd == "dms") {
+        if (!args.empty())
+            args.erase(args.begin());
+        if (sub.empty() && args.empty()) {
+            Service::DmSettings d = sync_wait(svc.dm_settings());
+            printf("direct messages  %s\nlargest file     %s\n", d.on ? "on" : "off",
+                   d.files_max ? size_text(d.files_max).c_str() : "off (no files in direct messages)");
+            return 0;
+        }
+        if ((sub == "on" || sub == "off") && args.empty())
+            return done(sync_wait(svc.set_dms(sub == "on", std::nullopt)));
+        if (sub == "files" && args.size() == 2 && args[0] == "max-size") {
+            int64_t b = parse_size(args[1]);
+            if (b < 0)
+                return die("a size is like 25M, 1G or 500K, or off");
+            return done(sync_wait(svc.set_dms(std::nullopt, b)));
         }
         return usage();
     }

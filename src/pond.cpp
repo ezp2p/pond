@@ -80,7 +80,7 @@ static std::optional<std::string> nullable(const std::string &s)
     return s;
 }
 
-static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until";
+static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until, dms";
 static const char CHANNEL_COLS[] = "id, name, topic, position, kind";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
 
@@ -95,7 +95,8 @@ static std::string muted_json(const drogon::orm::Field &f)
 static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
 {
     return "{\"id\":" + jstr(text(row[0])) + ",\"profile\":" + (row[1].isNull() ? std::string("null") : text(row[1])) +
-           ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + ",\"muted\":" + muted_json(row[4]) + "}";
+           ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + ",\"muted\":" + muted_json(row[4]) +
+           ",\"dms\":" + (num(row[5]) ? "true" : "false") + "}";
 }
 
 static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
@@ -155,18 +156,23 @@ Task<std::string> Service::member_json_of(DbPtr db, std::string id)
 
 Task<std::string> Service::pond_json(DbPtr db)
 {
-    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon')");
-    std::string name, description, max = std::to_string(FILES_DEFAULT_MAX), icon_hash;
+    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon', 'dms', 'dms.files_max')");
+    std::map<std::string, std::string> v;
     for (const auto &row : r)
-        (text(row[0]) == "name" ? name : text(row[0]) == "description" ? description : text(row[0]) == "icon" ? icon_hash : max) = text(row[1]);
+        v[text(row[0])] = text(row[1]);
+    const std::string max = v.count("files.max_size") ? v["files.max_size"] : std::to_string(FILES_DEFAULT_MAX);
+    const std::string dm_max = v.count("dms.files_max") ? v["dms.files_max"] : std::to_string(DM_FILES_DEFAULT_MAX);
     /* the icon (docs/design.md, "Pictures"): {hash, mime, size}, or null when there is none (or its file went) */
     std::string icon = "null";
-    if (!icon_hash.empty() && !picture_ref(icon_hash, icon))
+    if (!v["icon"].empty() && !picture_ref(v["icon"], icon))
         icon = "null";
+    /* direct messages (docs/dms.md): on or off, and the largest file one may carry (0: none) */
+    const std::string dms = std::string("{\"on\":") + (v["dms"] != "off" ? "true" : "false") + ",\"files_max\":" +
+                            std::to_string(strtoll(dm_max.c_str(), nullptr, 10)) + "}";
     /* what members may send: "files" (docs/design.md, "Files"); max_size 0 is files turned off */
-    co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"seal_key\":" + jstr(hex(key_.seal_pub, 32)) + ",\"name\":" + jstr(name) + ",\"description\":" + jstr(description) +
+    co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"seal_key\":" + jstr(hex(key_.seal_pub, 32)) + ",\"name\":" + jstr(v["name"]) + ",\"description\":" + jstr(v["description"]) +
               ",\"icon\":" + icon + ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
-              std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "}}";
+              std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "},\"dms\":" + dms + "}";
 }
 
 Task<std::string> Service::channels_json()
@@ -284,6 +290,9 @@ Task<Answer> Service::info(std::string member)
             features += (features.size() > 1 ? "," : "") + jstr(f);
         if (voice_now)
             features += ",\"voice\"";
+        const DmSettings dms = co_await dm_settings();
+        if (dms.on)
+            features += dms.files_max > 0 ? ",\"dms\",\"dm_files\"" : ",\"dms\"";
         /* each co_await on its own, then the text (docs/design.md, "Coroutines") */
         const std::string pond = co_await pond_json(db_);
         const std::string offer = co_await offer_json(member);
@@ -470,6 +479,7 @@ Task<Outcome> Service::remove_member(std::string id)
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);
+        forget_dms(id); /* nothing more is relayed to or from them */
         co_return "";
     } catch (const DrogonDbException &e) {
         if (tx)
@@ -535,36 +545,26 @@ Task<int64_t> Service::add_event(TxPtr tx, const char *kind, std::string data, s
     co_return (int64_t)r.insertId();
 }
 
-/* One request for events, waiting. Whoever sets `done` first (news, the time running out, or stopping) resumes it. */
-struct Service::Waiter {
-    int64_t after;
-    std::coroutine_handle<> h;
-    std::atomic<bool> done{false};
-    void wake()
-    {
-        if (!done.exchange(true))
-            h.resume();
-    }
-};
-
 struct Service::News {
     Service *s;
     int64_t after;
     double seconds;
+    std::string member;
 
     bool await_ready()
     {
         std::lock_guard<std::mutex> g(s->mu_);
-        return s->latest_ > after || s->stopping_;
+        return s->latest_ > after || s->stopping_ || s->has_inbox_locked(member);
     }
     bool await_suspend(std::coroutine_handle<> h)
     {
         auto w = std::make_shared<Waiter>();
         w->after = after;
+        w->member = member;
         w->h = h;
         {
             std::lock_guard<std::mutex> g(s->mu_);
-            if (s->latest_ > after || s->stopping_)
+            if (s->latest_ > after || s->stopping_ || s->has_inbox_locked(member))
                 return false; /* news came in between: go on */
             s->waiters_.push_back(w);
         }
@@ -595,8 +595,17 @@ void Service::bump(int64_t id)
         w->wake();
 }
 
+/* Says while a member's Puddle holds a request open on the events: it is following, so direct messages can be relayed to it. */
+struct Service::Following {
+    Service *s;
+    std::string member;
+    Following(Service *svc, std::string m) : s(svc), member(std::move(m)) { s->following(member, true); }
+    ~Following() { s->following(member, false); }
+};
+
 Task<Answer> Service::events(int64_t after, std::string member)
 {
+    Following here(this, member);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
     for (;;) {
         try {
@@ -616,7 +625,9 @@ Task<Answer> Service::events(int64_t after, std::string member)
              * left at all, an empty answer below a newer cursor says the same. */
             if ((oldest > 0 && after + 1 < oldest && (r.empty() || num(r[0][0]) == oldest)) || (r.empty() && latest > after))
                 co_return Answer{200, "{\"reset\":true}"};
-            if (!r.empty()) {
+            /* direct messages and what goes with them (dms.cpp): for this member alone, from memory, with no number */
+            const std::vector<std::string> mine = take_inbox(member);
+            if (!r.empty() || !mine.empty()) {
                 /* an event for one member is left out for the rest; the cursor still moves past it */
                 std::string out = "{\"events\":[";
                 bool first = true;
@@ -627,7 +638,12 @@ Task<Answer> Service::events(int64_t after, std::string member)
                            ",\"data\":" + text(r[i][2]) + "}";
                     first = false;
                 }
-                co_return Answer{200, out + "],\"cursor\":" + std::to_string(num(r[r.size() - 1][0])) + "}"};
+                for (const std::string &e : mine) {
+                    out += std::string(first ? "" : ",") + e;
+                    first = false;
+                }
+                const int64_t cursor = r.empty() ? after : num(r[r.size() - 1][0]);
+                co_return Answer{200, out + "],\"cursor\":" + std::to_string(cursor) + "}"};
             }
         } catch (const DrogonDbException &e) {
             co_return server_error(e);
@@ -635,7 +651,7 @@ Task<Answer> Service::events(int64_t after, std::string member)
         auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
         if (left <= 0 || stopping_ || !timers_)
             break;
-        co_await News{this, after, (double)left / 1000.0};
+        co_await News{this, after, (double)left / 1000.0, member};
         if (stopping_)
             break;
     }

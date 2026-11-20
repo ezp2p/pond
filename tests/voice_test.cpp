@@ -281,7 +281,7 @@ int main()
     /* ---- a channel's kind; protocol 4, with voice ---- */
     Reply a = pond.call(&ann.id, "GET", "/pond/v1/info");
     Json::Value info = parse(a.body);
-    CHECK(info["protocol"].asInt() == 7 && has(a.body, "\"receipts\",\"sealed\",\"pictures\",\"voice\"]") && has(a.body, "\"voice\":[]"));
+    CHECK(info["protocol"].asInt() == 8 && has(a.body, "\"receipts\",\"sealed\",\"pictures\",\"voice\",\"dms\",\"dm_files\"]") && has(a.body, "\"voice\":[]"));
     int64_t talk = 0, general = 0;
     for (const auto &c : info["channels"])
         (c["name"].asString() == "talk" ? talk : general) = c["id"].asInt64();

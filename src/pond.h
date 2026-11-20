@@ -14,12 +14,15 @@
 
 #include <array>
 #include <atomic>
+#include <coroutine>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,12 +42,27 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 7; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 8; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
                              * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
                              * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures");
-                             * 7: muting, and a member's `muted` ("Muting") */
+                             * 7: muting, and a member's `muted` ("Muting");
+                             * 8: direct messages, relayed (docs/dms.md), where `features` says `dms`; a member's `dms` */
 constexpr std::array<const char *, 5> FEATURES{"files", "roles", "receipts", "sealed", "pictures"}; /* and "voice", when voice is on */
+
+/* Direct messages (docs/dms.md, dms.cpp): relayed, never stored. */
+constexpr size_t DM_SEALED_MAX = 16 * 1024;            /* a sealed letter, as base64 */
+constexpr int64_t DM_CHUNK = 1 << 20;                  /* a piece of a file: a Puddle's chunk */
+constexpr size_t DM_PIECE_MAX = DM_CHUNK + 64;         /* sealed */
+constexpr int64_t DM_FILES_DEFAULT_MAX = 25LL << 20;
+constexpr int64_t DM_FILES_HARD_MAX = 4LL << 30;
+constexpr int64_t DM_PRESENT_MS = 60 * 1000;           /* a Puddle that asked for events this recently is following */
+constexpr size_t DM_INBOX_MAX = 500;                   /* waiting to go to one member's Puddle, in memory */
+constexpr size_t DM_AWAITING_MAX = 1000;               /* senders waiting for one member to be back */
+constexpr size_t DM_NEW_PER_DAY = 20;                  /* new people one member may write to in a day */
+constexpr size_t DM_PAIRS_MAX = 1 << 20;
+constexpr size_t DM_PIECES_MAX = 4096;                 /* pieces asked for and not yet sent, across the Pond */
+constexpr double DM_PIECE_WAIT_S = 30;
 
 /* Roles (docs/design.md, "Roles"), lowest first. An operator outranks an administrator. */
 enum class Role { MEMBER = 0, ADMINISTRATOR = 1, OPERATOR = 2 };
@@ -171,6 +189,22 @@ public:
     /* The Pond's icon: a picture sent first, or nullopt for none. */
     Task<Answer> admin_icon(std::string by, std::optional<std::string> hash);
 
+    /* Direct messages (dms.cpp, docs/dms.md). A member's chain, for sealing to them; a letter relayed (or its sender told the
+     * recipient isn't there); whether `member` takes them; a piece of a letter's file, asked for by its recipient and sent by its
+     * sender. */
+    Task<Answer> member_chain(std::string member);
+    Task<Answer> dm_send(std::string from, std::string to, std::string id, std::string kid, std::string enc, std::string sealed);
+    Task<Answer> dm_accept(std::string member, bool accept);
+    Task<Answer> dm_piece_get(std::string to, std::string from, std::string letter, int n, std::string part);
+    Task<Answer> dm_piece_put(std::string from, std::string to, std::string letter, int n, std::string part, std::string bytes);
+    struct DmSettings {
+        bool on = true;
+        int64_t files_max = DM_FILES_DEFAULT_MAX; /* 0: no files */
+    };
+    Task<DmSettings> dm_settings();
+    /* pondctl dms: on or off for the whole Pond, and the largest file (0: none) */
+    Task<Outcome> set_dms(std::optional<bool> on, std::optional<int64_t> files_max);
+
     /* The largest file members may send (0: files are turned off). */
     Task<int64_t> files_max();
 
@@ -226,8 +260,47 @@ public:
     void stop();
 
 private:
-    struct Waiter;
+    /* One request for events, waiting. Whoever sets `done` first (news, the time running out, or stopping) resumes it. */
+    struct Waiter {
+        int64_t after;
+        std::string member; /* whose request: a direct message for them wakes it (dms.cpp) */
+        std::coroutine_handle<> h;
+        std::atomic<bool> done{false};
+        void wake()
+        {
+            if (!done.exchange(true))
+                h.resume();
+        }
+    };
     struct News;
+    struct Piece;
+    struct Following;
+    struct PieceWait;
+    /* direct messages, in memory (dms.cpp); all under mu_ */
+    struct Seen {
+        int open = 0;        /* requests for events held open now */
+        int64_t last_ms = 0; /* the last one began or ended */
+    };
+    struct NewToday {
+        int64_t day = 0;
+        std::set<std::string> to;
+    };
+    std::map<std::string, Seen> seen_;
+    std::map<std::string, std::deque<std::string>> inbox_;       /* member: {kind, data} for them alone, not yet taken */
+    std::map<std::string, std::set<std::string>> awaiting_;      /* member: who wants to write to them when they are back */
+    std::map<std::string, std::shared_ptr<Piece>> pieces_;
+    std::map<std::string, NewToday> new_today_;
+    std::set<std::string> wrote_;                                /* "<from> <to>": has written to them */
+    Keyed dm_limit_{10, 1000};   /* letters: one a second on average, ten at once */
+    Keyed piece_limit_{64, 50};  /* pieces asked for */
+    bool present_locked(const std::string &member, int64_t now) const;
+    bool has_inbox_locked(const std::string &member) const;
+    void push_locked(const std::string &member, const std::string &kind, const std::string &data, std::vector<std::shared_ptr<Waiter>> &wake);
+    /* a request for events from `member` begins (open) or ends */
+    void following(const std::string &member, bool open);
+    std::vector<std::string> take_inbox(const std::string &member);
+    void forget_dms(const std::string &member);
+    Task<std::string> may_write(std::string from, std::string to);
     Task<Answer> enter(Chain chain, std::string invite, std::string profile);
     Task<int64_t> add_event(TxPtr tx, const char *kind, std::string data, std::string only_for = "");
     Task<std::string> offer_json(std::string member);

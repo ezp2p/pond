@@ -23,13 +23,15 @@ constexpr size_t BODY_MAX = 32 * 1024;
 constexpr size_t SEND_MAX = 64 * 1024;           /* ten files with previews, and the text */
 constexpr size_t BEGIN_MAX = 256 * 1024;         /* the hashes of a file of FILE_HARD_MAX, in base64 */
 constexpr size_t VOICE_JOIN_MAX = 64 * 1024;     /* an offer: eighteen media sections, each with its candidates */
+constexpr size_t DM_SEND_MAX = DM_SEALED_MAX + 1024;
 constexpr int UNKNOWN = -1; /* the status of an answer that must look like a path that does not exist */
 
 static const Answer NOT_FOUND = {UNKNOWN, ""};
 
 enum Kind {
     JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
-    VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET,
+    VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET, MEMBER_CHAIN, DM_SEND, DM_SETTINGS, DM_PIECE_GET,
+    DM_PIECE_PUT,
     ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN,
     ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, ADMIN_MUTE, ADMIN_UNMUTE, NONE
 };
@@ -52,6 +54,17 @@ static bool user_id_ok(std::string_view s)
 }
 
 static int64_t number_of(std::string_view s, bool zero);
+
+/* 64 of lower-case hex: a letter's id */
+static bool hex_id_ok(std::string_view s)
+{
+    if (s.size() != 64)
+        return false;
+    for (char c : s)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
 
 /* The routes under /pond/v1/admin/: the channel or member in the path, if any. */
 static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channel, std::string &member)
@@ -140,6 +153,26 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     if (p.substr(0, 6) == "files/")
         return file_route(get, post, p.substr(6), file, n);
     if (post && p == "roles/answer") return ROLE_ANSWER;
+    if (get && p.substr(0, 8) == "members/" && p.size() == 8 + 52 + 6 && p.substr(8 + 52) == "/chain" && user_id_ok(p.substr(8, 52))) {
+        member = std::string(p.substr(8, 52));
+        return MEMBER_CHAIN;
+    }
+    if (post && p == "dms/send") return DM_SEND;
+    if (post && p == "dms/settings") return DM_SETTINGS;
+    if (p.substr(0, 10) == "dms/files/") {
+        /* dms/files/{letter}/{n}/{part}: the letter's id (64 hex), the file's place in it, and "hashes" or a chunk's number */
+        std::string_view rest = p.substr(10);
+        if (rest.size() < 64 + 4 || rest[64] != '/' || !hex_id_ok(rest.substr(0, 64)))
+            return NONE;
+        file = std::string(rest.substr(0, 64));
+        rest.remove_prefix(65);
+        size_t slash = rest.find('/');
+        if (slash != 1 || rest[0] < '0' || rest[0] > '9')
+            return NONE;
+        channel = rest[0] - '0'; /* the file's place, 0 to 9 */
+        member = std::string(rest.substr(2)); /* the part, checked by the Service */
+        return get ? DM_PIECE_GET : post ? DM_PIECE_PUT : NONE;
+    }
     if (post && p == "pictures") return PICTURE_PUT;
     if (get && p.substr(0, 9) == "pictures/" && picture_hash_ok(std::string(p.substr(9)))) {
         file = std::string(p.substr(9)); /* the picture's hash */
@@ -175,14 +208,14 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 /* Routes whose body is a JSON object. FILE_PUT's is a chunk's bytes, and PICTURE_PUT's a picture's. */
 static bool takes_body(Kind k)
 {
-    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
+    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == DM_SEND || k == DM_SETTINGS || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH;
 }
 
 static size_t body_max(Kind k)
 {
-    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == PICTURE_PUT ? PICTURE_MAX : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : BODY_MAX;
+    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == DM_PIECE_PUT ? DM_PIECE_MAX : k == DM_SEND ? DM_SEND_MAX : k == PICTURE_PUT ? PICTURE_MAX : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : BODY_MAX;
 }
 
 /* "files": [{id, name, mime, w?, h?, duration_ms?, preview?}], as a send says them; cleaned by the Service. */
@@ -275,7 +308,7 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         k = NONE; /* voice is off: there are no such paths */
     bool has_seal = !req->getHeader("x-puddle-seal").empty();
     size_t limit = body_max(k) + (has_seal && body_max(k) ? SEAL_TAG : 0);
-    if (k == NONE || (!takes_body(k) && k != FILE_PUT && k != PICTURE_PUT && !sent.empty() && !has_seal) || sent.size() > limit)
+    if (k == NONE || (!takes_body(k) && k != FILE_PUT && k != PICTURE_PUT && k != DM_PIECE_PUT && !sent.empty() && !has_seal) || sent.size() > limit)
         co_return NOT_FOUND;
     int64_t now = now_ms();
 
@@ -295,7 +328,7 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
             (!sent.empty() && !hpke_open(hc, seal_aad(method, target), sent, body)) || !answer_key(hc, signing.key))
             co_return NOT_FOUND; /* not sealed to us, for this request: a stranger learns nothing */
         signing.sealed = true;
-        if ((!takes_body(k) && k != FILE_PUT && k != PICTURE_PUT && !body.empty()) || body.size() > body_max(k))
+        if ((!takes_body(k) && k != FILE_PUT && k != PICTURE_PUT && k != DM_PIECE_PUT && !body.empty()) || body.size() > body_max(k))
             co_return NOT_FOUND;
     }
 
@@ -442,6 +475,31 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         co_return co_await svc_.picture_put(sender, std::move(body));
     case PICTURE_GET:
         co_return co_await svc_.picture_get(sender, file);
+    case MEMBER_CHAIN:
+        co_return co_await svc_.member_chain(member);
+    case DM_SEND: {
+        std::string to, id, kid, enc, sealed;
+        if (!get_string(json, "to", to) || !user_id_ok(to) || !get_string(json, "id", id) || !hex_id_ok(id) || !get_string(json, "kid", kid) ||
+            !hex_id_ok(kid) || !get_string(json, "enc", enc) || enc.size() != 44 || !get_string(json, "sealed", sealed) || sealed.empty() ||
+            sealed.size() > DM_SEALED_MAX)
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.dm_send(sender, to, id, kid, enc, sealed);
+    }
+    case DM_SETTINGS:
+        if (!json.isMember("accept") || !json["accept"].isBool())
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.dm_accept(sender, json["accept"].asBool());
+    case DM_PIECE_GET:
+    case DM_PIECE_PUT: {
+        /* ?from= the sender (asking) or ?to= the recipient (sending) */
+        const std::string q = req->query(), want = k == DM_PIECE_GET ? "from=" : "to=";
+        if (q.size() != want.size() + 52 || q.compare(0, want.size(), want) != 0 || !user_id_ok(std::string_view(q).substr(want.size())))
+            co_return fail(400, "bad_query");
+        const std::string other = q.substr(want.size());
+        if (k == DM_PIECE_GET)
+            co_return co_await svc_.dm_piece_get(sender, other, file, (int)channel, member);
+        co_return co_await svc_.dm_piece_put(sender, other, file, (int)channel, member, std::move(body));
+    }
     case ROLE_ANSWER:
         if (!json.isMember("offer") || !json["offer"].isInt64() || !json.isMember("accept") || !json["accept"].isBool())
             co_return fail(400, "bad_request");
