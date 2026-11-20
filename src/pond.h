@@ -51,12 +51,12 @@ constexpr int PROTOCOL = 8; /* 2: roles (docs/design.md, "Roles"); 3: receipts, 
 constexpr std::array<const char *, 5> FEATURES{"files", "roles", "receipts", "sealed", "pictures"}; /* and "voice", when voice is on */
 
 /* Direct messages (docs/dms.md, dms.cpp): relayed, never stored. */
-constexpr size_t DM_SEALED_MAX = 16 * 1024;            /* a sealed letter, as base64 */
+constexpr size_t DM_SEALED_MAX = 128 * 1024;           /* a sealed letter, as base64: a message with ten files' previews fits */
 constexpr int64_t DM_CHUNK = 1 << 20;                  /* a piece of a file: a Puddle's chunk */
-constexpr size_t DM_PIECE_MAX = DM_CHUNK + 64;         /* sealed */
+constexpr size_t DM_PIECE_MAX = DM_CHUNK + 1024;       /* sealed, as records of 64 KiB */
 constexpr int64_t DM_FILES_DEFAULT_MAX = 25LL << 20;
 constexpr int64_t DM_FILES_HARD_MAX = 4LL << 30;
-constexpr int64_t DM_PRESENT_MS = 60 * 1000;           /* a Puddle that asked for events this recently is following */
+constexpr int64_t DM_PRESENT_MS = 15 * 1000;           /* a Puddle that asked for events this recently is following */
 constexpr size_t DM_INBOX_MAX = 500;                   /* waiting to go to one member's Puddle, in memory */
 constexpr size_t DM_AWAITING_MAX = 1000;               /* senders waiting for one member to be back */
 constexpr size_t DM_NEW_PER_DAY = 20;                  /* new people one member may write to in a day */

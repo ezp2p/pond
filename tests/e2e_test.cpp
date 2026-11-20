@@ -7,6 +7,7 @@
 
 #include <sys/stat.h>
 
+
 using namespace pond;
 
 /* ---- a Puddle ---- */
@@ -174,6 +175,64 @@ int main()
         CHECK(until([&] { return has(ben.get("/api/v1/files/" + bid), "\"available\""); }));
         CHECK(ben.get("/api/v1/files/" + bid + "/content") == big);
         CHECK(has(ann.get(msgs), "\"state\":\"available\""));
+    }
+
+    /* ---- direct messages through the Pond (docs/dms.md): sealed from one Puddle to the other, relayed, never kept ---- */
+    if (!has(ann.get("/api/v1/ponds"), "\"dms\":{\"on\":true")) {
+        printf("e2e_test: direct messages skipped (this puddled has none)\n");
+    } else {
+        std::string annId = str_of(ann.get("/api/v1/users/me"), "id"), benId = str_of(ben.get("/api/v1/users/me"), "id");
+        CHECK(ann.post(P + "/dms/" + benId + "/open", "", &out) == 200 && has(out, "\"kind\":\"pond_dm\"") && has(out, "\"closed\":null"));
+        std::string conv = str_of(out, "id"), C = "/api/v1/conversations/" + conv;
+        CHECK(ann.post(P + "/dms/" + annId + "/open", "") == 404); /* not with ourselves */
+        CHECK(ann.post(C + "/messages/send", "{\"body\":\"psst, ben\"}") == 201);
+        CHECK(until([&] { return has(ben.get(C + "/messages"), "psst, ben"); })); /* the same conversation id on both sides */
+        CHECK(has(ben.get("/api/v1/conversations"), "\"kind\":\"pond_dm\"") && has(ben.get(C), "\"name\":\"Lily Pad\""));
+        CHECK(until([&] { return !has(ann.get(C + "/messages"), "\"delivery\""); })); /* Ben's Puddle said it came */
+        {
+            std::string all;
+            CHECK(db.sql("SELECT data FROM events", &all) == 0 && !has(all, "psst") && !has(all, "\"dm\"")); /* nothing of it in the Pond */
+        }
+        CHECK(ben.post(C + "/messages/send", "{\"body\":\"hi ann, quietly\"}") == 201);
+        CHECK(until([&] { return has(ann.get(C + "/messages"), "hi ann, quietly"); }));
+        /* edited and deleted, as any message */
+        std::string mine = ann.get(C + "/messages");
+        size_t at = mine.rfind("{\"id\":\"", mine.rfind("\"conversation\"", mine.find("psst, ben")));
+        std::string mid = mine.substr(at + 7, 64);
+        CHECK(ann.post(C + "/messages/" + mid + "/edit", "{\"body\":\"psst, ben (edited)\"}") == 200);
+        CHECK(until([&] { return has(ben.get(C + "/messages"), "psst, ben (edited)"); }));
+        /* a file, a piece at a time through the Pond, which keeps none of it */
+        std::string bytes(3 * (1 << 20) + 12345, '\0');
+        for (size_t i = 0; i < bytes.size(); i++)
+            bytes[i] = (char)(i * 7 + i / 1031);
+        std::string fid = ann.upload(bytes);
+        CHECK(fid.size() == 64);
+        CHECK(ann.post(C + "/messages/send", "{\"body\":\"a file\",\"files\":[{\"id\":\"" + fid + "\",\"name\":\"secret.bin\",\"mime\":\"application/octet-stream\"}]}") == 201);
+        CHECK(until([&] { return has(ben.get("/api/v1/files/" + fid), "\"available\""); }, 30000));
+        CHECK(ben.get("/api/v1/files/" + fid + "/content") == bytes);
+        /* a friend offer: Ben's side has a link to Ann's Puddle */
+        CHECK(ann.post(C + "/befriend", "", &out) == 200 && has(out, "\"offered\":true"));
+        CHECK(until([&] { return has(ben.get(C), "\"friend_offer\":\"puddle://"); }));
+        /* away: Ann's Puddle stops; what Ben writes meanwhile reaches her when it is back (held by Ben's Puddle, or, while the
+         * Pond still counts her request for events as open, in the Pond's memory) */
+        ann.down();
+        CHECK(ben.post(C + "/messages/send", "{\"body\":\"while you were away\"}") == 201);
+        CHECK(has(ben.get(C + "/messages"), "\"delivery\""));
+        CHECK(ann.up());
+        CHECK(until([&] { return has(ann.get(C + "/messages"), "while you were away"); }, 90000));
+        /* blocking her direct messages: dropped unread, and to her they look delivered */
+        CHECK(ben.post("/api/v1/users/" + annId + "/dm-block", "", &out) == 200 && has(out, "\"dms_blocked\":true"));
+        CHECK(ann.post(C + "/messages/send", "{\"body\":\"are you there?\"}") == 201);
+        CHECK(until([&] { return !has(ann.get(C + "/messages"), "\"delivery\""); }));
+        CHECK(!has(ben.get(C + "/messages"), "are you there?"));
+        CHECK(has(ben.get("/api/v1/dm-blocks"), annId));
+        CHECK(ben.post("/api/v1/users/" + annId + "/dm-unblock", "") == 200);
+        /* taking none in this Pond: Ann's app is told, and her Puddle refuses to send */
+        CHECK(ben.post(P + "/dms/settings", "{\"accept\":false}") == 200);
+        CHECK(until([&] { return has(ann.get(C), "\"closed\":\"not_accepted\""); }));
+        CHECK(ann.post(C + "/messages/send", "{\"body\":\"no?\"}", &out) == 409 && has(out, "not_accepted"));
+        CHECK(ben.post(P + "/dms/settings", "{\"accept\":true}") == 200);
+        CHECK(until([&] { return has(ann.get(C), "\"closed\":null"); }));
     }
 
     /* ---- profiles ---- */
