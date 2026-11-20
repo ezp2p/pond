@@ -6,7 +6,7 @@ Puddle. The design is in [docs/design.md](docs/design.md) and the routes in [api
 What a Pond says to Puddles follows the Puddle Protocol (`ezp2p/protocol`); [docs/protocol.md](docs/protocol.md) says
 which parts Pond implements and what the protocol asks of it next.
 
-- `pondd` is the service. It has no UI and serves HTTPS on one port.
+- `pondd` is the service. It has no UI and serves HTTPS on its chat port (TCP) and voice on its voice port (UDP), both 443 unless set.
 - `pondctl` is the admin's tool. It runs on the same machine and uses the same config.
 
 ## Docker

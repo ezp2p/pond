@@ -35,6 +35,6 @@ WORKDIR /data
 ENV HOME=/data
 VOLUME /data
 # HTTPS, and voice on UDP at the same port number
-EXPOSE 8443 8443/udp
+EXPOSE 443 443/udp
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -412,13 +412,14 @@ part of a member's display name that only one member's has.
 
 ```yaml
 listen: 0.0.0.0           # where pondd listens
-port: 8443
-address: pond.example.org:8443   # what invite links say; port left off if 443
+ports:
+  chat: 443               # TCP (HTTPS): everything but voice: joining, channels, messages, files, invites
+  voice: 443              # UDP: voice and video in voice channels; the chat port's number unless set
+address: pond.example.org # what invite links say, host[:chat port]; the port is left off when it is 443
 data_dir: /var/lib/pond   # pond.key, cert.pem, key.pem
 threads: 0                # threads answering requests; 0 is one per CPU
 events_wait_ms: 25000     # how long a request for events is held open (the tests shorten it)
 voice:                    # voice channels (voice.md); "voice: false" turns them off
-  port: 8443              # the UDP port every voice connection shares; the HTTPS port's number unless set
   max_in_channel: 0       # people in one voice channel; 0 is no limit
 database:
   host: 127.0.0.1         # "localhost" is the client library's default Unix socket
@@ -429,7 +430,18 @@ database:
   connections: 16
 ```
 
-Unknown settings are an error, so a typo is not silently ignored. Drogon's MariaDB client cannot be given a socket path:
+Unknown settings are an error, so a typo is not silently ignored.
+
+**Two ports, one number.** A Pond has a **chat port** (TCP: HTTPS, everything a member does except talk) and a **voice
+port** (UDP: the sound and video of voice channels). TCP and UDP port numbers are separate, so both can be 443, and are
+unless said: someone running a Pond opens one number, 443, for both protocols (on most routers one rule, "TCP/UDP"),
+and 443 is the port networks least often block. Give them different numbers only when something else has one: a
+reverse proxy on TCP 443 in front of the Pond (it can't carry UDP, so voice goes straight to the Pond), or a proxy using
+UDP 443 for HTTP/3. Invite links carry the chat port; a Puddle learns the voice port when it joins a voice channel.
+
+`port` and `voice.port`, the older names for `ports.chat` and `ports.voice`, are still read, and pondd logs a note to
+rename them. Before `ports`, the default was 8443; a `pond.yaml` that says nothing keeps 443 now, so one written before
+it that left the port out moves to 443. Drogon's MariaDB client cannot be given a socket path:
 with `host: localhost` it uses the client library's default socket, and otherwise it connects over TCP.
 
 ## Versions
