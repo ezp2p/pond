@@ -243,6 +243,86 @@ paths:
             application/octet-stream: {}
         "404": { description: "`no_picture`" }
         "429": { description: "`slow_down`" }
+  /pond/v1/members/{member}/chain:
+    get:
+      summary: A member's key chain, to seal a letter to them and check theirs (protocol 8)
+      description: The chain as the Pond holds it. A Puddle checks it against the member's id (the protocol's part 01) before using it.
+      parameters:
+        - { name: member, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The chain
+          content:
+            application/json:
+              schema: { type: object, properties: { id: { type: string }, chain: { type: string } } }
+        "404": { description: "`no_member`" }
+  /pond/v1/dms/send:
+    post:
+      summary: Relay a letter to another member (protocol 8, feature `dms`; docs/dms.md)
+      description: |
+        The letter is sealed to the recipient (the protocol's part 10); the Pond reads none of it and keeps none of it. When the
+        recipient's Puddle is following the events, the letter goes to it as the event `dm` (for it alone, not numbered,
+        never stored) and the answer says `relayed: true`. When it isn't, `relayed: false`, and the sender gets the event
+        `dm_back` `{member}` once that member's Puddle follows again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, id, kid, enc, sealed]
+              properties:
+                to: { type: string }
+                id: { type: string, description: 64 hex }
+                kid: { type: string, description: hex SHA-256 of the recipient's encryption key it is sealed to }
+                enc: { type: string, description: base64 of HPKE's enc (32 bytes) }
+                sealed: { type: string, description: base64, at most 128 KiB }
+      responses:
+        "200":
+          description: Relayed, or the recipient is away
+          content:
+            application/json:
+              schema: { type: object, properties: { id: { type: string }, relayed: { type: boolean } } }
+        "400": { description: "`bad_request`" }
+        "404": { description: "`no_member`: either is not a member now" }
+        "409": { description: "`not_accepted` (they take no direct messages here), `dms_off` (the Pond relays none)" }
+        "429": { description: "`slow_down`, `too_many_new` (20 new people a day)" }
+  /pond/v1/dms/settings:
+    post:
+      summary: Whether this member takes direct messages here
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [accept], properties: { accept: { type: boolean } } }
+      responses:
+        "200": { description: "`{accept}`; a `member` event tells everyone (a member's `dms`)" }
+  /pond/v1/dms/files/{letter}/{n}/{piece}:
+    get:
+      summary: A piece of a file a letter carries, asked for by its recipient (`?from=` the sender)
+      description: |
+        The Pond sends the sender's Puddle the event `dm_want` `{to, letter, file, part}` and waits up to 30 seconds for it to
+        send the piece. `piece` is `hashes` or a chunk's number. The bytes are sealed under the file's key (part 10, "Files").
+      parameters:
+        - { name: letter, in: path, required: true, schema: { type: string } }
+        - { name: n, in: path, required: true, description: the file's place in the letter, 0 to 9, schema: { type: integer } }
+        - { name: piece, in: path, required: true, schema: { type: string } }
+        - { name: from, in: query, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The sealed piece, content: { application/octet-stream: {} } }
+        "400": { description: "`bad_part`, `bad_query`" }
+        "409": { description: "`away` (the sender's Puddle isn't following, or didn't send it), `files_off`" }
+    post:
+      summary: The sender's answer to `dm_want` (`?to=` the recipient)
+      parameters:
+        - { name: letter, in: path, required: true, schema: { type: string } }
+        - { name: n, in: path, required: true, schema: { type: integer } }
+        - { name: piece, in: path, required: true, schema: { type: string } }
+        - { name: to, in: query, required: true, schema: { type: string } }
+      requestBody: { required: true, content: { application/octet-stream: {} } }
+      responses:
+        "204": { description: Handed to the request waiting for it }
+        "404": { description: "`not_asked`: nobody waits for it (any more)" }
   /pond/v1/events:
     get:
       summary: What happened after an event, waiting for something to happen
@@ -671,6 +751,7 @@ components:
           oneOf:
             - { type: object, properties: { until: { oneOf: [{ type: integer }, { type: "null" }] } } }
             - type: "null"
+        dms: { type: boolean, description: "Takes direct messages here (protocol 8; docs/dms.md)" }
     Role:
       enum: [operator, administrator, member]
       description: "docs/design.md, \"Roles\". Missing (protocol 1) means member."

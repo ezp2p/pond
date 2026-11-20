@@ -1,7 +1,8 @@
-# Direct messages through a Pond (design, decided, not built)
+# Direct messages through a Pond
 
-**Status:** the owner has answered the open questions (the decisions are listed at the end). Nothing is built yet.
-Puddle's side is in Puddle's `docs/pond-dms.md`.
+**Status:** built (protocol 8, features `dms` and `dm_files`), 2026-11-21, as the owner decided (the decisions are at the
+end). The letter itself, how it is signed, sealed and answered, is the protocol's part 10, "Letters"; this page is the
+Pond's side. Puddle's side is in Puddle's `docs/pond-dms.md`. The code is `src/dms.cpp`.
 
 ## What it is for
 
@@ -24,130 +25,45 @@ What it promises:
 
 ## How it works
 
-### Keys: nothing new
+The Pond keeps everything for direct messages in pondd's memory, under the Service's lock (`src/dms.cpp`): who is
+following now, what waits to go to each member's Puddle on its next request for events, who wants to know when someone is
+back, and the pieces of files on their way. A restart forgets all of it; Puddles allow for that by trying again.
 
-A member's Puddle already gave the Pond its key chain when it joined (`/pond/v1/join`, and `/pond/v1/keys` after a roll).
-The chain (Puddle Protocol part 01) holds the member's current Ed25519 signing key **and its X25519 encryption key**, and
-it proves itself: the user id is the hash of the first key, and every later key is signed by the one before. So a sender
-asks the Pond for the recipient's chain, checks it against the recipient's id (the member id it already knows), and seals
-to the encryption key in it. A Pond that answered with another key would have to forge a chain for that id, which it
-can't. The worst a Pond can do is withhold a message, which it could always do.
-
-New route: `GET /pond/v1/members/{member}/chain` answers the member's chain as the Pond holds it.
-
-### The letter
-
-The sender's Puddle builds the **letter**, the message itself, signed by the sender:
-
-```json
-{"v": 1, "from": "<sender id>", "to": "<recipient id>", "pond": "<pond id>", "id": "<26 base32, made by the sender>",
- "ts": <ms>, "kid": "<hex SHA-256 of the signing key>", "kind": "text", "text": "…", "reply_to": "<id>"?,
- "files": [{"name", "type", "size", "sha256", "key"}]?,
- "sig": "<base64 Ed25519 over the rest, canonical JSON>"}
-```
-
-`pond` and `to` are in it so a letter can't be replayed to someone else, or through another Pond. Other kinds:
-`friend_offer` (below) and `delivered` (receipts, below). It is sealed with HPKE exactly as part 09 seals a request body
-(`DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`, `ChaCha20-Poly1305`), to the recipient's encryption key, with
-`info` = `puddle-letter-v1\n<from>\n<to>\n<pond>\n<id>`.
-
-### Relaying
-
-```
-POST /pond/v1/dms/send  {"to": "<recipient id>", "id": "<the letter's id>", "kid": "<hex SHA-256 of the recipient's encryption key>",
-                         "enc": "<base64 HPKE enc>", "sealed": "<base64 of the sealed letter>"}
-```
-
-The Pond checks only what it can: that DMs are on in this Pond, that the sender and recipient are both members now,
-that the recipient takes DMs here (below), the size (at most 16 KiB sealed), and the sender's rate. Then:
-
-- **The recipient's Puddle is following the Pond's events now:** the Pond hands the letter to that open request, in
-  memory, as a `dm` event for them alone (`{id, from, kid, enc, sealed, ts}`), and answers `200 {"relayed": true}`.
-  The event is not written to the `events` table.
-- **It isn't:** `200 {"relayed": false}`. The Pond keeps no letter, only, in memory, that this sender is waiting for
-  this recipient. When the recipient's Puddle next follows, the Pond sends the sender a `dm_back {member}` event, and the
-  sender's Puddle sends again. A Pond that restarted has forgotten who waits, so a sender also tries again on its own,
-  every 15 minutes at first and less often later.
-
-The recipient's Puddle opens the letter, checks the signature against the sender's chain (asked of the Pond once, then
-kept), checks `to`, `pond` and `from` match, drops a repeat by `id`, keeps it, and sends a `delivered` letter back
-(sealed and relayed the same way), so the sender knows it arrived. The sender's Puddle keeps trying until it has the
-receipt or 30 days have passed; then the message says it wasn't delivered.
-
-A letter the recipient's Puddle can't open (a key it has rolled past, see "Keys rolling"), or whose signature is wrong,
-is dropped.
-
-### Files
-
-Files go with the letter, sealed too, and relayed, never stored. The letter names each file with its own random key
-(`files[].key`, inside the sealed letter); the file is encrypted with that key (ChaCha20-Poly1305, in 64 KiB chunks) and
-streamed through the Pond:
-
-```
-POST /pond/v1/dms/files/{letter id}/{n}   body: the encrypted file      (sender, once the recipient has the letter)
-GET  /pond/v1/dms/files/{letter id}/{n}   body: the same bytes, as they arrive   (recipient)
-```
-
-The Pond joins the two requests and passes the bytes from one to the other as they come, holding a few chunks in memory
-at most. The sender's upload waits (up to a minute) for the recipient to ask; if they don't, the sender tries again
-later, as for the letter. The recipient checks `sha256` and `size`. Limits are the Pond's: at most 25 MiB a file and 10
-files a letter by default; the admin may lower them, or turn files in DMs off (`pondctl dms files off`), which `/info`
-says by leaving out the feature `dm_files`.
-
-### Who may write to whom
-
-- **The Pond's admin** turns DMs on or off for the whole Pond (`pondctl dms on|off`, on by default), which `/info` says
-  with the feature `dms`. Only between members: someone who isn't a member now can't write or be written to.
-- **Each member** says whether they take DMs in this Pond, from their Puddle: `POST /pond/v1/dms/settings {"accept": true|false}`
-  (`true` by default). A send to someone who doesn't is `409 not_accepted`, and the app doesn't offer **Message** for
-  them; this is not a secret, as on Discord.
-- **One person** a member doesn't want to hear from, they block. Blocks are the Puddle's, below.
-
-### Blocking
-
-Blocks stay in the recipient's Puddle, as they do today, and the Pond never learns of them. A blocked person's letters
-are relayed like any other; the blocker's Puddle drops them unread but still sends `delivered`, so the blocked sender
-sees them delivered and is told nothing, which is how a Puddle's block already behaves (Puddle's `docs/streams.md`).
-There are two kinds (Puddle's `docs/pond-dms.md`): one for direct messages, and the Puddle's block, which also hides
-their messages in Ponds.
-
-### Keys rolling
-
-A member whose keys roll gives every Pond its new chain, as now (`/pond/v1/keys`). A sender whose `kid` names a key the
-Pond knows is not the recipient's current one gets `409 stale_key` with the chain, takes the new key, and seals again.
-A letter relayed in the moment of a roll may be sealed to the key just rolled past; the recipient's Puddle keeps its
-previous encryption key for 7 days after a roll, only to open letters.
-
-### Leaving, removal, bans
-
-When either member leaves the Pond or is removed, nothing more can be sent between them through it, and senders waiting
-for them stop. What each Puddle kept stays in its conversation, read-only, still called "Ann @ Lily Pad".
-
-### Turning it into a friendship
-
-Either side may offer to become friends from the conversation. A Pond never learns a member's address (a Puddle always
-calls the Pond), so the offer travels **inside a letter**: a letter with `"kind": "friend_offer"`, carrying the sender's
-`puddle://` link (address and sealing key, part 09) and a note. The recipient's Puddle shows it as an offer in the
-conversation; accepting sends an ordinary stream request to that link (part 03), naming the offer so the offering Puddle
-accepts it without asking its owner again. Declining sends nothing. Only the recipient learns the address, and only
-because the sender chose to send it.
+- **Following.** A member's Puddle is *following* while it holds a request on `/pond/v1/events`, and for 15 seconds
+  after one ends (`DM_PRESENT_MS`), so the moment between two requests doesn't count as away.
+- **A letter** (`POST /pond/v1/dms/send`): checked for what the Pond can check (DMs on here, both members now, the
+  recipient takes them, the size, the rate), then, if the recipient is following, put in their inbox and their waiting
+  request woken: it goes out as the event `dm`, with no number, and the cursor doesn't move. `{"relayed": true}`. If not,
+  `{"relayed": false}`, and the sender is noted as waiting for them; when their Puddle next asks for events, each waiting
+  sender gets `dm_back`. A letter put in the inbox of a Puddle that had just gone is handed over when it comes back, or
+  lost if pondd restarts first; the sender sends it again when no receipt comes.
+- **A piece of a file** (`GET /pond/v1/dms/files/{letter}/{n}/{piece}?from=`): the recipient's request waits (30 s) while
+  the sender's Puddle is sent `dm_want`; its `POST .../{piece}?to=` hands the bytes to the waiting request. Nothing is
+  written to disk. At most 4096 pieces wait across the Pond.
+- **Whether a member takes them**: `members.dms` (the one thing kept in the database), changed by `POST
+  /pond/v1/dms/settings`; a `member` event tells everyone. The admin's switches are the settings `dms` and
+  `dms.files_max` (`pondctl dms on|off`, `pondctl dms files max-size`), in `pond.dms` `{on, files_max}`.
+- **Leaving**: a member removed or gone is forgotten: their inbox, and who waits for them.
 
 ## Where it lives
 
-- **In the protocol** (`ezp2p/protocol`): see decision 9 below, still open.
+- **In the protocol** (`ezp2p/protocol`): the letter (its fields, signature, sealing, receipts and files) is part 10,
+  "Letters", so a Levee (part 06) or Drip (part 07) can carry the same thing later; part 05 says how a Pond relays them.
 - **In `/pond/v1`**: an addition, so a protocol number and the features `dms` and `dm_files`. Routes
   `GET /pond/v1/members/{member}/chain`, `POST /pond/v1/dms/send`, `POST /pond/v1/dms/settings`,
-  `POST|GET /pond/v1/dms/files/{letter}/{n}`; the events `dm` and `dm_back`, for one member and never stored.
-- **In the Pond's database**: only `members.dms_accept` and the Pond's own settings. No letters, no files.
+  `GET|POST /pond/v1/dms/files/{letter}/{n}/{piece}`; the events `dm`, `dm_back` and `dm_want`, for one member and never
+  stored.
+- **In the Pond's database**: only `members.dms` and the Pond's own settings. No letters, no files.
 - **In Puddle**: a conversation kind of its own in the direct messages, labelled with the Pond, plus the waiting
   letters (Puddle's `docs/pond-dms.md`).
 
 ## Limits
 
-- A sealed letter: 16 KiB (text up to 4000 characters, as a channel message).
+- A sealed letter: 128 KiB as base64 (a message of 4000 characters with ten files' previews fits).
 - Files: 25 MiB each, 10 a letter, by default; the admin may lower them or turn them off.
 - Each member: 1 letter a second on average, bursts of 10; at most 20 different recipients a day who have never
-  written back, to make a Pond a poor tool for spam.
+  written to them, to make a Pond a poor tool for spam (counted in memory: a restart starts the day afresh).
+- Waiting in one member's inbox: 500; senders waiting for one member: 1000.
 - A sender waits for a recipient's return for 30 days.
 
 ## Decisions (the owner's answers)
@@ -165,5 +81,4 @@ because the sender chose to send it.
 6. **Files:** yes, bundled in, relayed and never stored.
 7. **30 days**, now how long a sender's Puddle keeps trying.
 8. **Where they show:** in the Puddle's direct messages.
-9. **Where the letter format goes in the protocol:** asked again, with the choice spelled out. *Recommendation:* a
-   section of part 05 (Ponds), since only a Pond carries letters now that nothing stores them on the way.
+9. **Where the letter format goes in the protocol:** a part of its own, part 10 "Letters", for Levee and Drip to reuse.

@@ -394,7 +394,7 @@ device) is not possible, since the Pond knows nothing else of them.
 ### Protocol
 
 These are additions, so they stay in `/pond/v1`: `protocol` becomes 2, and `features` gains `roles`. Muting came with
-protocol 7: a member gains `muted`. A member and `me`
+protocol 7: a member gains `muted`. Direct messages came with protocol 8 (`dms.md`): a member gains `dms`. A member and `me`
 gain `role` (`operator`, `administrator` or `member`), and `/info` gains `offer` (`{id, role}` or null).
 
 ### Open questions
@@ -492,7 +492,7 @@ the protocol, not the version of either program.
 - Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
   it does not know, so an older Puddle keeps working with a newer Pond.
 - `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
-  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `voice`). A Puddle checks these before using an addition, rather than guessing from
+  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `voice`, `dms`, `dm_files`). A Puddle checks these before using an addition, rather than guessing from
   a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
 
 A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.
@@ -545,8 +545,6 @@ to report.
 
 - Permissions finer than the three roles, such as who may post where.
 - Editing, deleting and replying to messages, reactions, mentions, unread counts and typing indicators.
-- Direct messages between members, sealed end to end so the Pond can't read them: a proposal waiting on the owner's
-  choices, [dms.md](dms.md).
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.
 - Redis, and several `pondd` processes. The client for Redis is already built in; nothing uses it yet.
