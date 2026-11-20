@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,10 +39,11 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 6; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 7; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
                              * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
-                             * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures") */
+                             * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures");
+                             * 7: muting, and a member's `muted` ("Muting") */
 constexpr std::array<const char *, 5> FEATURES{"files", "roles", "receipts", "sealed", "pictures"}; /* and "voice", when voice is on */
 
 /* Roles (docs/design.md, "Roles"), lowest first. An operator outranks an administrator. */
@@ -150,6 +152,11 @@ public:
     Task<Answer> admin_channel_delete(std::string by, int64_t channel);
     Task<Answer> admin_remove(std::string by, std::string member, bool ban, std::string reason);
     Task<Answer> admin_bans();
+    /* Mute `member` (docs/design.md, "Muting"): until `until_ms`, or until unmuted (0); or unmute them. */
+    Task<Answer> admin_mute(std::string by, std::string member, int64_t until_ms);
+    Task<Answer> admin_unmute(std::string by, std::string member);
+    /* Is `member` muted now? -1 if not; 0 until unmuted; else until when (ms). From memory, so voice may ask for every frame. */
+    int64_t muted_until(const std::string &member);
     /* Invites from the app (docs/design.md, "Invite links"): those that can still be used; one made with `max_uses` (0: no
      * limit) and `expires_ms` (0: never); one revoked. */
     Task<Answer> admin_invites();
@@ -251,7 +258,9 @@ private:
     Keyed chunk_limit_{64, 50}; /* chunks sent or fetched: 20 MiB a second on average, 64 at once */
     std::mutex mu_;
     std::vector<std::shared_ptr<Waiter>> waiters_;
-    int64_t latest_ = 0, oldest_ = 0, next_prune_ = 0;
+    int64_t latest_ = 0, oldest_ = 0, next_prune_ = 0, next_mutes_ = 0;
+    std::map<std::string, int64_t> muted_; /* who is muted: muted_until as kept; reloaded every two seconds by tick() */
+    Task<Outcome> set_muted(std::string member, std::optional<int64_t> until);
     std::atomic<bool> stopping_{false}, ticking_{false};
 };
 

@@ -80,14 +80,22 @@ static std::optional<std::string> nullable(const std::string &s)
     return s;
 }
 
-static const char MEMBER_COLS[] = "id, profile, joined_ms, role";
+static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until";
 static const char CHANNEL_COLS[] = "id, name, topic, position, kind";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
+
+/* "muted": null, or {"until": ms, or null until they are unmuted} (docs/design.md, "Muting") */
+static std::string muted_json(const drogon::orm::Field &f)
+{
+    if (f.isNull() || (num(f) != 0 && num(f) <= now_ms()))
+        return "null";
+    return num(f) == 0 ? std::string("{\"until\":null}") : "{\"until\":" + std::to_string(num(f)) + "}";
+}
 
 static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
 {
     return "{\"id\":" + jstr(text(row[0])) + ",\"profile\":" + (row[1].isNull() ? std::string("null") : text(row[1])) +
-           ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + "}";
+           ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + ",\"muted\":" + muted_json(row[4]) + "}";
 }
 
 static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
@@ -347,6 +355,8 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
             co_return fail(400, "bad_file");
     if (!send_limit_.take(member, now_ms()))
         co_return fail(429, "slow_down");
+    if (int64_t until = muted_until(member); until >= 0) /* muted: nothing they write is posted (docs/design.md, "Muting") */
+        co_return Answer{409, "{\"error\":\"muted\",\"until\":" + (until ? std::to_string(until) : std::string("null")) + "}"};
     TxPtr tx;
     try {
         Result live = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0", channel);
@@ -640,6 +650,15 @@ Task<> Service::tick()
             co_await db_->execSqlCoro("DELETE FROM events WHERE ts_ms < ?", now_ms() - EVENTS_KEEP_MS);
             co_await sweep_files();
             co_await sweep_pictures();
+        }
+        if (now_ms() >= next_mutes_) { /* who is muted, from the app or pondctl: what sends and voice look at */
+            next_mutes_ = now_ms() + 2000;
+            Result m = co_await db_->execSqlCoro("SELECT id, muted_until FROM members WHERE muted_until IS NOT NULL AND left_ms IS NULL");
+            std::map<std::string, int64_t> now;
+            for (const auto &row : m)
+                now[text(row[0])] = num(row[1]);
+            std::lock_guard<std::mutex> g(mu_);
+            muted_ = std::move(now);
         }
         Result r = co_await db_->execSqlCoro("SELECT COALESCE(MAX(id), 0), COALESCE(MIN(id), 0) FROM events");
         {

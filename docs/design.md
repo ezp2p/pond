@@ -367,6 +367,8 @@ member without one gets the same `404` as any refusal.
 | `POST /pond/v1/admin/channels/{channel}/delete` | |
 | `POST /pond/v1/admin/members/{member}/remove` | Kick: they are out, and may come back with an invite |
 | `POST /pond/v1/admin/members/{member}/ban` | `{reason?}`: out, and refused if they try to join again |
+| `POST /pond/v1/admin/members/{member}/mute` | `{until?}` (ms): they stay, but may not write or be heard (see "Muting") |
+| `POST /pond/v1/admin/members/{member}/unmute` | |
 | `GET /pond/v1/admin/bans` | Who is banned, by whom, when and why |
 | `POST /pond/v1/admin/bans/{member}/unban` | |
 | `GET /pond/v1/admin/invites` | The invites that can still be used, each with its link |
@@ -377,12 +379,22 @@ Rank decides who may act on whom: an operator on administrators and members, an 
 Nobody acts on an operator from the app (only `pondctl` can), and nobody on themselves. Each of these goes in
 `admin_log` (who, what, when), as do `pondctl`'s, for a record of who did what.
 
+### Muting
+
+An operator or administrator mutes a member for a while (`until`, in ms) or until they are unmuted. A muted member stays,
+reads, and sees everything, but a send is refused (`409 muted`, with `until`), and in a voice channel the Pond passes on
+nothing they say. Every member hears of it in a `member` event: the member carries `muted: {until}` (`until` null for
+until unmuted), or `muted: null`. A mute that runs out ends by itself, with no event: the apps know `until`. The same rank
+rules apply as for removing and banning. Mutes are kept in `members.muted_until`, and `pondd` holds who is muted in memory
+(read again every two seconds, so voice can ask for every frame).
+
 Bans are by user id. A member who makes a new identity is a new member; banning by anything else (an address, a
 device) is not possible, since the Pond knows nothing else of them.
 
 ### Protocol
 
-These are additions, so they stay in `/pond/v1`: `protocol` becomes 2, and `features` gains `roles`. A member and `me`
+These are additions, so they stay in `/pond/v1`: `protocol` becomes 2, and `features` gains `roles`. Muting came with
+protocol 7: a member gains `muted`. A member and `me`
 gain `role` (`operator`, `administrator` or `member`), and `/info` gains `offer` (`{id, role}` or null).
 
 ### Open questions
@@ -403,7 +415,7 @@ gain `role` (`operator`, `administrator` or `member`), and `/info` gains `offer`
 | `invites` | `token`, `max_uses` (NULL = unlimited), `uses`, `expires_ms` (NULL = never), `created_ms`, `revoked` |
 | `messages` | `id`, `channel`, `author`, `text`, `nonce`, `ts_ms`; one index on `(channel, id)`, and a unique one on `(author, nonce)` |
 | `events` | `id`, `kind`, `data` (JSON), `ts_ms` |
-| `members` (more) | `role`: `operator`, `administrator` or `member` |
+| `members` (more) | `role`: `operator`, `administrator` or `member`; `muted_until`: NULL, 0 (until unmuted) or when (ms) |
 | `role_offers` | `id`, `member`, `role`, `created_ms`; open until answered or 7 days old |
 | `bans` | `member`, `by` (a member id, or `pondctl`), `reason`, `ts_ms` |
 | `admin_log` | `id`, `by`, `action`, `target`, `detail`, `ts_ms` |

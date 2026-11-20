@@ -120,7 +120,7 @@ paths:
               schema: { $ref: "#/components/schemas/Message" }
         "400": { description: "`bad_text`, `bad_file` (a name with a folder in it, a preview that is not base64...), `too_many_files`" }
         "404": { description: "No such channel (`no_channel`)" }
-        "409": { description: "`no_file`, with `file`: one of the files is not here whole; `files_off`: the Pond takes no files" }
+        "409": { description: "`no_file`, with `file`: one of the files is not here whole; `files_off`: the Pond takes no files; `muted`, with `until` (ms, or null until unmuted): an operator or administrator muted the sender" }
         "429": { description: "Too many (`slow_down`)" }
   /pond/v1/files/{file}:
     post:
@@ -447,6 +447,28 @@ paths:
         "204": { description: Banned }
         "400": { $ref: "#/components/responses/AdminRefused" }
         "409": { description: "`outranked`, `not_yourself`" }
+  /pond/v1/admin/members/{member}/mute:
+    post:
+      summary: Mute a member
+      description: |
+        What they write is refused (`409 muted`) and their voice is not passed on in voice channels, until `until` (ms) or,
+        without it, until they are unmuted. Only on a lower rank, never an operator, never oneself. Every member hears of it:
+        a `member` event, with `muted`.
+      parameters: [{ $ref: "#/components/parameters/Member" }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { until: { oneOf: [{ type: integer }, { type: "null" }] } } } } } }
+      responses:
+        "204": { description: Muted }
+        "400": { description: "`bad_request`: `until` is not in the future (or over ten years ahead)" }
+        "404": { description: "`no_member`" }
+        "409": { description: "`outranked`, `not_yourself`" }
+  /pond/v1/admin/members/{member}/unmute:
+    post:
+      summary: Unmute a member
+      parameters: [{ $ref: "#/components/parameters/Member" }]
+      responses:
+        "204": { description: Unmuted (or was not muted) }
+        "404": { description: "`no_member`" }
+        "409": { description: "`outranked`, `not_yourself`" }
   /pond/v1/admin/bans:
     get:
       summary: Who is banned
@@ -644,6 +666,11 @@ components:
         profile: { $ref: "#/components/schemas/Profile" }
         joined: { type: integer, description: ms }
         role: { $ref: "#/components/schemas/Role" }
+        muted:
+          description: "Muted by an operator or administrator (protocol 7): `until` when (ms), or null until unmuted. null when not muted."
+          oneOf:
+            - { type: object, properties: { until: { oneOf: [{ type: integer }, { type: "null" }] } } }
+            - type: "null"
     Role:
       enum: [operator, administrator, member]
       description: "docs/design.md, \"Roles\". Missing (protocol 1) means member."

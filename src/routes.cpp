@@ -31,13 +31,13 @@ enum Kind {
     JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
     VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET,
     ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN,
-    ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, NONE
+    ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, ADMIN_MUTE, ADMIN_UNMUTE, NONE
 };
 
 /* The routes only an operator or administrator may use (docs/design.md, "Roles"). */
 static bool is_admin(int k)
 {
-    return k >= ADMIN_POND && k <= ADMIN_INVITE_REVOKE;
+    return k >= ADMIN_POND && k <= ADMIN_UNMUTE;
 }
 
 /* A user id: 52 of base32. */
@@ -81,6 +81,8 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
         member = std::string(id);
         if (verb == "remove") return ADMIN_REMOVE;
         if (verb == "ban") return ADMIN_BAN;
+        if (verb == "mute") return ADMIN_MUTE;
+        if (verb == "unmute") return ADMIN_UNMUTE;
     }
     if (post && split("bans/", id, verb) && user_id_ok(id) && verb == "unban") {
         member = std::string(id);
@@ -173,7 +175,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 /* Routes whose body is a JSON object. FILE_PUT's is a chunk's bytes, and PICTURE_PUT's a picture's. */
 static bool takes_body(Kind k)
 {
-    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE ||
+    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH;
 }
@@ -521,6 +523,18 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         co_return co_await svc_.admin_bans();
     case ADMIN_UNBAN:
         co_return co_await svc_.admin_unban(sender, member);
+    case ADMIN_MUTE: {
+        /* {until?: when it ends (ms)}; absent or null: until they are unmuted */
+        int64_t until = 0;
+        if (json.isMember("until") && !json["until"].isNull()) {
+            if (!json["until"].isInt64() || json["until"].asInt64() < 1)
+                co_return fail(400, "bad_request");
+            until = json["until"].asInt64();
+        }
+        co_return co_await svc_.admin_mute(sender, member, until);
+    }
+    case ADMIN_UNMUTE:
+        co_return co_await svc_.admin_unmute(sender, member);
     case ADMIN_INVITES:
         co_return co_await svc_.admin_invites();
     case ADMIN_INVITE_CREATE: {

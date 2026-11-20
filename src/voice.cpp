@@ -295,7 +295,7 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
         {
             std::lock_guard<std::mutex> g(mu);
             SessionPtr s = weak.lock();
-            if (!s || s->gone || s->muted || !s->audio_limit.take(steady_ms()))
+            if (!s || s->gone || s->muted || svc.muted_until(s->member) >= 0 || !s->audio_limit.take(steady_ms())) /* muted by themselves, or by an admin */
                 return;
             auto it = in_channel.find(s->channel);
             if (it == in_channel.end())

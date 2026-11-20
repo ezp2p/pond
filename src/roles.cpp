@@ -337,6 +337,87 @@ Task<Answer> Service::admin_bans()
     }
 }
 
+/* ---- muting ---- */
+
+int64_t Service::muted_until(const std::string &member)
+{
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = muted_.find(member);
+    if (it == muted_.end() || (it->second != 0 && it->second <= now_ms()))
+        return -1;
+    return it->second;
+}
+
+/* `until`: 0 until unmuted, a time, or nullopt to unmute. Every member hears of it (a `member` event). */
+Task<Outcome> Service::set_muted(std::string member, std::optional<int64_t> until)
+{
+    TxPtr tx;
+    try {
+        tx = co_await db_->newTransactionCoro();
+        Result r = co_await tx->execSqlCoro("UPDATE members SET muted_until = ? WHERE id = ? AND left_ms IS NULL", until, member);
+        if (r.affectedRows() == 0) {
+            tx->rollback();
+            if (!co_await is_member(member))
+                co_return "no_member";
+            co_return ""; /* as it was already */
+        }
+        std::string mj = co_await member_json_of(tx, member);
+        int64_t ev = co_await add_event(tx, "member", mj);
+        if (!co_await Committed(std::move(tx)))
+            co_return "database";
+        bump(ev);
+    } catch (const DrogonDbException &e) {
+        if (tx)
+            tx->rollback();
+        LOG_ERROR << "database: " << e.base().what();
+        co_return "database";
+    }
+    std::lock_guard<std::mutex> g(mu_);
+    if (until)
+        muted_[member] = *until;
+    else
+        muted_.erase(member);
+    co_return "";
+}
+
+Task<Answer> Service::admin_mute(std::string by, std::string member, int64_t until_ms)
+{
+    if (until_ms < 0 || (until_ms > 0 && (until_ms <= now_ms() || until_ms > now_ms() + INVITE_EXPIRY_MAX_MS)))
+        co_return fail(400, "bad_request");
+    try {
+        std::string no = co_await may_act(by, member);
+        if (!no.empty())
+            co_return fail(409, no.c_str());
+    } catch (const DrogonDbException &e) {
+        co_return server_error(e);
+    }
+    Outcome o = co_await set_muted(member, until_ms);
+    if (o == "no_member")
+        co_return fail(404, "no_member");
+    if (!o.empty())
+        co_return fail(500, "database");
+    co_await log_admin(by, "mute", member, until_ms ? "until " + std::to_string(until_ms) : std::string("until unmuted"));
+    co_return Answer{204, ""};
+}
+
+Task<Answer> Service::admin_unmute(std::string by, std::string member)
+{
+    try {
+        std::string no = co_await may_act(by, member);
+        if (!no.empty())
+            co_return fail(409, no.c_str());
+    } catch (const DrogonDbException &e) {
+        co_return server_error(e);
+    }
+    Outcome o = co_await set_muted(member, std::nullopt);
+    if (o == "no_member")
+        co_return fail(404, "no_member");
+    if (!o.empty())
+        co_return fail(500, "database");
+    co_await log_admin(by, "unmute", member, "");
+    co_return Answer{204, ""};
+}
+
 /* ---- invites ---- */
 
 std::string Service::invite_link(const std::string &token) const

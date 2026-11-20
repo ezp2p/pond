@@ -99,7 +99,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 6 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 7 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -420,6 +420,31 @@ int main()
             CHECK(pond.ctl("log", &out) == 0 && has(out, "invite_create") && has(out, "invite_revoke"));
             CHECK(pond.ctl("invite create", &out) == 0 && has(out, "pond://127.0.0.1:" + std::to_string(pond.port) + "?invite=")); /* pondctl's still */
             CHECK(pond.call(&fay, "POST", "/pond/v1/leave").status == 204);
+        }
+
+        /* ---- muting (docs/design.md, "Muting"): what they write is refused until it ends or they are unmuted ---- */
+        {
+            CHECK(pond.call(&eve, "POST", "/pond/v1/admin/members/" + ann.id + "/mute", "{}").status == 404); /* no role */
+            CHECK(has(pond.call(&ann, "POST", "/pond/v1/admin/members/" + dan.id + "/mute", "{}").body, "outranked"));
+            CHECK(has(pond.call(&ann, "POST", "/pond/v1/admin/members/" + ann.id + "/mute", "{}").body, "not_yourself"));
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + eve.id + "/mute", "{\"until\":1000}").status == 400); /* past */
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + eve.id + "/mute", "{\"until\":\"soon\"}").status == 400);
+            CHECK(pond.call(&eve, "POST", send, "{\"text\":\"before\"}").status == 200);
+            int64_t c2 = num_of(pond.call(&ann, "GET", "/pond/v1/info").body, "cursor");
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + eve.id + "/mute", "{}").status == 204);
+            a = pond.call(&eve, "POST", send, "{\"text\":\"muted?\"}");
+            CHECK(a.status == 409 && has(a.body, "\"error\":\"muted\"") && has(a.body, "\"until\":null"));
+            CHECK(has(pond.call(&dan, "GET", "/pond/v1/members").body, "\"muted\":{\"until\":null}"));
+            CHECK(has(pond.call(&dan, "GET", "/pond/v1/events?after=" + std::to_string(c2)).body, "\"muted\":{\"until\":null}"));
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + eve.id + "/unmute").status == 204);
+            CHECK(pond.call(&eve, "POST", send, "{\"text\":\"after\"}").status == 200);
+            CHECK(!has(pond.call(&dan, "GET", "/pond/v1/members").body, "\"muted\":{"));
+            int64_t later = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + 600000;
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + eve.id + "/mute", "{\"until\":" + std::to_string(later) + "}").status == 204);
+            CHECK(has(pond.call(&ann, "GET", "/pond/v1/members").body, "\"muted\":{\"until\":" + std::to_string(later) + "}"));
+            CHECK(pond.call(&eve, "POST", send, "{\"text\":\"muted again\"}").status == 409);
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + eve.id + "/unmute").status == 204);
+            CHECK(pond.ctl("log", &out) == 0 && has(out, "mute") && has(out, "unmute"));
         }
 
         /* taking a role away, and the record */
