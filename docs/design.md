@@ -545,6 +545,8 @@ to report.
 
 - Permissions finer than the three roles, such as who may post where.
 - Editing, deleting and replying to messages, reactions, mentions, unread counts and typing indicators.
+- Direct messages between members, sealed end to end so the Pond can't read them: a proposal waiting on the owner's
+  choices, [dms.md](dms.md).
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.
 - Redis, and several `pondd` processes. The client for Redis is already built in; nothing uses it yet.
