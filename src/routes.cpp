@@ -29,8 +29,8 @@ static const Answer NOT_FOUND = {UNKNOWN, ""};
 
 enum Kind {
     JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
-    VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE,
-    ADMIN_POND, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN, NONE
+    VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET,
+    ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN, NONE
 };
 
 /* The routes only an operator or administrator may use (docs/design.md, "Roles"). */
@@ -56,6 +56,7 @@ static int64_t number_of(std::string_view s, bool zero);
 static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channel, std::string &member)
 {
     if (post && p == "pond") return ADMIN_POND;
+    if (post && p == "icon") return ADMIN_ICON;
     if (post && p == "channels/create") return ADMIN_CHANNEL_CREATE;
     if (get && p == "bans") return ADMIN_BANS;
     auto split = [&](std::string_view prefix, std::string_view &id, std::string_view &verb) {
@@ -130,6 +131,11 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     if (p.substr(0, 6) == "files/")
         return file_route(get, post, p.substr(6), file, n);
     if (post && p == "roles/answer") return ROLE_ANSWER;
+    if (post && p == "pictures") return PICTURE_PUT;
+    if (get && p.substr(0, 9) == "pictures/" && picture_hash_ok(std::string(p.substr(9)))) {
+        file = std::string(p.substr(9)); /* the picture's hash */
+        return PICTURE_GET;
+    }
     if (post && p.substr(0, 6) == "voice/" && p.size() > 6 + 26 && p[6 + 26] == '/' && token_ok(std::string(p.substr(6, 26)))) {
         file = std::string(p.substr(6, 26)); /* the session */
         std::string_view verb = p.substr(6 + 27);
@@ -157,17 +163,17 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     return NONE;
 }
 
-/* Routes whose body is a JSON object. FILE_PUT's is a chunk's bytes. */
+/* Routes whose body is a JSON object. FILE_PUT's is a chunk's bytes, and PICTURE_PUT's a picture's. */
 static bool takes_body(Kind k)
 {
-    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND ||
+    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH;
 }
 
 static size_t body_max(Kind k)
 {
-    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : BODY_MAX;
+    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == PICTURE_PUT ? PICTURE_MAX : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : BODY_MAX;
 }
 
 /* "files": [{id, name, mime, w?, h?, duration_ms?, preview?}], as a send says them; cleaned by the Service. */
@@ -260,7 +266,7 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         k = NONE; /* voice is off: there are no such paths */
     bool has_seal = !req->getHeader("x-puddle-seal").empty();
     size_t limit = body_max(k) + (has_seal && body_max(k) ? SEAL_TAG : 0);
-    if (k == NONE || (!takes_body(k) && k != FILE_PUT && !sent.empty() && !has_seal) || sent.size() > limit)
+    if (k == NONE || (!takes_body(k) && k != FILE_PUT && k != PICTURE_PUT && !sent.empty() && !has_seal) || sent.size() > limit)
         co_return NOT_FOUND;
     int64_t now = now_ms();
 
@@ -280,7 +286,7 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
             (!sent.empty() && !hpke_open(hc, seal_aad(method, target), sent, body)) || !answer_key(hc, signing.key))
             co_return NOT_FOUND; /* not sealed to us, for this request: a stranger learns nothing */
         signing.sealed = true;
-        if ((!takes_body(k) && k != FILE_PUT && !body.empty()) || body.size() > body_max(k))
+        if ((!takes_body(k) && k != FILE_PUT && k != PICTURE_PUT && !body.empty()) || body.size() > body_max(k))
             co_return NOT_FOUND;
     }
 
@@ -423,6 +429,10 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         co_return co_await svc_.file_chunks(sender, file);
     case FILE_GET:
         co_return co_await svc_.file_chunk(sender, file, chunk);
+    case PICTURE_PUT:
+        co_return co_await svc_.picture_put(sender, std::move(body));
+    case PICTURE_GET:
+        co_return co_await svc_.picture_get(sender, file);
     case ROLE_ANSWER:
         if (!json.isMember("offer") || !json["offer"].isInt64() || !json.isMember("accept") || !json["accept"].isBool())
             co_return fail(400, "bad_request");
@@ -432,6 +442,13 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         if (!opt_string("name", name) || !opt_string("description", description))
             co_return fail(400, "bad_request");
         co_return co_await svc_.admin_pond(sender, name, description);
+    }
+    case ADMIN_ICON: {
+        /* {"hash": a picture sent first (POST /pond/v1/pictures)} or {"hash": null} for none */
+        std::optional<std::string> hash;
+        if (!json.isMember("hash") || (!json["hash"].isNull() && !opt_string("hash", hash)))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_icon(sender, hash);
     }
     case ADMIN_CHANNEL_CREATE: {
         std::optional<std::string> name, topic, kind;

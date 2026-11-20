@@ -20,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace pond {
@@ -37,10 +38,11 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 5; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 6; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
-                             * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09) */
-constexpr std::array<const char *, 4> FEATURES{"files", "roles", "receipts", "sealed"}; /* and "voice", when voice is on */
+                             * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
+                             * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures") */
+constexpr std::array<const char *, 5> FEATURES{"files", "roles", "receipts", "sealed", "pictures"}; /* and "voice", when voice is on */
 
 /* Roles (docs/design.md, "Roles"), lowest first. An operator outranks an administrator. */
 enum class Role { MEMBER = 0, ADMINISTRATOR = 1, OPERATOR = 2 };
@@ -59,6 +61,12 @@ constexpr size_t FILE_NAME_MAX = 255;                  /* bytes */
 constexpr size_t FILE_MIME_MAX = 127;
 constexpr size_t FILE_PREVIEW_MAX = 1400;              /* characters of base64: a preview of at most 1 KiB */
 constexpr int64_t FILE_UNSENT_KEEP_MS = 24LL * 3600 * 1000; /* an upload no message carries goes after this */
+
+/* Pictures (docs/design.md, "Pictures"): the icon and members' profile pictures, kept by their SHA-256 (pictures.cpp). */
+constexpr size_t PICTURE_MAX = 1 << 20;
+/* "image/png", "image/jpeg", "image/gif" or "image/webp" from what the bytes start with; nullptr for anything else */
+const char *picture_kind(std::string_view bytes);
+bool picture_hash_ok(const std::string &hash);
 
 int64_t now_ms();
 
@@ -138,6 +146,13 @@ public:
     Task<Answer> admin_bans();
     Task<Answer> admin_unban(std::string by, std::string member);
 
+    /* Pictures (pictures.cpp): keep one a member sends, answering {hash, mime, size}; give one that is shown to the members (the
+     * icon, or in a member's profile) to a member. */
+    Task<Answer> picture_put(std::string member, std::string bytes);
+    Task<Answer> picture_get(std::string member, std::string hash);
+    /* The Pond's icon: a picture sent first, or nullopt for none. */
+    Task<Answer> admin_icon(std::string by, std::optional<std::string> hash);
+
     /* The largest file members may send (0: files are turned off). */
     Task<int64_t> files_max();
 
@@ -162,6 +177,10 @@ public:
     /* Record an admin action. */
     Task<> log_admin(std::string by, std::string action, std::string target, std::string detail);
     Task<std::string> setting(std::string name);
+    /* Keep a picture (pondctl's `icon`; picture_put for members): its hash in `hash`. */
+    Outcome store_picture(const std::string &bytes, std::string &hash);
+    /* The icon: the hash of a picture kept, or nullopt to have none. */
+    Task<Outcome> set_icon(std::optional<std::string> hash);
     /* `bytes` 0 turns files off. */
     Task<Outcome> set_files_max(int64_t bytes);
     /* How many files are kept, and the bytes they take. */
@@ -204,13 +223,18 @@ private:
     void bump(int64_t id);
     Task<> tick();
     Task<> sweep_files();
+    Task<> sweep_pictures();
+    Task<bool> picture_shown(std::string hash);
+    std::string picture_path(const std::string &hash) const;
+    /* {hash, mime, size} of a picture kept, into `json`: false if it is not here */
+    bool picture_ref(const std::string &hash, std::string &json) const;
     Task<bool> may_read(std::string member, std::string id);
     Task<std::string> messages_json(DbPtr db, drogon::orm::Result r);
     std::string file_path(const std::string &id, bool partial) const;
 
     DbPtr db_;
     PondKey key_;
-    std::string files_dir_;
+    std::string files_dir_, pictures_dir_;
     trantor::EventLoop *timers_;
     Keyed send_limit_{20, 200}; /* 5 a second on average, 20 at once */
     Keyed chunk_limit_{64, 50}; /* chunks sent or fetched: 20 MiB a second on average, 64 at once */

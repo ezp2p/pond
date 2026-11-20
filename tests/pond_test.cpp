@@ -99,7 +99,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 5 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 6 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -347,6 +347,46 @@ int main()
         CHECK(pond.call(&eve, "POST", "/pond/v1/join", join_body(eve, invite(pond, ""), "Eve"), "*").status == 200);
         CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + eve.id + "/remove").status == 204); /* a kick: back with an invite */
         CHECK(pond.call(&eve, "POST", "/pond/v1/join", join_body(eve, invite(pond, ""), "Eve"), "*").status == 200);
+
+        /* ---- pictures: the icon, and pictures in members' profiles (docs/design.md, "Pictures") ---- */
+        {
+            const std::string png = std::string("\x89PNG\r\n\x1a\n", 8) + std::string(300, 'p'), H = sha256_hex(png);
+            CHECK(pond.call(&eve, "POST", "/pond/v1/pictures", "not a picture at all").status == 400);
+            CHECK(pond.call(&eve, "POST", "/pond/v1/pictures", std::string((1 << 20) + 1, 'x')).status == 404); /* over any body */
+            a = pond.call(&eve, "POST", "/pond/v1/pictures", png);
+            CHECK(a.status == 200 && has(a.body, "\"hash\":\"" + H + "\"") && has(a.body, "\"mime\":\"image/png\"") &&
+                  has(a.body, "\"size\":308"));
+            CHECK(pond.call(&dan, "GET", "/pond/v1/pictures/" + H).status == 404); /* sent, but nobody is shown it yet */
+            std::string avatar = "{\"hash\":\"" + H + "\",\"mime\":\"image/png\",\"size\":308}";
+            CHECK(pond.call(&eve, "POST", "/pond/v1/profile", "{\"profile\":{\"display_name\":\"Eve\",\"avatar\":" + avatar + "}}").status == 204);
+            a = pond.call(&dan, "GET", "/pond/v1/pictures/" + H);
+            CHECK(a.status == 200 && a.body == png && a.type == SEALED_TYPE);
+            CHECK(pond.call(&ben, "GET", "/pond/v1/pictures/" + H).status == 404);              /* not a member */
+            CHECK(pond.call(&dan, "GET", "/pond/v1/pictures/" + H.substr(0, 63) + "G").status == 404);
+            CHECK(pond.call(&dan, "GET", "/pond/v1/pictures/" + std::string(64, 'a')).status == 404);
+
+            /* the icon: an administrator's, from the app, or pondctl's */
+            CHECK(has(pond.call(&eve, "GET", "/pond/v1/info").body, "\"icon\":null"));
+            CHECK(pond.call(&eve, "POST", "/pond/v1/admin/icon", "{\"hash\":\"" + H + "\"}").status == 404); /* no role */
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/icon", "{\"hash\":\"" + std::string(64, 'b') + "\"}").status == 400); /* not sent */
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/icon", "{}").status == 400);
+            int64_t c1 = num_of(pond.call(&ann, "GET", "/pond/v1/info").body, "cursor");
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/icon", "{\"hash\":\"" + H + "\"}").status == 204);
+            CHECK(has(pond.call(&eve, "GET", "/pond/v1/info").body, "\"icon\":" + avatar));
+            a = pond.call(&eve, "GET", "/pond/v1/events?after=" + std::to_string(c1));
+            CHECK(has(a.body, "\"kind\":\"pond\"") && has(a.body, "\"icon\":" + avatar));
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/icon", "{\"hash\":null}").status == 204);
+            CHECK(has(pond.call(&eve, "GET", "/pond/v1/info").body, "\"icon\":null"));
+            const std::string gif = std::string("GIF89a") + std::string(50, 'g'), file = pond.dir + "/icon.gif";
+            FILE *f = fopen(file.c_str(), "wb");
+            CHECK(f && fwrite(gif.data(), 1, gif.size(), f) == gif.size() && fclose(f) == 0);
+            CHECK(pond.ctl("icon " + file) == 0);
+            CHECK(has(pond.call(&eve, "GET", "/pond/v1/info").body, "\"icon\":{\"hash\":\"" + sha256_hex(gif) + "\",\"mime\":\"image/gif\""));
+            a = pond.call(&eve, "GET", "/pond/v1/pictures/" + sha256_hex(gif));
+            CHECK(a.status == 200 && a.body == gif);
+            CHECK(pond.ctl("icon /no/such/file", &out) != 0);
+            CHECK(pond.ctl("log", &out) == 0 && has(out, "set_icon"));
+        }
 
         /* taking a role away, and the record */
         CHECK(pond.ctl("member role " + ann.id + " member --yes") == 0);

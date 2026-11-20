@@ -24,7 +24,7 @@ info:
     additions a Pond has (`protocol`, `features`). A change an older Puddle would misread gets new paths, /pond/v2.
 
     Only GET and POST are used. Bodies are JSON, up to 32 KiB, except a send (64 KiB), beginning a file (256 KiB), and a
-    file's chunk, which is its bytes (up to 1 MiB).
+    file's chunk or a picture, which are their bytes (up to 1 MiB).
 servers:
   - url: https://pond.example.org
 paths:
@@ -207,6 +207,42 @@ paths:
         "400": { description: "`bad_chunk`: no such chunk, the wrong length, or not the bytes it should be" }
         "404": { description: "`no_file`: not begun" }
         "429": { description: "`slow_down`" }
+  /pond/v1/pictures:
+    post:
+      summary: Send a picture, for the member's profile (or, by an administrator, for the Pond's icon)
+      description: |
+        Protocol 6, feature `pictures` (docs/design.md, "Pictures"). The body is the image's bytes: PNG, JPEG, GIF or WebP,
+        judged by its first bytes, up to 1 MiB. It is kept once, by its SHA-256, the hash a Puddle names a picture by in a
+        profile; the member then names it in the profile they show the Pond (`POST /pond/v1/profile`), as `{hash, mime,
+        size}`. A picture nobody is shown is let go after a day. Counts against the member's rate for file chunks.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: {}
+      responses:
+        "200":
+          description: Kept
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PictureRef" }
+        "400": { description: "`bad_picture`: not an image of a kind the Pond takes" }
+        "429": { description: "`slow_down`" }
+  /pond/v1/pictures/{hash}:
+    get:
+      summary: A picture the members are shown
+      description: |
+        The Pond's icon, or a picture named in the profile of someone who is a member. A Puddle checks what it gets against the
+        `{hash, mime, size}` that named it before showing it. Anything else is `404` (`no_picture`), so a guessed hash says
+        nothing of what the Pond holds.
+      parameters:
+        - { name: hash, in: path, required: true, description: "The picture's SHA-256, hex", schema: { type: string, pattern: "^[0-9a-f]{64}$" } }
+      responses:
+        "200":
+          description: Its bytes
+          content:
+            application/octet-stream: {}
+        "404": { description: "`no_picture`" }
+        "429": { description: "`slow_down`" }
   /pond/v1/events:
     get:
       summary: What happened after an event, waiting for something to happen
@@ -362,6 +398,20 @@ paths:
       description: "For operators and administrators; to anyone else, every /pond/v1/admin route is a `404` like any refusal."
       requestBody: { content: { application/json: { schema: { type: object, properties: { name: { type: string }, description: { type: string } } } } } }
       responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" } }
+  /pond/v1/admin/icon:
+    post:
+      summary: Set the Pond's icon, or take it away
+      description: |
+        Protocol 6, feature `pictures`. `hash` names a picture sent first (`POST /pond/v1/pictures`); `null` leaves the Pond
+        with none. Every member hears of it in a `pond` event, whose `icon` changes.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hash]
+              properties: { hash: { oneOf: [{ type: string, pattern: "^[0-9a-f]{64}$" }, { type: "null" }] } }
+      responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" } }
   /pond/v1/admin/channels/create:
     post:
       summary: Make a channel
@@ -473,7 +523,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `voice`: voice channels (docs/voice.md). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -523,6 +573,11 @@ components:
           description: The Pond's sealing key (X25519), hex (protocol 5), which members seal their requests to. An invite's `k`.
         name: { type: string }
         description: { type: string }
+        icon:
+          description: The Pond's icon (protocol 6, feature `pictures`), fetched from `/pond/v1/pictures/{hash}`; null for none
+          oneOf:
+            - { $ref: "#/components/schemas/PictureRef" }
+            - type: "null"
         files:
           type: object
           description: What members may send, with `files` in `features`
@@ -530,6 +585,13 @@ components:
             max_size: { type: integer, description: "The largest file, in bytes; 0 means the admin has turned files off" }
             chunk_size: { type: integer, description: "1048576" }
             per_message: { type: integer, description: "10" }
+    PictureRef:
+      type: object
+      description: A picture, as a profile names one (Puddle's api/wire/profile.yaml)
+      properties:
+        hash: { type: string, pattern: "^[0-9a-f]{64}$", description: "The SHA-256 of its bytes, hex" }
+        mime: { enum: [image/png, image/jpeg, image/gif, image/webp] }
+        size: { type: integer, maximum: 1048576 }
     Member:
       type: object
       properties:

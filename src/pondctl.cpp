@@ -17,6 +17,7 @@
 
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@ static const char USAGE[] =
     "  init <name>                          make the key and the database tables, and name the Pond\n"
     "  info                                 the Pond's id, link address, certificate and counts\n"
     "  name <name> [--description <text>]\n"
+    "  icon <picture file>|off             the Pond's icon: a PNG, JPEG, GIF or WebP of at most 1 MiB\n"
     "  channel create <name> [--voice] [--topic <text>]   --voice: a voice channel (docs/voice.md)\n"
     "  channel list\n"
     "  channel rename <name> <new name>\n"
@@ -263,6 +265,23 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
         if (description != "\x01")
             d = description;
         return done(sync_wait(svc.set_name(args[0], d)));
+    }
+    if (cmd == "icon") {
+        if (args.size() != 1)
+            return usage();
+        if (args[0] == "off")
+            return done(sync_wait(svc.set_icon(std::nullopt)));
+        std::ifstream in(args[0], std::ios::binary);
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()), hash;
+        if (!in.good() && !in.eof())
+            return die("cannot read " + args[0]);
+        Outcome o = svc.store_picture(bytes, hash);
+        if (!o.empty())
+            return die(o);
+        Outcome set = sync_wait(svc.set_icon(hash));
+        if (set.empty())
+            sync_wait(svc.log_admin("pondctl", "set_icon", "", hash));
+        return done(set);
     }
     if (cmd == "channel") {
         args.erase(args.begin());

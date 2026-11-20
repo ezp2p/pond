@@ -19,7 +19,8 @@ This first cut does text channels, and files in messages (see "Files"). Voice ch
   other about new events, or share rate limits. Until then the events table is the only way news travels.
 
 The Pond's own files live in `data_dir`. They are its key (`pond.key`, mode 0600), the TLS certificate and key
-(`cert.pem`, `key.pem`), and the files members send (`files/`, see "Files"). The certificate is made self-signed on first start, as a Puddle does, unless the operator has
+(`cert.pem`, `key.pem`), the files members send (`files/`, see "Files"), and pictures (`pictures/`: the icon and members'
+profile pictures, see "Pictures"). The certificate is made self-signed on first start, as a Puddle does, unless the operator has
 put their own there.
 
 The Pond is its own program and shares no code with Puddle. What the two must agree on is the protocol (see
@@ -131,6 +132,8 @@ one held.
 | `POST /pond/v1/files/{file}/chunks/{n}` | One chunk's bytes |
 | `GET /pond/v1/files/{file}/chunks` | A file's chunk hashes, as bytes |
 | `GET /pond/v1/files/{file}/chunks/{n}` | One chunk, as bytes |
+| `POST /pond/v1/pictures` | A picture's bytes, for the member's profile: answers `{hash, mime, size}` (see "Pictures") |
+| `GET /pond/v1/pictures/{hash}` | A picture the members are shown: the icon, or one in a member's profile |
 
 Message text is 1 to 4000 characters, with surrounding whitespace removed, or may be empty when the message carries
 files. `nonce` is up to 32 characters chosen by
@@ -146,7 +149,7 @@ Every change the members need to hear about is a row in the `events` table, with
 - `channel_deleted`: a channel was deleted (`{id}`).
 - `member`: someone joined or changed their profile, which is the member.
 - `member_left`: someone left or was removed (`{id}`).
-- `pond`: the Pond's name or description changed, or the admin changed what files may be sent.
+- `pond`: the Pond's name, description or icon changed, or the admin changed what files may be sent.
 - `voice`, `voice_left`: someone came into a voice channel, changed how they are in it, or left ([voice.md](voice.md)).
 
 A member's Puddle holds one request open on `/pond/v1/events?after=<cursor>` at a time. The Pond answers as soon as
@@ -277,6 +280,34 @@ first, and anything larger, or in older messages, when the owner asks. This is d
 - **Bandwidth per Pond.** The rate limit is per member. A Pond with many members can still use all of its uplink; a
   total limit, or a queue, may be needed.
 
+## Pictures
+
+A Pond has an icon, shown on its button in each member's window, and members show the pictures in the profile they chose for
+it (avatar, banner, background), as friends do between Puddles. Both are **pictures**: an image of at most 1 MiB, PNG,
+JPEG, GIF or WebP (judged by its first bytes), kept once in `data_dir/pictures/<sha256>`.
+
+The hash is the one a Puddle already names a picture by in a profile (Puddle's `docs/profiles.md`: `{hash, mime, size}`), so
+nothing new is said in a profile:
+
+1. A member's Puddle sends each picture of the profile it shows this Pond: `POST /pond/v1/pictures` with the bytes. The Pond
+   answers `{hash, mime, size}`; one it has already costs nothing to send again.
+2. It then shows the Pond the profile, naming the pictures as it would to a friend (`POST /pond/v1/profile`, or the join).
+3. Every other member's Puddle fetches a picture it does not hold with `GET /pond/v1/pictures/{hash}`, checks the hash, size
+   and kind against what the profile said, and keeps it with its friends' pictures.
+
+The icon is set by an operator or administrator from the app (`POST /pond/v1/admin/icon {hash}`, a picture sent first, or
+`{hash: null}` for none), or by `pondctl icon <file>` (`pondctl icon off`). It is kept as the setting `icon`, and said in
+the `pond` object of `/info` and of the `pond` event as `icon: {hash, mime, size}` (or `null`), so every member's Puddle
+hears of a change at once.
+
+A member may fetch only a picture that is shown: the icon, or one named in the profile of someone who is a member now.
+Anything else is `404 no_picture`, so a guessed hash says nothing of what the Pond holds. A picture nobody is shown is let go
+an hour or so after it is a day old (sent and never used, or replaced). Sending and fetching count against the member's
+rate for file chunks.
+
+Why not files: a file is chunked, held by the messages that carry it, and limited by the admin's `files.max_size`, which
+may be off. A picture is small, one request, and must work on a Pond that takes no files.
+
 ## Roles: operators and administrators
 
 Besides the person with a shell on the server (who runs `pondctl`), a Pond has members it trusts to run it from inside
@@ -329,6 +360,7 @@ member without one gets the same `404` as any refusal.
 | Route | Does |
 |---|---|
 | `POST /pond/v1/admin/pond` | `{name?, description?}` |
+| `POST /pond/v1/admin/icon` | `{hash}`: a picture sent first, or `null` for no icon (see "Pictures") |
 | `POST /pond/v1/admin/channels/create` | `{name, topic?}` |
 | `POST /pond/v1/admin/channels/{channel}/edit` | `{name?, topic?}` |
 | `POST /pond/v1/admin/channels/{channel}/delete` | |
@@ -360,7 +392,7 @@ gain `role` (`operator`, `administrator` or `member`), and `/info` gains `offer`
 
 | Table | Columns |
 |---|---|
-| `settings` | `name`, `value`: the Pond's name and description, `files.max_size`, and `event_lock` (see "Events") |
+| `settings` | `name`, `value`: the Pond's name and description, its `icon` (a picture's hash), `files.max_size`, and `event_lock` (see "Events") |
 | `schema_version` | `version`: which of `db.cpp`'s steps have been run |
 | `channels` | `id`, `name`, `topic`, `position`, `created_ms`, `deleted`, `kind` (`text` or `voice`) |
 | `members` | `id` (user id), `sign_pub`, `kid`, `chain`, `profile` (JSON), `joined_ms`, `left_ms` |
@@ -384,6 +416,7 @@ can read them.
 ```
 pondctl [-c pond.yaml] init <name>              make the key and the database tables, and name the Pond
 pondctl name <name> [--description <text>]
+pondctl icon <picture file>|off                 the Pond's icon (see "Pictures")
 pondctl channel create <name> [--voice] [--topic <text>]   --voice: a voice channel
 pondctl channel list
 pondctl channel rename <name> <new name>
@@ -443,7 +476,7 @@ the protocol, not the version of either program.
 - Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
   it does not know, so an older Puddle keeps working with a newer Pond.
 - `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
-  of optional parts this Pond has (`files`, `roles`, `receipts`). A Puddle checks these before using an addition, rather than guessing from
+  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `voice`). A Puddle checks these before using an addition, rather than guessing from
   a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
 
 A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.
@@ -451,7 +484,7 @@ A Puddle records what each Pond says on every `/info`, so it notices when a Pond
 ## Limits
 
 - Requests that fail any check get `404`.
-- Bodies are up to 32 KiB, apart from a send (64 KiB), beginning a file (256 KiB) and a file chunk (1 MiB). A
+- Bodies are up to 32 KiB, apart from a send (64 KiB), beginning a file (256 KiB), and a file chunk or a picture (1 MiB). A
   profile is up to 16 KiB of JSON, and is stored as received, apart from that limit and being a JSON object.
 - Connections are not limited by `pondd` beyond Drogon's default (100,000) and the open-file limit it is given. Each
   member's Puddle holds one open nearly all the time.

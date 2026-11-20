@@ -66,7 +66,7 @@ static Outcome refused(const DrogonDbException &e)
 }
 
 Service::Service(DbPtr db, PondKey key, std::string data_dir, trantor::EventLoop *timers)
-    : db_(std::move(db)), key_(std::move(key)), files_dir_(data_dir + "/files"), timers_(timers)
+    : db_(std::move(db)), key_(std::move(key)), files_dir_(data_dir + "/files"), pictures_dir_(data_dir + "/pictures"), timers_(timers)
 {
 }
 
@@ -147,13 +147,17 @@ Task<std::string> Service::member_json_of(DbPtr db, std::string id)
 
 Task<std::string> Service::pond_json(DbPtr db)
 {
-    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size')");
-    std::string name, description, max = std::to_string(FILES_DEFAULT_MAX);
+    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon')");
+    std::string name, description, max = std::to_string(FILES_DEFAULT_MAX), icon_hash;
     for (const auto &row : r)
-        (text(row[0]) == "name" ? name : text(row[0]) == "description" ? description : max) = text(row[1]);
+        (text(row[0]) == "name" ? name : text(row[0]) == "description" ? description : text(row[0]) == "icon" ? icon_hash : max) = text(row[1]);
+    /* the icon (docs/design.md, "Pictures"): {hash, mime, size}, or null when there is none (or its file went) */
+    std::string icon = "null";
+    if (!icon_hash.empty() && !picture_ref(icon_hash, icon))
+        icon = "null";
     /* what members may send: "files" (docs/design.md, "Files"); max_size 0 is files turned off */
     co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"seal_key\":" + jstr(hex(key_.seal_pub, 32)) + ",\"name\":" + jstr(name) + ",\"description\":" + jstr(description) +
-              ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
+              ",\"icon\":" + icon + ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
               std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "}}";
 }
 
@@ -635,6 +639,7 @@ Task<> Service::tick()
             next_prune_ = now_ms() + 3600 * 1000;
             co_await db_->execSqlCoro("DELETE FROM events WHERE ts_ms < ?", now_ms() - EVENTS_KEEP_MS);
             co_await sweep_files();
+            co_await sweep_pictures();
         }
         Result r = co_await db_->execSqlCoro("SELECT COALESCE(MAX(id), 0), COALESCE(MIN(id), 0) FROM events");
         {
