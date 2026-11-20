@@ -181,6 +181,34 @@ int main()
     CHECK(until([&] { return has(ben.get(P), "Ann (work)"); }));
     CHECK(ann.post(P + "/profile", "{\"profile\":\"nope\"}") == 404);
 
+    /* ---- pictures (docs/design.md, "Pictures"): Ann's profile picture reaches Ben through the Pond, and the icon an
+     * administrator sets from the app reaches everyone. Skipped with a puddled from before pictures in Ponds. ---- */
+    if (!has(ann.get("/api/v1/ponds"), "\"icon\":")) {
+        printf("e2e_test: pictures skipped (this puddled does not show Ponds' pictures)\n");
+    } else {
+        std::string png = std::string("\x89PNG\r\n\x1a\n", 8) + std::string(2000, 'a'), big = std::string("\x89PNG\r\n\x1a\n", 8) + std::string(1 << 20, 'b');
+        CHECK(ann.post("/api/v1/media/upload", png, &out) == 201);
+        std::string hash = str_of(out, "hash");
+        CHECK(hash == sha256_hex(png));
+        CHECK(ann.post("/api/v1/profiles/work/edit", "{\"avatar\":\"" + hash + "\"}") == 200);
+        CHECK(until([&] { return has(ben.get(P), "\"avatar\":{\"hash\":\"" + hash + "\""); })); /* Ann's Puddle sent it */
+        CHECK(until([&] { return ben.get("/api/v1/media?hash=" + hash) == png; }));               /* and Ben's fetched it */
+
+        /* the icon: a picture this Puddle holds, sent to the Pond and named; refused to someone without a role */
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":\"" + hash + "\"}", &out) == 409 && has(out, "no_role"));
+        CHECK(pond.ctl("member offer Ann administrator --yes") == 0);
+        CHECK(until([&] { return has(ann.get(P), "\"offer\":{"); }));
+        CHECK(ann.post(P + "/offer/accept", "", &out) == 200);
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":\"" + std::string(64, 'c') + "\"}", &out) == 404 && has(out, "no_picture"));
+        CHECK(ann.post("/api/v1/media/upload", big, &out) == 201);
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":\"" + str_of(out, "hash") + "\"}", &out) == 409 && has(out, "too_large"));
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":\"" + hash + "\"}", &out) == 204);
+        CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"icon\":{\"hash\":\"" + hash + "\""); }));
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":null}", &out) == 204);
+        CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"icon\":null"); }));
+        CHECK(pond.ctl("member role Ann member --yes") == 0);
+    }
+
     /* ---- voice channels (docs/voice.md): two Puddles join one through their owner API, connect to the Pond, and each sees
      * the other in it; muting is heard of; leaving. Skipped with a puddled from before voice, or one built without calls. ---- */
     if (!has(ann.get("/api/v1/voice"), "\"voice\"") || has(ann.get("/api/v1/calls"), "\"version\":0,")) {
