@@ -122,16 +122,6 @@ static std::string when(int64_t ms)
     return buf;
 }
 
-/* An invite carries the Pond's sealing key, `k` (spec/09, "First contact"): the join is sealed to it, so nothing in it can be
- * read on the way, whatever carries it. */
-static std::string link_for(const Config &cfg, const PondKey &key, const std::string &token)
-{
-    std::string a = link_address(cfg);
-    if (a.size() > 4 && a.compare(a.size() - 4, 4, ":443") == 0)
-        a.resize(a.size() - 4);
-    return "pond://" + a + "?invite=" + token + "&k=" + base32(key.seal_pub, 32);
-}
-
 /* `--name value` options after the positional words; false if one is unknown or has no value. */
 static bool options(std::vector<std::string> &args, std::vector<std::pair<std::string, std::string *>> known)
 {
@@ -226,6 +216,9 @@ int main(int argc, char **argv)
     if (!migrate(db, err))
         return die(err);
     Service svc(db, key, cfg.data_dir);
+    /* invites carry the Pond's sealing key, `k` (spec/09, "First contact"): the join is sealed to it, so nothing in it can be
+     * read on the way, whatever carries it */
+    svc.link_address = link_address(cfg);
     svc.voice_on = cfg.voice.on && Voice::built();
     try {
         return run(cfg, svc, db, key, cmd, sub, args);
@@ -321,7 +314,7 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
             Outcome o = sync_wait(svc.invite_create(n, until, token));
             if (!o.empty())
                 return die(o);
-            printf("%s\n", link_for(cfg, key, *token).c_str());
+            printf("%s\n", svc.invite_link(*token).c_str());
             fprintf(stderr, "%s, %s\n", n ? (std::to_string(n) + (n == 1 ? " use" : " uses")).c_str() : "unlimited uses",
                     until ? ("expires " + when(until)).c_str() : "never expires");
             return 0;

@@ -50,6 +50,8 @@ const char *role_name(Role r);
 std::optional<Role> role_of_name(const std::string &s);
 constexpr int64_t OFFER_KEEP_MS = 7LL * 24 * 3600 * 1000;
 constexpr size_t BAN_REASON_MAX = 500;
+constexpr int INVITE_USES_MAX = 1000000;
+constexpr int64_t INVITE_EXPIRY_MAX_MS = 10LL * 366 * 24 * 3600 * 1000; /* made from the app: at most ten years ahead */
 
 /* Files (docs/design.md, "Files"): split into chunks of FILE_CHUNK bytes as a Puddle splits them, so a file has the same id in
  * a Pond as in a Puddle. How large a file may be is the admin's choice (`pondctl files max-size`), up to FILE_HARD_MAX. */
@@ -108,6 +110,10 @@ public:
     Service(DbPtr db, PondKey key, std::string data_dir, trantor::EventLoop *timers = nullptr);
     const PondKey &key() const { return key_; }
     int wait_ms = 25000; /* how long events() holds a request */
+    /* host[:port] invite links name (pond.yaml's `address`): set by pondd and pondctl */
+    std::string link_address;
+    /* The link to give out for an invite: pond://<address>?invite=<token>&k=<the sealing key> */
+    std::string invite_link(const std::string &token) const;
 
     /* ---- for the routes ---- */
 
@@ -144,6 +150,11 @@ public:
     Task<Answer> admin_channel_delete(std::string by, int64_t channel);
     Task<Answer> admin_remove(std::string by, std::string member, bool ban, std::string reason);
     Task<Answer> admin_bans();
+    /* Invites from the app (docs/design.md, "Invite links"): those that can still be used; one made with `max_uses` (0: no
+     * limit) and `expires_ms` (0: never); one revoked. */
+    Task<Answer> admin_invites();
+    Task<Answer> admin_invite_create(std::string by, int max_uses, int64_t expires_ms);
+    Task<Answer> admin_invite_revoke(std::string by, std::string token);
     Task<Answer> admin_unban(std::string by, std::string member);
 
     /* Pictures (pictures.cpp): keep one a member sends, answering {hash, mime, size}; give one that is shown to the members (the

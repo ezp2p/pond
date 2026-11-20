@@ -388,6 +388,40 @@ int main()
             CHECK(pond.ctl("log", &out) == 0 && has(out, "set_icon"));
         }
 
+        /* ---- invites from the app: made with uses and an expiry, listed while they can be used, revoked ---- */
+        {
+            CHECK(pond.call(&eve, "GET", "/pond/v1/admin/invites").status == 404); /* no role */
+            CHECK(pond.call(&eve, "POST", "/pond/v1/admin/invites/create", "{}").status == 404);
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/invites/create", "{\"uses\":0}").status == 400);
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/invites/create", "{\"uses\":\"two\"}").status == 400);
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/invites/create", "{\"expires\":1000}").status == 400); /* long past */
+            int64_t soon = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + 3600 * 1000;
+            a = pond.call(&ann, "POST", "/pond/v1/admin/invites/create", "{\"uses\":1,\"expires\":" + std::to_string(soon) + "}");
+            CHECK(a.status == 200 && has(a.body, "\"uses\":0") && has(a.body, "\"max_uses\":1") && has(a.body, "\"expires\":" + std::to_string(soon)));
+            std::string token = parse(a.body)["token"].asString(), link = parse(a.body)["link"].asString();
+            CHECK(token.size() == 26 && link == "pond://127.0.0.1:" + std::to_string(pond.port) + "?invite=" + token + "&k=" + base32(pond.seal_pub, 32));
+            a = pond.call(&dan, "POST", "/pond/v1/admin/invites/create", "{\"uses\":null,\"expires\":null}"); /* an operator too; forever */
+            CHECK(a.status == 200 && has(a.body, "\"max_uses\":null") && has(a.body, "\"expires\":null"));
+            std::string forever = parse(a.body)["token"].asString();
+            a = pond.call(&ann, "GET", "/pond/v1/admin/invites");
+            CHECK(a.status == 200 && has(a.body, token) && has(a.body, forever) && has(a.body, "\"link\":\"pond://"));
+            /* used up: it works once, then is no longer listed */
+            Identity fay;
+            CHECK(pond.call(&fay, "POST", "/pond/v1/join", join_body(fay, token, "Fay"), "*").status == 200);
+            CHECK(!has(pond.call(&ann, "GET", "/pond/v1/admin/invites").body, token));
+            /* revoked: refused at the door, gone from the list, and revoking again is 404 */
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/invites/" + forever + "/revoke").status == 204);
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/invites/" + forever + "/revoke").status == 404);
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/invites/aaaaaaaaaaaaaaaaaaaaaaaaaa/revoke").status == 404);
+            CHECK(pond.call(&ann, "POST", "/pond/v1/admin/invites/short/revoke").status == 404);
+            Identity gus;
+            CHECK(pond.call(&gus, "POST", "/pond/v1/join", join_body(gus, forever, "Gus"), "*").status == 404);
+            CHECK(!has(pond.call(&ann, "GET", "/pond/v1/admin/invites").body, forever));
+            CHECK(pond.ctl("log", &out) == 0 && has(out, "invite_create") && has(out, "invite_revoke"));
+            CHECK(pond.ctl("invite create", &out) == 0 && has(out, "pond://127.0.0.1:" + std::to_string(pond.port) + "?invite=")); /* pondctl's still */
+            CHECK(pond.call(&fay, "POST", "/pond/v1/leave").status == 204);
+        }
+
         /* taking a role away, and the record */
         CHECK(pond.ctl("member role " + ann.id + " member --yes") == 0);
         CHECK(pond.call(&ann, "GET", "/pond/v1/admin/bans").status == 404);

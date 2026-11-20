@@ -56,7 +56,8 @@ pond://203.0.113.7:8443?invite=...
 - The address part follows the same rules as a Puddle address: a host or IP, the port defaulting to 443, and no path.
 - The token is 26 characters of base32 (16 random bytes), the same form as a Puddle invite.
 - `pondctl invite create` makes an invite. It can have a number of uses (`--uses 10`), an expiry (`--expires 7d`, or a
-  date), both, or neither, in which case it lasts until revoked.
+  date), both, or neither, in which case it lasts until revoked. Operators and administrators make, list and revoke them
+  from the app too (`/pond/v1/admin/invites`, below), each answered with its link.
 - Joining spends one use. Someone who is already a member spends nothing.
 - A used-up, expired, revoked or unknown token is answered `404`, like any other failed check, so a guessed token
   tells the guesser nothing.
@@ -368,6 +369,9 @@ member without one gets the same `404` as any refusal.
 | `POST /pond/v1/admin/members/{member}/ban` | `{reason?}`: out, and refused if they try to join again |
 | `GET /pond/v1/admin/bans` | Who is banned, by whom, when and why |
 | `POST /pond/v1/admin/bans/{member}/unban` | |
+| `GET /pond/v1/admin/invites` | The invites that can still be used, each with its link |
+| `POST /pond/v1/admin/invites/create` | `{uses?, expires?}` (ms): answers the invite, with its link |
+| `POST /pond/v1/admin/invites/{token}/revoke` | It stops working at once |
 
 Rank decides who may act on whom: an operator on administrators and members, an administrator on members only.
 Nobody acts on an operator from the app (only `pondctl` can), and nobody on themselves. Each of these goes in

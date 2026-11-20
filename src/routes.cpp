@@ -30,13 +30,14 @@ static const Answer NOT_FOUND = {UNKNOWN, ""};
 enum Kind {
     JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
     VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET,
-    ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN, NONE
+    ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN,
+    ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, NONE
 };
 
 /* The routes only an operator or administrator may use (docs/design.md, "Roles"). */
 static bool is_admin(int k)
 {
-    return k >= ADMIN_POND && k <= ADMIN_UNBAN;
+    return k >= ADMIN_POND && k <= ADMIN_INVITE_REVOKE;
 }
 
 /* A user id: 52 of base32. */
@@ -59,6 +60,8 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
     if (post && p == "icon") return ADMIN_ICON;
     if (post && p == "channels/create") return ADMIN_CHANNEL_CREATE;
     if (get && p == "bans") return ADMIN_BANS;
+    if (get && p == "invites") return ADMIN_INVITES;
+    if (post && p == "invites/create") return ADMIN_INVITE_CREATE;
     auto split = [&](std::string_view prefix, std::string_view &id, std::string_view &verb) {
         if (p.substr(0, prefix.size()) != prefix)
             return false;
@@ -82,6 +85,10 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
     if (post && split("bans/", id, verb) && user_id_ok(id) && verb == "unban") {
         member = std::string(id);
         return ADMIN_UNBAN;
+    }
+    if (post && split("invites/", id, verb) && token_ok(std::string(id)) && verb == "revoke") {
+        member = std::string(id); /* the invite's token */
+        return ADMIN_INVITE_REVOKE;
     }
     return NONE;
 }
@@ -166,7 +173,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 /* Routes whose body is a JSON object. FILE_PUT's is a chunk's bytes, and PICTURE_PUT's a picture's. */
 static bool takes_body(Kind k)
 {
-    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON ||
+    return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH;
 }
@@ -514,6 +521,26 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         co_return co_await svc_.admin_bans();
     case ADMIN_UNBAN:
         co_return co_await svc_.admin_unban(sender, member);
+    case ADMIN_INVITES:
+        co_return co_await svc_.admin_invites();
+    case ADMIN_INVITE_CREATE: {
+        /* {uses?: how many may join with it, expires?: when it stops working (ms)}; neither, and it lasts until revoked */
+        int uses = 0;
+        int64_t expires = 0;
+        if (json.isMember("uses") && !json["uses"].isNull()) {
+            if (!json["uses"].isInt() || json["uses"].asInt() < 1)
+                co_return fail(400, "bad_request");
+            uses = json["uses"].asInt();
+        }
+        if (json.isMember("expires") && !json["expires"].isNull()) {
+            if (!json["expires"].isInt64() || json["expires"].asInt64() < 1)
+                co_return fail(400, "bad_request");
+            expires = json["expires"].asInt64();
+        }
+        co_return co_await svc_.admin_invite_create(sender, uses, expires);
+    }
+    case ADMIN_INVITE_REVOKE:
+        co_return co_await svc_.admin_invite_revoke(sender, member);
     case NONE:
         break;
     }

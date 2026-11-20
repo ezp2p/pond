@@ -468,6 +468,42 @@ paths:
                         reason: { type: string }
                         ts: { type: integer }
                         profile: { $ref: "#/components/schemas/Profile" }
+  /pond/v1/admin/invites:
+    get:
+      summary: The invites that can still be used
+      description: Not used up, not expired and not revoked, newest first (at most 500). Those `pondctl` made too.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { invites: { type: array, items: { $ref: "#/components/schemas/Invite" } } } }
+  /pond/v1/admin/invites/create:
+    post:
+      summary: Make an invite
+      description: |
+        `uses`: how many may join with it (1 to 1000000); `expires`: when it stops working, in ms since 1970 (in the future,
+        and at most ten years ahead). Either, both or neither: an invite with neither lasts until revoked.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                uses: { oneOf: [{ type: integer, minimum: 1, maximum: 1000000 }, { type: "null" }] }
+                expires: { oneOf: [{ type: integer }, { type: "null" }] }
+      responses:
+        "200": { description: Made, content: { application/json: { schema: { $ref: "#/components/schemas/Invite" } } } }
+        "400": { description: "`bad_request`" }
+  /pond/v1/admin/invites/{token}/revoke:
+    post:
+      summary: Revoke an invite
+      description: It stops working at once. Those who joined with it stay.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string, pattern: "^[a-z2-7]{26}$" } }
+      responses:
+        "204": { description: Revoked }
+        "404": { description: "`no_invite`: no such invite, or revoked already" }
   /pond/v1/admin/bans/{member}/unban:
     post:
       summary: Lift a ban
@@ -585,6 +621,15 @@ components:
             max_size: { type: integer, description: "The largest file, in bytes; 0 means the admin has turned files off" }
             chunk_size: { type: integer, description: "1048576" }
             per_message: { type: integer, description: "10" }
+    Invite:
+      type: object
+      properties:
+        token: { type: string, pattern: "^[a-z2-7]{26}$" }
+        link: { type: string, description: "What to give out: pond://<address>?invite=<token>&k=<the sealing key>" }
+        uses: { type: integer, description: How many have joined with it }
+        max_uses: { oneOf: [{ type: integer }, { type: "null" }], description: "How many may; null: no limit" }
+        expires: { oneOf: [{ type: integer }, { type: "null" }], description: "When it stops working (ms); null: never" }
+        created: { type: integer, description: ms }
     PictureRef:
       type: object
       description: A picture, as a profile names one (Puddle's api/wire/profile.yaml)
