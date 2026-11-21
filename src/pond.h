@@ -57,6 +57,7 @@ constexpr size_t DM_PIECE_MAX = DM_CHUNK + 1024;       /* sealed, as records of 
 constexpr int64_t DM_FILES_DEFAULT_MAX = 25LL << 20;
 constexpr int64_t DM_FILES_HARD_MAX = 4LL << 30;
 constexpr int64_t DM_PRESENT_MS = 15 * 1000;           /* a Puddle that asked for events this recently is following */
+constexpr int JOIN_TRIES = 5;                            /* a join that met others at the same moment is tried this often */
 constexpr size_t DM_INBOX_MAX = 500;                   /* waiting to go to one member's Puddle, in memory */
 constexpr size_t DM_AWAITING_MAX = 1000;               /* senders waiting for one member to be back */
 constexpr size_t DM_NEW_PER_DAY = 20;                  /* new people one member may write to in a day */
@@ -302,6 +303,7 @@ private:
     void forget_dms(const std::string &member);
     Task<std::string> may_write(std::string from, std::string to);
     Task<Answer> enter(Chain chain, std::string invite, std::string profile);
+    Task<Answer> enter_once(Chain chain, std::string invite, std::string profile); /* status 0: met another join, try again */
     Task<int64_t> add_event(TxPtr tx, const char *kind, std::string data, std::string only_for = "");
     Task<std::string> offer_json(std::string member);
     /* May `by` act on `target`? "" if so, else the error code. */

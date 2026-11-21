@@ -99,6 +99,31 @@ int main()
     CHECK(pond.call(&dan, "POST", "/pond/v1/join", join_body(dan, forever, "Dan"), "*").status == 404); /* revoked */
     CHECK(pond.ctl("invite list", &out) == 0 && has(out, "used up") && has(out, "revoked") && has(out, "expired"));
 
+    /* many at the same moment, with one invite: each is let in or turned away, never a 500 (they meet on the invite's row,
+     * and the database stops all but one: the others are tried again) */
+    {
+        const std::string many = invite(pond, ""), three = invite(pond, "--uses 3");
+        std::vector<Identity> crowd(12);
+        std::vector<int> got(crowd.size());
+        std::vector<std::thread> ts;
+        for (size_t i = 0; i < crowd.size(); i++)
+            ts.emplace_back([&, i] {
+                got[i] = pond.call(&crowd[i], "POST", "/pond/v1/join", join_body(crowd[i], i < 6 ? many : three, "Crowd"), "*").status;
+            });
+        for (auto &t : ts)
+            t.join();
+        int in = 0, turned = 0;
+        for (size_t i = 0; i < crowd.size(); i++) {
+            if (!(got[i] == 200 || (i >= 6 && got[i] == 404)))
+                fprintf(stderr, "join %zu: %d\n", i, got[i]);
+            CHECK(got[i] == 200 || (i >= 6 && got[i] == 404));
+            (got[i] == 200 ? in : turned)++;
+        }
+        CHECK(in == 6 + 3 && turned == 3); /* all six with the open invite, three of the six with the one good three times */
+        /* joins from strangers are limited (20 at once, then one each 100 ms): let the crowd's go by before the next */
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    }
+
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
     CHECK(num_of(a.body, "protocol") == 8 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));

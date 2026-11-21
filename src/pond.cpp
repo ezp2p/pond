@@ -4,10 +4,13 @@
 #include "json.h"
 #include "text.h"
 
+#include <drogon/HttpAppFramework.h>
 #include <drogon/orm/Exception.h>
+#include <drogon/utils/coroutine.h>
 #include <trantor/utils/Logger.h>
 
 #include <cctype>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -221,12 +224,32 @@ Task<Answer> Service::join(Chain chain, std::string invite, std::string profile)
     co_return co_await info(chain.id);
 }
 
+/* Joins at the same moment with the same invite wait on its row (enter_once). Should MariaDB still stop one ("record has
+ * changed since last read", 1020, or a deadlock, 1213), it is tried again a little later, seeing the uses already spent. */
 Task<Answer> Service::enter(Chain chain, std::string invite, std::string profile)
+{
+    for (int attempt = 1;; attempt++) {
+        Answer a = co_await enter_once(chain, invite, profile);
+        if (a.status != 0)
+            co_return a;
+        if (attempt == JOIN_TRIES) {
+            LOG_ERROR << "database: a join met others " << JOIN_TRIES << " times";
+            co_return fail(500, "database");
+        }
+        co_await drogon::sleepCoro(drogon::app().getLoop(), 0.005 * attempt * (1 + std::rand() % 4)); /* apart, not all at once again */
+    }
+}
+
+Task<Answer> Service::enter_once(Chain chain, std::string invite, std::string profile)
 {
     TxPtr tx;
     try {
         tx = co_await db_->newTransactionCoro();
-        Result r = co_await tx->execSqlCoro("SELECT left_ms FROM members WHERE id = ? FOR UPDATE", chain.id);
+        /* the invite's row first, locked: joins with the same invite go one at a time, and this is read as it is now, before
+         * anything else in the transaction fixes what it sees. The member's row is only read: locking one that isn't there
+         * yet would lock the gap it goes in, and two joins inserting into the same gap stop each other (a deadlock). */
+        co_await tx->execSqlCoro("SELECT 1 FROM invites WHERE token = ? FOR UPDATE", invite);
+        Result r = co_await tx->execSqlCoro("SELECT left_ms FROM members WHERE id = ?", chain.id);
         bool member = !r.empty() && r[0][0].isNull();
         int64_t now = now_ms();
         Result banned = co_await tx->execSqlCoro("SELECT 1 FROM bans WHERE member = ?", chain.id);
@@ -261,6 +284,9 @@ Task<Answer> Service::enter(Chain chain, std::string invite, std::string profile
     } catch (const DrogonDbException &e) {
         if (tx)
             tx->rollback();
+        const int why = sql_errno(e);
+        if (why == 1020 || why == 1213)
+            co_return Answer{0, ""};
         co_return server_error(e);
     }
 }
