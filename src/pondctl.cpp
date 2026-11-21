@@ -17,6 +17,7 @@
 
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@ static const char USAGE[] =
     "  init <name>                          make the key and the database tables, and name the Pond\n"
     "  info                                 the Pond's id, link address, certificate and counts\n"
     "  name <name> [--description <text>]\n"
+    "  icon <picture file>|off             the Pond's icon: a PNG, JPEG, GIF or WebP of at most 1 MiB\n"
     "  channel create <name> [--voice] [--topic <text>]   --voice: a voice channel (docs/voice.md)\n"
     "  channel list\n"
     "  channel rename <name> <new name>\n"
@@ -48,7 +50,10 @@ static const char USAGE[] =
     "  log [N]                                                the last N admin actions (20)\n"
     "    <member> is a user id, or part of a member's display name\n"
     "  files                                the largest file members may send, and the room files take\n"
-    "  files max-size <size>|off            e.g. 25M, 1G, 500K; off stops members sending files\n";
+    "  files max-size <size>|off            e.g. 25M, 1G, 500K; off stops members sending files\n"
+    "  dms                                  whether members may write to each other here, and the largest file\n"
+    "  dms on|off                           direct messages between members (relayed, never kept)\n"
+    "  dms files max-size <size>|off        the largest file a direct message may carry\n";
 
 static int usage()
 {
@@ -118,16 +123,6 @@ static std::string when(int64_t ms)
     char buf[32];
     strftime(buf, sizeof buf, "%Y-%m-%d %H:%M UTC", gmtime(&t));
     return buf;
-}
-
-/* An invite carries the Pond's sealing key, `k` (spec/09, "First contact"): the join is sealed to it, so nothing in it can be
- * read on the way, whatever carries it. */
-static std::string link_for(const Config &cfg, const PondKey &key, const std::string &token)
-{
-    std::string a = link_address(cfg);
-    if (a.size() > 4 && a.compare(a.size() - 4, 4, ":443") == 0)
-        a.resize(a.size() - 4);
-    return "pond://" + a + "?invite=" + token + "&k=" + base32(key.seal_pub, 32);
 }
 
 /* `--name value` options after the positional words; false if one is unknown or has no value. */
@@ -224,6 +219,9 @@ int main(int argc, char **argv)
     if (!migrate(db, err))
         return die(err);
     Service svc(db, key, cfg.data_dir);
+    /* invites carry the Pond's sealing key, `k` (spec/09, "First contact"): the join is sealed to it, so nothing in it can be
+     * read on the way, whatever carries it */
+    svc.link_address = link_address(cfg);
     svc.voice_on = cfg.voice.on && Voice::built();
     try {
         return run(cfg, svc, db, key, cmd, sub, args);
@@ -264,6 +262,23 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
             d = description;
         return done(sync_wait(svc.set_name(args[0], d)));
     }
+    if (cmd == "icon") {
+        if (args.size() != 1)
+            return usage();
+        if (args[0] == "off")
+            return done(sync_wait(svc.set_icon(std::nullopt)));
+        std::ifstream in(args[0], std::ios::binary);
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()), hash;
+        if (!in.good() && !in.eof())
+            return die("cannot read " + args[0]);
+        Outcome o = svc.store_picture(bytes, hash);
+        if (!o.empty())
+            return die(o);
+        Outcome set = sync_wait(svc.set_icon(hash));
+        if (set.empty())
+            sync_wait(svc.log_admin("pondctl", "set_icon", "", hash));
+        return done(set);
+    }
     if (cmd == "channel") {
         args.erase(args.begin());
         std::string topic;
@@ -302,7 +317,7 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
             Outcome o = sync_wait(svc.invite_create(n, until, token));
             if (!o.empty())
                 return die(o);
-            printf("%s\n", link_for(cfg, key, *token).c_str());
+            printf("%s\n", svc.invite_link(*token).c_str());
             fprintf(stderr, "%s, %s\n", n ? (std::to_string(n) + (n == 1 ? " use" : " uses")).c_str() : "unlimited uses",
                     until ? ("expires " + when(until)).c_str() : "never expires");
             return 0;
@@ -339,6 +354,25 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
             if (b < 0)
                 return die("a size is like 25M, 1G or 500K, or off");
             return done(sync_wait(svc.set_files_max(b)));
+        }
+        return usage();
+    }
+    if (cmd == "dms") {
+        if (!args.empty())
+            args.erase(args.begin());
+        if (sub.empty() && args.empty()) {
+            Service::DmSettings d = sync_wait(svc.dm_settings());
+            printf("direct messages  %s\nlargest file     %s\n", d.on ? "on" : "off",
+                   d.files_max ? size_text(d.files_max).c_str() : "off (no files in direct messages)");
+            return 0;
+        }
+        if ((sub == "on" || sub == "off") && args.empty())
+            return done(sync_wait(svc.set_dms(sub == "on", std::nullopt)));
+        if (sub == "files" && args.size() == 2 && args[0] == "max-size") {
+            int64_t b = parse_size(args[1]);
+            if (b < 0)
+                return die("a size is like 25M, 1G or 500K, or off");
+            return done(sync_wait(svc.set_dms(std::nullopt, b)));
         }
         return usage();
     }

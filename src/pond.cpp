@@ -4,10 +4,13 @@
 #include "json.h"
 #include "text.h"
 
+#include <drogon/HttpAppFramework.h>
 #include <drogon/orm/Exception.h>
+#include <drogon/utils/coroutine.h>
 #include <trantor/utils/Logger.h>
 
 #include <cctype>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -66,7 +69,7 @@ static Outcome refused(const DrogonDbException &e)
 }
 
 Service::Service(DbPtr db, PondKey key, std::string data_dir, trantor::EventLoop *timers)
-    : db_(std::move(db)), key_(std::move(key)), files_dir_(data_dir + "/files"), timers_(timers)
+    : db_(std::move(db)), key_(std::move(key)), files_dir_(data_dir + "/files"), pictures_dir_(data_dir + "/pictures"), timers_(timers)
 {
 }
 
@@ -80,14 +83,23 @@ static std::optional<std::string> nullable(const std::string &s)
     return s;
 }
 
-static const char MEMBER_COLS[] = "id, profile, joined_ms, role";
+static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until, dms";
 static const char CHANNEL_COLS[] = "id, name, topic, position, kind";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
+
+/* "muted": null, or {"until": ms, or null until they are unmuted} (docs/design.md, "Muting") */
+static std::string muted_json(const drogon::orm::Field &f)
+{
+    if (f.isNull() || (num(f) != 0 && num(f) <= now_ms()))
+        return "null";
+    return num(f) == 0 ? std::string("{\"until\":null}") : "{\"until\":" + std::to_string(num(f)) + "}";
+}
 
 static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
 {
     return "{\"id\":" + jstr(text(row[0])) + ",\"profile\":" + (row[1].isNull() ? std::string("null") : text(row[1])) +
-           ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + "}";
+           ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + ",\"muted\":" + muted_json(row[4]) +
+           ",\"dms\":" + (num(row[5]) ? "true" : "false") + "}";
 }
 
 static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
@@ -147,14 +159,23 @@ Task<std::string> Service::member_json_of(DbPtr db, std::string id)
 
 Task<std::string> Service::pond_json(DbPtr db)
 {
-    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size')");
-    std::string name, description, max = std::to_string(FILES_DEFAULT_MAX);
+    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon', 'dms', 'dms.files_max')");
+    std::map<std::string, std::string> v;
     for (const auto &row : r)
-        (text(row[0]) == "name" ? name : text(row[0]) == "description" ? description : max) = text(row[1]);
+        v[text(row[0])] = text(row[1]);
+    const std::string max = v.count("files.max_size") ? v["files.max_size"] : std::to_string(FILES_DEFAULT_MAX);
+    const std::string dm_max = v.count("dms.files_max") ? v["dms.files_max"] : std::to_string(DM_FILES_DEFAULT_MAX);
+    /* the icon (docs/design.md, "Pictures"): {hash, mime, size}, or null when there is none (or its file went) */
+    std::string icon = "null";
+    if (!v["icon"].empty() && !picture_ref(v["icon"], icon))
+        icon = "null";
+    /* direct messages (docs/dms.md): on or off, and the largest file one may carry (0: none) */
+    const std::string dms = std::string("{\"on\":") + (v["dms"] != "off" ? "true" : "false") + ",\"files_max\":" +
+                            std::to_string(strtoll(dm_max.c_str(), nullptr, 10)) + "}";
     /* what members may send: "files" (docs/design.md, "Files"); max_size 0 is files turned off */
-    co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"seal_key\":" + jstr(hex(key_.seal_pub, 32)) + ",\"name\":" + jstr(name) + ",\"description\":" + jstr(description) +
-              ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
-              std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "}}";
+    co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"seal_key\":" + jstr(hex(key_.seal_pub, 32)) + ",\"name\":" + jstr(v["name"]) + ",\"description\":" + jstr(v["description"]) +
+              ",\"icon\":" + icon + ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
+              std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "},\"dms\":" + dms + "}";
 }
 
 Task<std::string> Service::channels_json()
@@ -203,12 +224,32 @@ Task<Answer> Service::join(Chain chain, std::string invite, std::string profile)
     co_return co_await info(chain.id);
 }
 
+/* Joins at the same moment with the same invite wait on its row (enter_once). Should MariaDB still stop one ("record has
+ * changed since last read", 1020, or a deadlock, 1213), it is tried again a little later, seeing the uses already spent. */
 Task<Answer> Service::enter(Chain chain, std::string invite, std::string profile)
+{
+    for (int attempt = 1;; attempt++) {
+        Answer a = co_await enter_once(chain, invite, profile);
+        if (a.status != 0)
+            co_return a;
+        if (attempt == JOIN_TRIES) {
+            LOG_ERROR << "database: a join met others " << JOIN_TRIES << " times";
+            co_return fail(500, "database");
+        }
+        co_await drogon::sleepCoro(drogon::app().getLoop(), 0.005 * attempt * (1 + std::rand() % 4)); /* apart, not all at once again */
+    }
+}
+
+Task<Answer> Service::enter_once(Chain chain, std::string invite, std::string profile)
 {
     TxPtr tx;
     try {
         tx = co_await db_->newTransactionCoro();
-        Result r = co_await tx->execSqlCoro("SELECT left_ms FROM members WHERE id = ? FOR UPDATE", chain.id);
+        /* the invite's row first, locked: joins with the same invite go one at a time, and this is read as it is now, before
+         * anything else in the transaction fixes what it sees. The member's row is only read: locking one that isn't there
+         * yet would lock the gap it goes in, and two joins inserting into the same gap stop each other (a deadlock). */
+        co_await tx->execSqlCoro("SELECT 1 FROM invites WHERE token = ? FOR UPDATE", invite);
+        Result r = co_await tx->execSqlCoro("SELECT left_ms FROM members WHERE id = ?", chain.id);
         bool member = !r.empty() && r[0][0].isNull();
         int64_t now = now_ms();
         Result banned = co_await tx->execSqlCoro("SELECT 1 FROM bans WHERE member = ?", chain.id);
@@ -243,6 +284,9 @@ Task<Answer> Service::enter(Chain chain, std::string invite, std::string profile
     } catch (const DrogonDbException &e) {
         if (tx)
             tx->rollback();
+        const int why = sql_errno(e);
+        if (why == 1020 || why == 1213)
+            co_return Answer{0, ""};
         co_return server_error(e);
     }
 }
@@ -272,6 +316,9 @@ Task<Answer> Service::info(std::string member)
             features += (features.size() > 1 ? "," : "") + jstr(f);
         if (voice_now)
             features += ",\"voice\"";
+        const DmSettings dms = co_await dm_settings();
+        if (dms.on)
+            features += dms.files_max > 0 ? ",\"dms\",\"dm_files\"" : ",\"dms\"";
         /* each co_await on its own, then the text (docs/design.md, "Coroutines") */
         const std::string pond = co_await pond_json(db_);
         const std::string offer = co_await offer_json(member);
@@ -343,6 +390,8 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
             co_return fail(400, "bad_file");
     if (!send_limit_.take(member, now_ms()))
         co_return fail(429, "slow_down");
+    if (int64_t until = muted_until(member); until >= 0) /* muted: nothing they write is posted (docs/design.md, "Muting") */
+        co_return Answer{409, "{\"error\":\"muted\",\"until\":" + (until ? std::to_string(until) : std::string("null")) + "}"};
     TxPtr tx;
     try {
         Result live = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0", channel);
@@ -456,6 +505,7 @@ Task<Outcome> Service::remove_member(std::string id)
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);
+        forget_dms(id); /* nothing more is relayed to or from them */
         co_return "";
     } catch (const DrogonDbException &e) {
         if (tx)
@@ -521,36 +571,26 @@ Task<int64_t> Service::add_event(TxPtr tx, const char *kind, std::string data, s
     co_return (int64_t)r.insertId();
 }
 
-/* One request for events, waiting. Whoever sets `done` first (news, the time running out, or stopping) resumes it. */
-struct Service::Waiter {
-    int64_t after;
-    std::coroutine_handle<> h;
-    std::atomic<bool> done{false};
-    void wake()
-    {
-        if (!done.exchange(true))
-            h.resume();
-    }
-};
-
 struct Service::News {
     Service *s;
     int64_t after;
     double seconds;
+    std::string member;
 
     bool await_ready()
     {
         std::lock_guard<std::mutex> g(s->mu_);
-        return s->latest_ > after || s->stopping_;
+        return s->latest_ > after || s->stopping_ || s->has_inbox_locked(member);
     }
     bool await_suspend(std::coroutine_handle<> h)
     {
         auto w = std::make_shared<Waiter>();
         w->after = after;
+        w->member = member;
         w->h = h;
         {
             std::lock_guard<std::mutex> g(s->mu_);
-            if (s->latest_ > after || s->stopping_)
+            if (s->latest_ > after || s->stopping_ || s->has_inbox_locked(member))
                 return false; /* news came in between: go on */
             s->waiters_.push_back(w);
         }
@@ -581,8 +621,17 @@ void Service::bump(int64_t id)
         w->wake();
 }
 
+/* Says while a member's Puddle holds a request open on the events: it is following, so direct messages can be relayed to it. */
+struct Service::Following {
+    Service *s;
+    std::string member;
+    Following(Service *svc, std::string m) : s(svc), member(std::move(m)) { s->following(member, true); }
+    ~Following() { s->following(member, false); }
+};
+
 Task<Answer> Service::events(int64_t after, std::string member)
 {
+    Following here(this, member);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
     for (;;) {
         try {
@@ -602,7 +651,9 @@ Task<Answer> Service::events(int64_t after, std::string member)
              * left at all, an empty answer below a newer cursor says the same. */
             if ((oldest > 0 && after + 1 < oldest && (r.empty() || num(r[0][0]) == oldest)) || (r.empty() && latest > after))
                 co_return Answer{200, "{\"reset\":true}"};
-            if (!r.empty()) {
+            /* direct messages and what goes with them (dms.cpp): for this member alone, from memory, with no number */
+            const std::vector<std::string> mine = take_inbox(member);
+            if (!r.empty() || !mine.empty()) {
                 /* an event for one member is left out for the rest; the cursor still moves past it */
                 std::string out = "{\"events\":[";
                 bool first = true;
@@ -613,7 +664,12 @@ Task<Answer> Service::events(int64_t after, std::string member)
                            ",\"data\":" + text(r[i][2]) + "}";
                     first = false;
                 }
-                co_return Answer{200, out + "],\"cursor\":" + std::to_string(num(r[r.size() - 1][0])) + "}"};
+                for (const std::string &e : mine) {
+                    out += std::string(first ? "" : ",") + e;
+                    first = false;
+                }
+                const int64_t cursor = r.empty() ? after : num(r[r.size() - 1][0]);
+                co_return Answer{200, out + "],\"cursor\":" + std::to_string(cursor) + "}"};
             }
         } catch (const DrogonDbException &e) {
             co_return server_error(e);
@@ -621,7 +677,7 @@ Task<Answer> Service::events(int64_t after, std::string member)
         auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
         if (left <= 0 || stopping_ || !timers_)
             break;
-        co_await News{this, after, (double)left / 1000.0};
+        co_await News{this, after, (double)left / 1000.0, member};
         if (stopping_)
             break;
     }
@@ -635,6 +691,16 @@ Task<> Service::tick()
             next_prune_ = now_ms() + 3600 * 1000;
             co_await db_->execSqlCoro("DELETE FROM events WHERE ts_ms < ?", now_ms() - EVENTS_KEEP_MS);
             co_await sweep_files();
+            co_await sweep_pictures();
+        }
+        if (now_ms() >= next_mutes_) { /* who is muted, from the app or pondctl: what sends and voice look at */
+            next_mutes_ = now_ms() + 2000;
+            Result m = co_await db_->execSqlCoro("SELECT id, muted_until FROM members WHERE muted_until IS NOT NULL AND left_ms IS NULL");
+            std::map<std::string, int64_t> now;
+            for (const auto &row : m)
+                now[text(row[0])] = num(row[1]);
+            std::lock_guard<std::mutex> g(mu_);
+            muted_ = std::move(now);
         }
         Result r = co_await db_->execSqlCoro("SELECT COALESCE(MAX(id), 0), COALESCE(MIN(id), 0) FROM events");
         {

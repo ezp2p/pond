@@ -60,6 +60,16 @@ static const char *const STEPS[][8] = {
         "ALTER TABLE channels ADD COLUMN kind VARCHAR(8) NOT NULL DEFAULT 'text'",
         nullptr,
     },
+    {
+        /* muting (docs/design.md, "Roles"): NULL is not muted, 0 muted until unmuted, else muted until then (ms) */
+        "ALTER TABLE members ADD COLUMN muted_until BIGINT NULL",
+        nullptr,
+    },
+    {
+        /* direct messages (docs/dms.md): whether a member takes them here. The letters themselves are never kept. */
+        "ALTER TABLE members ADD COLUMN dms TINYINT NOT NULL DEFAULT 1",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run

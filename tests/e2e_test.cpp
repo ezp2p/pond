@@ -7,6 +7,7 @@
 
 #include <sys/stat.h>
 
+
 using namespace pond;
 
 /* ---- a Puddle ---- */
@@ -121,7 +122,7 @@ int main()
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + k + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + k + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":5,\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":8,\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
 
     std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";
@@ -176,10 +177,96 @@ int main()
         CHECK(has(ann.get(msgs), "\"state\":\"available\""));
     }
 
+    /* ---- direct messages through the Pond (docs/dms.md): sealed from one Puddle to the other, relayed, never kept ---- */
+    if (!has(ann.get("/api/v1/ponds"), "\"dms\":{\"on\":true")) {
+        printf("e2e_test: direct messages skipped (this puddled has none)\n");
+    } else {
+        std::string annId = str_of(ann.get("/api/v1/users/me"), "id"), benId = str_of(ben.get("/api/v1/users/me"), "id");
+        CHECK(ann.post(P + "/dms/" + benId + "/open", "", &out) == 200 && has(out, "\"kind\":\"pond_dm\"") && has(out, "\"closed\":null"));
+        std::string conv = str_of(out, "id"), C = "/api/v1/conversations/" + conv;
+        CHECK(ann.post(P + "/dms/" + annId + "/open", "") == 404); /* not with ourselves */
+        CHECK(ann.post(C + "/messages/send", "{\"body\":\"psst, ben\"}") == 201);
+        CHECK(until([&] { return has(ben.get(C + "/messages"), "psst, ben"); })); /* the same conversation id on both sides */
+        CHECK(has(ben.get("/api/v1/conversations"), "\"kind\":\"pond_dm\"") && has(ben.get(C), "\"name\":\"Lily Pad\""));
+        CHECK(until([&] { return !has(ann.get(C + "/messages"), "\"delivery\""); })); /* Ben's Puddle said it came */
+        {
+            std::string all;
+            CHECK(db.sql("SELECT data FROM events", &all) == 0 && !has(all, "psst") && !has(all, "\"dm\"")); /* nothing of it in the Pond */
+        }
+        CHECK(ben.post(C + "/messages/send", "{\"body\":\"hi ann, quietly\"}") == 201);
+        CHECK(until([&] { return has(ann.get(C + "/messages"), "hi ann, quietly"); }));
+        /* edited and deleted, as any message */
+        std::string mine = ann.get(C + "/messages");
+        size_t at = mine.rfind("{\"id\":\"", mine.rfind("\"conversation\"", mine.find("psst, ben")));
+        std::string mid = mine.substr(at + 7, 64);
+        CHECK(ann.post(C + "/messages/" + mid + "/edit", "{\"body\":\"psst, ben (edited)\"}") == 200);
+        CHECK(until([&] { return has(ben.get(C + "/messages"), "psst, ben (edited)"); }));
+        /* a file, a piece at a time through the Pond, which keeps none of it */
+        std::string bytes(3 * (1 << 20) + 12345, '\0');
+        for (size_t i = 0; i < bytes.size(); i++)
+            bytes[i] = (char)(i * 7 + i / 1031);
+        std::string fid = ann.upload(bytes);
+        CHECK(fid.size() == 64);
+        CHECK(ann.post(C + "/messages/send", "{\"body\":\"a file\",\"files\":[{\"id\":\"" + fid + "\",\"name\":\"secret.bin\",\"mime\":\"application/octet-stream\"}]}") == 201);
+        CHECK(until([&] { return has(ben.get("/api/v1/files/" + fid), "\"available\""); }, 30000));
+        CHECK(ben.get("/api/v1/files/" + fid + "/content") == bytes);
+        /* a friend offer: Ben's side has a link to Ann's Puddle */
+        CHECK(ann.post(C + "/befriend", "", &out) == 200 && has(out, "\"offered\":true"));
+        CHECK(until([&] { return has(ben.get(C), "\"friend_offer\":\"puddle://"); }));
+        /* away: Ann's Puddle stops; what Ben writes meanwhile reaches her when it is back (held by Ben's Puddle, or, while the
+         * Pond still counts her request for events as open, in the Pond's memory) */
+        ann.down();
+        CHECK(ben.post(C + "/messages/send", "{\"body\":\"while you were away\"}") == 201);
+        CHECK(has(ben.get(C + "/messages"), "\"delivery\""));
+        CHECK(ann.up());
+        CHECK(until([&] { return has(ann.get(C + "/messages"), "while you were away"); }, 90000));
+        /* blocking her direct messages: dropped unread, and to her they look delivered */
+        CHECK(ben.post("/api/v1/users/" + annId + "/dm-block", "", &out) == 200 && has(out, "\"dms_blocked\":true"));
+        CHECK(ann.post(C + "/messages/send", "{\"body\":\"are you there?\"}") == 201);
+        CHECK(until([&] { return !has(ann.get(C + "/messages"), "\"delivery\""); }));
+        CHECK(!has(ben.get(C + "/messages"), "are you there?"));
+        CHECK(has(ben.get("/api/v1/dm-blocks"), annId));
+        CHECK(ben.post("/api/v1/users/" + annId + "/dm-unblock", "") == 200);
+        /* taking none in this Pond: Ann's app is told, and her Puddle refuses to send */
+        CHECK(ben.post(P + "/dms/settings", "{\"accept\":false}") == 200);
+        CHECK(until([&] { return has(ann.get(C), "\"closed\":\"not_accepted\""); }));
+        CHECK(ann.post(C + "/messages/send", "{\"body\":\"no?\"}", &out) == 409 && has(out, "not_accepted"));
+        CHECK(ben.post(P + "/dms/settings", "{\"accept\":true}") == 200);
+        CHECK(until([&] { return has(ann.get(C), "\"closed\":null"); }));
+    }
+
     /* ---- profiles ---- */
     CHECK(ann.post(P + "/profile", "{\"profile\":\"work\"}") == 200);
     CHECK(until([&] { return has(ben.get(P), "Ann (work)"); }));
     CHECK(ann.post(P + "/profile", "{\"profile\":\"nope\"}") == 404);
+
+    /* ---- pictures (docs/design.md, "Pictures"): Ann's profile picture reaches Ben through the Pond, and the icon an
+     * administrator sets from the app reaches everyone. Skipped with a puddled from before pictures in Ponds. ---- */
+    if (!has(ann.get("/api/v1/ponds"), "\"icon\":")) {
+        printf("e2e_test: pictures skipped (this puddled does not show Ponds' pictures)\n");
+    } else {
+        std::string png = std::string("\x89PNG\r\n\x1a\n", 8) + std::string(2000, 'a'), big = std::string("\x89PNG\r\n\x1a\n", 8) + std::string(1 << 20, 'b');
+        CHECK(ann.post("/api/v1/media/upload", png, &out) == 201);
+        std::string hash = str_of(out, "hash");
+        CHECK(hash == sha256_hex(png));
+        CHECK(ann.post("/api/v1/profiles/work/edit", "{\"avatar\":\"" + hash + "\"}") == 200);
+        CHECK(until([&] { return has(ben.get(P), "\"avatar\":{\"hash\":\"" + hash + "\""); })); /* Ann's Puddle sent it */
+        CHECK(until([&] { return ben.get("/api/v1/media?hash=" + hash) == png; }));               /* and Ben's fetched it */
+
+        /* the icon: a picture this Puddle holds, sent to the Pond and named; refused to someone without a role */
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":\"" + hash + "\"}", &out) == 409 && has(out, "no_role"));
+        CHECK(pond.ctl("member offer Ann administrator --yes") == 0);
+        CHECK(until([&] { return has(ann.get(P), "\"offer\":{"); }));
+        CHECK(ann.post(P + "/offer/accept", "", &out) == 200);
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":\"" + std::string(64, 'c') + "\"}", &out) == 404 && has(out, "no_picture"));
+        CHECK(ann.post("/api/v1/media/upload", big, &out) == 201);
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":\"" + str_of(out, "hash") + "\"}", &out) == 409 && has(out, "too_large"));
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":\"" + hash + "\"}", &out) == 204);
+        CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"icon\":{\"hash\":\"" + hash + "\""); }));
+        CHECK(ann.post(P + "/admin/icon", "{\"hash\":null}", &out) == 204);
+        CHECK(until([&] { return has(ben.get("/api/v1/ponds"), "\"icon\":null"); }));
+        CHECK(pond.ctl("member role Ann member --yes") == 0);
+    }
 
     /* ---- voice channels (docs/voice.md): two Puddles join one through their owner API, connect to the Pond, and each sees
      * the other in it; muting is heard of; leaving. Skipped with a puddled from before voice, or one built without calls. ---- */

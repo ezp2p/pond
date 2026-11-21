@@ -4,6 +4,7 @@
 
 #include "pond.h"
 
+#include "encoding.h"
 #include "json.h"
 #include "text.h"
 
@@ -334,6 +335,157 @@ Task<Answer> Service::admin_bans()
     } catch (const DrogonDbException &e) {
         co_return server_error(e);
     }
+}
+
+/* ---- muting ---- */
+
+int64_t Service::muted_until(const std::string &member)
+{
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = muted_.find(member);
+    if (it == muted_.end() || (it->second != 0 && it->second <= now_ms()))
+        return -1;
+    return it->second;
+}
+
+/* `until`: 0 until unmuted, a time, or nullopt to unmute. Every member hears of it (a `member` event). */
+Task<Outcome> Service::set_muted(std::string member, std::optional<int64_t> until)
+{
+    TxPtr tx;
+    try {
+        tx = co_await db_->newTransactionCoro();
+        Result r = co_await tx->execSqlCoro("UPDATE members SET muted_until = ? WHERE id = ? AND left_ms IS NULL", until, member);
+        if (r.affectedRows() == 0) {
+            tx->rollback();
+            if (!co_await is_member(member))
+                co_return "no_member";
+            co_return ""; /* as it was already */
+        }
+        std::string mj = co_await member_json_of(tx, member);
+        int64_t ev = co_await add_event(tx, "member", mj);
+        if (!co_await Committed(std::move(tx)))
+            co_return "database";
+        bump(ev);
+    } catch (const DrogonDbException &e) {
+        if (tx)
+            tx->rollback();
+        LOG_ERROR << "database: " << e.base().what();
+        co_return "database";
+    }
+    std::lock_guard<std::mutex> g(mu_);
+    if (until)
+        muted_[member] = *until;
+    else
+        muted_.erase(member);
+    co_return "";
+}
+
+Task<Answer> Service::admin_mute(std::string by, std::string member, int64_t until_ms)
+{
+    if (until_ms < 0 || (until_ms > 0 && (until_ms <= now_ms() || until_ms > now_ms() + INVITE_EXPIRY_MAX_MS)))
+        co_return fail(400, "bad_request");
+    try {
+        std::string no = co_await may_act(by, member);
+        if (!no.empty())
+            co_return fail(409, no.c_str());
+    } catch (const DrogonDbException &e) {
+        co_return server_error(e);
+    }
+    Outcome o = co_await set_muted(member, until_ms);
+    if (o == "no_member")
+        co_return fail(404, "no_member");
+    if (!o.empty())
+        co_return fail(500, "database");
+    co_await log_admin(by, "mute", member, until_ms ? "until " + std::to_string(until_ms) : std::string("until unmuted"));
+    co_return Answer{204, ""};
+}
+
+Task<Answer> Service::admin_unmute(std::string by, std::string member)
+{
+    try {
+        std::string no = co_await may_act(by, member);
+        if (!no.empty())
+            co_return fail(409, no.c_str());
+    } catch (const DrogonDbException &e) {
+        co_return server_error(e);
+    }
+    Outcome o = co_await set_muted(member, std::nullopt);
+    if (o == "no_member")
+        co_return fail(404, "no_member");
+    if (!o.empty())
+        co_return fail(500, "database");
+    co_await log_admin(by, "unmute", member, "");
+    co_return Answer{204, ""};
+}
+
+/* ---- invites ---- */
+
+std::string Service::invite_link(const std::string &token) const
+{
+    std::string a = link_address;
+    if (a.size() > 4 && a.compare(a.size() - 4, 4, ":443") == 0)
+        a.resize(a.size() - 4);
+    return "pond://" + a + "?invite=" + token + "&k=" + base32(key_.seal_pub, 32);
+}
+
+/* token, uses, max_uses, expires_ms, created_ms: as an Invite (api/pond.yaml) */
+static std::string invite_json(const Service &s, const drogon::orm::Row &r)
+{
+    const std::string token = text(r[0]);
+    return "{\"token\":" + jstr(token) + ",\"link\":" + jstr(s.invite_link(token)) + ",\"uses\":" + std::to_string(num(r[1])) +
+           ",\"max_uses\":" + (r[2].isNull() ? std::string("null") : std::to_string(num(r[2]))) +
+           ",\"expires\":" + (r[3].isNull() ? std::string("null") : std::to_string(num(r[3]))) + ",\"created\":" + std::to_string(num(r[4])) + "}";
+}
+
+static const char INVITE_COLS[] = "token, uses, max_uses, expires_ms, created_ms";
+
+Task<Answer> Service::admin_invites()
+{
+    try {
+        /* only those that can still be used: one used up, expired or revoked is no longer an invite */
+        Result r = co_await db_->execSqlCoro(std::string("SELECT ") + INVITE_COLS + " FROM invites WHERE revoked = 0 AND (max_uses IS NULL OR uses < max_uses)"
+                                                 " AND (expires_ms IS NULL OR expires_ms > ?) ORDER BY created_ms DESC LIMIT 500",
+                                             now_ms());
+        std::string out = "{\"invites\":[";
+        for (size_t i = 0; i < r.size(); i++)
+            out += (i ? "," : "") + invite_json(*this, r[i]);
+        co_return Answer{200, out + "]}"};
+    } catch (const DrogonDbException &e) {
+        co_return server_error(e);
+    }
+}
+
+Task<Answer> Service::admin_invite_create(std::string by, int max_uses, int64_t expires_ms)
+{
+    if (max_uses < 0 || max_uses > INVITE_USES_MAX || expires_ms < 0 || (expires_ms > 0 && (expires_ms <= now_ms() || expires_ms > now_ms() + INVITE_EXPIRY_MAX_MS)))
+        co_return fail(400, "bad_request");
+    auto token = std::make_shared<std::string>();
+    Outcome o = co_await invite_create(max_uses, expires_ms, token);
+    if (!o.empty())
+        co_return outcome(o);
+    try {
+        Result r = co_await db_->execSqlCoro(std::string("SELECT ") + INVITE_COLS + " FROM invites WHERE token = ?", *token);
+        if (r.empty())
+            co_return fail(500, "database");
+        std::string detail = (max_uses ? std::to_string(max_uses) + " uses" : std::string("no limit")) + (expires_ms ? ", expires" : "");
+        co_await log_admin(by, "invite_create", token->substr(0, 6), detail);
+        co_return Answer{200, invite_json(*this, r[0])};
+    } catch (const DrogonDbException &e) {
+        co_return server_error(e);
+    }
+}
+
+Task<Answer> Service::admin_invite_revoke(std::string by, std::string token)
+{
+    try {
+        Result r = co_await db_->execSqlCoro("UPDATE invites SET revoked = 1 WHERE token = ? AND revoked = 0", token);
+        if (r.affectedRows() == 0)
+            co_return fail(404, "no_invite");
+    } catch (const DrogonDbException &e) {
+        co_return server_error(e);
+    }
+    co_await log_admin(by, "invite_revoke", token.substr(0, 6), "");
+    co_return Answer{204, ""};
 }
 
 Task<Answer> Service::admin_unban(std::string by, std::string member)
