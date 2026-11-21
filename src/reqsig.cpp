@@ -3,54 +3,33 @@
 #include "encoding.h"
 #include "identity.h"
 
+#include <puddle_proto.h>
+
 #include <cstdlib>
+#include <cstring>
 
 namespace pond {
 
 bool parse_reqsig(std::string_view h, ReqSig &out)
 {
-    static const std::string_view seps[] = {"v1 id=", "; kid=", "; ts=", "; nonce=", "; sig="};
-    if (h.size() > 1000)
+    pp_reqsig r;
+    if (pp_reqsig_parse(std::string(h).c_str(), &r) != 0)
         return false;
-    std::string_view vals[5];
-    size_t p = 0;
-    for (int i = 0; i < 5; i++) {
-        if (h.compare(p, seps[i].size(), seps[i]) != 0)
-            return false;
-        p += seps[i].size();
-        size_t end = i < 4 ? h.find(seps[i + 1], p) : h.size();
-        if (end == std::string_view::npos || end == p || end - p >= 120)
-            return false;
-        vals[i] = h.substr(p, end - p);
-        p = end;
-    }
-    unsigned char kid[32];
-    if (!id_valid(vals[0]) || !unhex(vals[1], kid, 32) || vals[2].size() > 15)
-        return false;
-    for (char c : vals[2])
-        if (c < '0' || c > '9')
-            return false;
-    if (vals[3].size() < 16 || vals[3].size() >= 48)
-        return false;
-    for (char c : vals[3])
-        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '='))
-            return false;
-    if (!unbase64(vals[4], out.sig, 64))
-        return false;
-    out.id = vals[0];
-    out.kid = vals[1];
-    out.ts = strtoll(std::string(vals[2]).c_str(), nullptr, 10);
-    out.nonce = vals[3];
+    out.id = r.id;
+    out.kid = r.kid;
+    out.ts = r.ts;
+    out.nonce = r.nonce;
+    memcpy(out.sig, r.sig, 64);
     return true;
 }
 
 std::string reqsig_canonical(std::string_view method, std::string_view target, std::string_view body, int64_t ts,
                              std::string_view nonce, std::string_view recipient)
 {
-    std::string s = "puddle-request-v1\n";
-    s.append(method).append("\n").append(target).append("\n").append(sha256_hex(body)).append("\n");
-    s.append(std::to_string(ts)).append("\n").append(nonce).append("\n").append(recipient);
-    return s;
+    char buf[2400];
+    int n = pp_reqsig_canonical(buf, sizeof buf, std::string(method).c_str(), std::string(target).c_str(), body.data(), body.size(), ts,
+                                std::string(nonce).c_str(), std::string(recipient).c_str());
+    return n < 0 ? std::string() : std::string(buf, (size_t)n);
 }
 
 constexpr int64_t NONCE_REMEMBER_MS = 2 * SIG_WINDOW_MS;
@@ -108,52 +87,38 @@ std::string receipt_canonical(std::string_view id, std::string_view nonce, int s
     return s;
 }
 
-std::string receipt_header(const PondKey &key, std::string_view nonce, int status, std::string_view body)
+static int key_sign(void *user, const void *data, size_t len, unsigned char sig[64])
 {
-    unsigned char sig[64];
-    if (!key.sign(receipt_canonical(key.id, nonce, status, body), sig))
-        return "";
-    return "v2 id=" + key.id + "; kid=" + key_id(key.pub) + "; sig=" + base64(sig, 64);
+    return ((const PondKey *)user)->sign(std::string_view((const char *)data, len), sig) ? 0 : -1;
 }
 
-static bool hex64(std::string_view s)
+std::string receipt_header(const PondKey &key, std::string_view nonce, int status, std::string_view body)
 {
-    if (s.size() != 64)
-        return false;
-    for (char c : s)
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
-            return false;
-    return true;
+    pp_signer s{};
+    s.id = key.id.c_str();
+    memcpy(s.pub, key.pub, 32);
+    s.sign = key_sign;
+    s.user = (void *)&key;
+    char out[PP_RECEIPT_MAX];
+    if (pp_receipt_sign(&s, std::string(nonce).c_str(), status, sha256_hex(body).c_str(), out, sizeof out) != 0)
+        return "";
+    return out;
 }
 
 Receipt check_receipt(std::string_view h, std::string_view id, const unsigned char pub[32], std::string_view nonce, int status,
                       std::string_view body)
 {
-    if (h.empty())
+    switch (pp_receipt_verify(std::string(h).c_str(), std::string(id).c_str(), pub, std::string(nonce).c_str(), status,
+                              sha256_hex(body).c_str())) {
+    case PP_RECEIPT_OK:
+        return Receipt::OK;
+    case PP_RECEIPT_MISSING:
         return Receipt::MISSING;
-    static const std::string_view seps[] = {"v2 id=", "; kid=", "; sig="};
-    if (h.size() > 1000)
-        return Receipt::BAD;
-    std::string_view vals[3];
-    size_t p = 0;
-    for (int i = 0; i < 3; i++) {
-        if (h.compare(p, seps[i].size(), seps[i]) != 0)
-            return Receipt::BAD;
-        p += seps[i].size();
-        size_t end = i < 2 ? h.find(seps[i + 1], p) : h.size();
-        if (end == std::string_view::npos || end == p || end - p >= 120)
-            return Receipt::BAD;
-        vals[i] = h.substr(p, end - p);
-        p = end;
-    }
-    unsigned char sig[64];
-    if (!id_valid(vals[0]) || !hex64(vals[1]) || !unbase64(vals[2], sig, 64))
-        return Receipt::BAD;
-    if (vals[0] != id || vals[1] != key_id(pub))
+    case PP_RECEIPT_WRONG_KEY:
         return Receipt::WRONG_KEY;
-    if (!verify_signature(pub, receipt_canonical(vals[0], nonce, status, body), sig))
+    default:
         return Receipt::BAD;
-    return Receipt::OK;
+    }
 }
 
 } // namespace pond

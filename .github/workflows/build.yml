@@ -21,13 +21,10 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-
-      # the protocol test checks Pond against the Puddle Protocol's test vectors
+      # the submodule third_party/protocol: libpuddle-proto, and the vectors the protocol test checks Pond against
       - uses: actions/checkout@v5
         with:
-          repository: ezp2p/protocol
-          path: protocol
+          submodules: true
 
       - name: Install dependencies
         run: |
@@ -42,8 +39,6 @@ jobs:
           cmake --build build --parallel 4
 
       - name: Test
-        env:
-          POND_PROTOCOL_DIR: ${{ github.workspace }}/protocol
         run: |
           # e2e needs a built Puddle and skips without one
           if ! ctest --test-dir build --output-on-failure 2>&1 | tee test.log; then

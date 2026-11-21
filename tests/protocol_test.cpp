@@ -1,5 +1,5 @@
 /* The Puddle Protocol's test vectors (ezp2p/protocol, vectors/), made by Puddle: Pond must read request signatures and
- * receipts exactly as Puddle writes them. Needs a checkout of the protocol beside this repository (../protocol), or
+ * receipts exactly as Puddle writes them. Reads them from the submodule (third_party/protocol), or
  * POND_PROTOCOL_DIR pointing at one; skipped (77) without. No database or pondd: these are the checks alone. */
 
 #include "encoding.h"
@@ -62,7 +62,7 @@ static const char *said(Receipt r)
 int main()
 {
     const char *env = getenv("POND_PROTOCOL_DIR");
-    std::string dir = env && *env ? std::string(env) + "/vectors" : std::string(POND_SOURCE_DIR) + "/../protocol/vectors";
+    std::string dir = env && *env ? std::string(env) + "/vectors" : std::string(POND_SOURCE_DIR) + "/third_party/protocol/vectors";
     if (!std::filesystem::exists(dir + "/signatures.json")) {
         printf("protocol_test: skipped, no protocol checkout at %s\n", dir.c_str());
         return 77;
