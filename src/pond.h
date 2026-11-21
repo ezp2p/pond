@@ -42,13 +42,15 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 8; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 9; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
                              * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
                              * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures");
                              * 7: muting, and a member's `muted` ("Muting");
-                             * 8: direct messages, relayed (docs/dms.md), where `features` says `dms`; a member's `dms` */
-constexpr std::array<const char *, 5> FEATURES{"files", "roles", "receipts", "sealed", "pictures"}; /* and "voice", when voice is on */
+                             * 8: direct messages, relayed (docs/dms.md), where `features` says `dms`; a member's `dms`;
+                             * 9: roles for channels, and the channels' order from the app ("Roles for channels"): `roles` in
+                             *    /info, a member's and a channel's `roles`, and the events `role`, `role_deleted` and `channels` */
+constexpr std::array<const char *, 6> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles"}; /* and "voice", when voice is on */
 
 /* Direct messages (docs/dms.md, dms.cpp): relayed, never stored. */
 constexpr size_t DM_SEALED_MAX = 128 * 1024;           /* a sealed letter, as base64: a message with ten files' previews fits */
@@ -71,6 +73,8 @@ const char *role_name(Role r);
 std::optional<Role> role_of_name(const std::string &s);
 constexpr int64_t OFFER_KEEP_MS = 7LL * 24 * 3600 * 1000;
 constexpr size_t BAN_REASON_MAX = 500;
+constexpr size_t ROLE_NAME_MAX = 32;   /* characters in the name of a role for channels */
+constexpr int64_t ROLES_MAX = 200;     /* roles for channels in one Pond */
 constexpr int INVITE_USES_MAX = 1000000;
 constexpr int64_t INVITE_EXPIRY_MAX_MS = 10LL * 366 * 24 * 3600 * 1000; /* made from the app: at most ten years ahead */
 
@@ -146,7 +150,7 @@ public:
     Task<Answer> join(Chain chain, std::string invite, std::string profile);
     Task<Answer> keys(std::string member, Chain chain);
     Task<Answer> info(std::string member);
-    Task<Answer> history(int64_t channel, int64_t before, int limit);
+    Task<Answer> history(std::string member, int64_t channel, int64_t before, int limit);
     Task<Answer> send(std::string member, int64_t channel, std::string text, std::string nonce, std::vector<FileRef> files = {});
     /* Answers when there is something after `after`, `wait_ms` pass, or stop(). */
     Task<Answer> events(int64_t after, std::string member);
@@ -182,6 +186,20 @@ public:
     Task<Answer> admin_invite_create(std::string by, int max_uses, int64_t expires_ms);
     Task<Answer> admin_invite_revoke(std::string by, std::string token);
     Task<Answer> admin_unban(std::string by, std::string member);
+    /* Roles for channels (channel_roles.cpp; docs/design.md, "Roles for channels"): named by operators and administrators,
+     * given to members, and asked for by channels that are not open to everyone. */
+    Task<Answer> admin_role_create(std::string by, std::string name);
+    Task<Answer> admin_role_edit(std::string by, int64_t role, std::string name);
+    Task<Answer> admin_role_delete(std::string by, int64_t role);
+    /* the roles `member` holds now: these, and no others */
+    Task<Answer> admin_member_roles(std::string by, std::string member, std::vector<int64_t> roles);
+    /* who may see `channel`: everyone (nullopt), or operators, administrators and members with one of `roles` */
+    Task<Answer> admin_channel_roles(std::string by, int64_t channel, std::optional<std::vector<int64_t>> roles);
+    /* the order of the channels: every live channel's id, first to last */
+    Task<Answer> admin_channel_order(std::string by, std::vector<int64_t> channels);
+    /* The live channels `member` may not see; may they see `channel`? */
+    Task<std::set<int64_t>> hidden_channels(std::string member);
+    Task<bool> may_see(std::string member, int64_t channel);
 
     /* Pictures (pictures.cpp): keep one a member sends, answering {hash, mime, size}; give one that is shown to the members (the
      * icon, or in a member's profile) to a member. */
@@ -243,14 +261,15 @@ public:
 
     /* Voice channels may be made (pondd: built with voice, and `voice` not false). */
     bool voice_on = false;
-    /* Who is in which voice channel now, as a JSON array for /info; set by pondd while voice is on. */
-    std::function<std::string()> voice_now;
+    /* Who is in which voice channel now, as a JSON array for /info, leaving out the channels given; set by pondd while voice is on. */
+    std::function<std::string(const std::set<int64_t> &)> voice_now;
     /* Tell every member: `voice` or `voice_left` with its data. */
     Task<> voice_event(std::string kind, std::string data);
-    /* Of `members`, those no longer members; of `channels`, those that are no longer live voice channels. */
-    Task<std::pair<std::vector<std::string>, std::vector<int64_t>>> voice_gone(std::vector<std::string> members, std::vector<int64_t> channels);
-    /* `channel` is a live voice channel */
-    Task<bool> is_voice_channel(int64_t channel);
+    /* Of these (member, voice channel), those where they may no longer be: no longer a member, the channel gone, or no longer
+     * one they may see. */
+    Task<std::vector<std::pair<std::string, int64_t>>> voice_gone(std::vector<std::pair<std::string, int64_t>> in);
+    /* `channel` is a live voice channel `member` may see */
+    Task<bool> is_voice_channel(int64_t channel, std::string member);
 
     /* ---- the event log ---- */
 
@@ -304,13 +323,16 @@ private:
     Task<std::string> may_write(std::string from, std::string to);
     Task<Answer> enter(Chain chain, std::string invite, std::string profile);
     Task<Answer> enter_once(Chain chain, std::string invite, std::string profile); /* status 0: met another join, try again */
-    Task<int64_t> add_event(TxPtr tx, const char *kind, std::string data, std::string only_for = "");
+    /* `channel`: the event is about that channel, and only those who may see it are given it */
+    Task<int64_t> add_event(TxPtr tx, const char *kind, std::string data, std::string only_for = "", int64_t channel = 0);
     Task<std::string> offer_json(std::string member);
     /* May `by` act on `target`? "" if so, else the error code. */
     Task<std::string> may_act(std::string by, std::string target);
     Task<std::string> member_json_of(DbPtr db, std::string id);
     Task<std::string> pond_json(DbPtr db);
-    Task<std::string> channels_json();
+    /* the channels `member` may see, in order */
+    Task<std::string> channels_json(std::string member);
+    Task<std::string> roles_json();
     Task<Outcome> channel_set(std::string name, const char *column, std::string value);
     Task<Outcome> remove_member(std::string id);
     void bump(int64_t id);

@@ -404,6 +404,48 @@ gain `role` (`operator`, `administrator` or `member`), and `/info` gains `offer`
 - Whether an operator may step down from the app, and whether the last operator may.
 - Bans with an end date, and a ban list that `pondctl` can import and export.
 
+## Roles for channels
+
+Built 2026-11-22. Operators and administrators (above: their **rank**) make named **roles** and give them to members, as
+on Discord, and a channel can be left to some roles. A role gives no say over the Pond, only what a member can see. The
+wire keeps the two apart by name: a member's `role` is their rank, `roles` the roles for channels they hold.
+
+| Question | Decision |
+|---|---|
+| Who makes and gives them | Operators and administrators, from the app. Given outright (no offer: a role takes nothing from anyone), to anyone, themselves included. |
+| What a role is | A name (1 to 32 characters, one line, unique) and an id. At most 200 in a Pond. |
+| Who sees a channel | Everyone (`roles: null`, the default), or operators, administrators and members holding one of the channel's roles. A restricted channel with no roles is for operators and administrators only. |
+| Deleting a role | Members lose it, and channels stop asking for it. A channel that asked for it alone stays restricted, so it closes rather than opening to everyone. |
+| What a member can't see | Is not there for them: not in `/info`, its history and send are `404 no_channel`, its events (messages, edits, voice) are not given to them, its files are not served to them (unless they sent them), and they can't join its voice. Someone in its voice who loses it is dropped within a second. |
+| The order | The admins set it (`position`); members can't change it, and everyone sees the same order. |
+
+| Route | Does |
+|---|---|
+| `POST /pond/v1/admin/roles/create` | `{name}`: answers `{id, name}` |
+| `POST /pond/v1/admin/roles/{role}/edit` | `{name}` |
+| `POST /pond/v1/admin/roles/{role}/delete` | |
+| `POST /pond/v1/admin/members/{member}/roles` | `{roles: [ids]}`: the roles they hold now, these and no others |
+| `POST /pond/v1/admin/channels/{channel}/roles` | `{roles: null}` for everyone, or `{roles: [ids]}` |
+| `POST /pond/v1/admin/channels/order` | `{channels: [ids]}`: every live channel, first to last; `409 channels_changed` if one was made or deleted meanwhile |
+
+An unknown role is `404 unknown_role`. Each goes in `admin_log`.
+
+**What members are told.** `/info` gains `roles` (`[{id, name}]`, every role: members see each other's), a member and `me`
+gain `roles` (ids), and a channel gains `roles` (null, or ids). New events: `role` (`{id, name}`, made or renamed),
+`role_deleted` (`{id}`: take it out of every member and channel), and `channels`. A `channels` event is written for each
+member as it is given out: `{channels: [...]}`, every channel they see now, in order, which replaces what they had. It
+follows anything that changes who sees what or the order: a channel's roles, the order, deleting a role (for everyone);
+a member's roles or rank (for them alone, with a `member` event for everyone).
+
+**How the events are kept apart.** An event about one channel (`message`, `channel`, `voice`, `voice_left`) records which
+(`events.channel`), and is left out for a member who may not see that channel when they ask: what counts is what they may
+see then, not when it happened, so someone given a role also gets the recent events of its channels. The cursor moves past
+the ones left out, as for `only_for`.
+
+Protocol 9, feature `channel_roles`. An older Puddle ignores the new events and fields: it shows the channels `/info`
+gives it, so it never shows one it may not see, but it learns of a change only at its next `/info` (a reset, or starting
+again).
+
 ## What the database holds
 
 | Table | Columns |
@@ -419,7 +461,11 @@ gain `role` (`operator`, `administrator` or `member`), and `/info` gains `offer`
 | `role_offers` | `id`, `member`, `role`, `created_ms`; open until answered or 7 days old |
 | `bans` | `member`, `by` (a member id, or `pondctl`), `reason`, `ts_ms` |
 | `admin_log` | `id`, `by`, `action`, `target`, `detail`, `ts_ms` |
-| `events` (more) | `only_for`: a member id, for an event only they receive |
+| `events` (more) | `only_for`: a member id, for an event only they receive; `channel`: the channel it is about, given only to those who may see it |
+| `roles` | `id`, `name` (unique), `created_ms`: roles for channels |
+| `member_roles` | `member`, `role` |
+| `channel_roles` | `channel`, `role` |
+| `channels` (more) | `restricted`: 1 when only some roles (and operators and administrators) see it |
 | `files` | `id`, `size`, `chunks` (the hashes, 32 bytes each), `have` (a `0` or `1` per chunk), `whole`, `uploader`, `created_ms` |
 | `message_files` | `message`, `position`, `file`, and what the sender said of it: `name`, `mime`, `size`, `w`, `h`, `duration_ms`, `preview` |
 
@@ -504,7 +550,7 @@ the protocol, not the version of either program.
 - Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
   it does not know, so an older Puddle keeps working with a newer Pond.
 - `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
-  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `voice`, `dms`, `dm_files`). A Puddle checks these before using an addition, rather than guessing from
+  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `voice`, `dms`, `dm_files`). A Puddle checks these before using an addition, rather than guessing from
   a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
 
 A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.
@@ -555,7 +601,8 @@ to report.
 
 ## Not yet
 
-- Permissions finer than the three roles, such as who may post where.
+- Permissions finer than seeing a channel: who may post where (a channel others may read but not write in), or a role
+  that may do some of what an administrator does. Roles have no colour or order yet, and `pondctl` can't manage them.
 - Editing, deleting and replying to messages, reactions, mentions, unread counts and typing indicators.
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.

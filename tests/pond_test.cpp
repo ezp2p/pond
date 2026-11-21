@@ -4,6 +4,7 @@
 
 #include "harness.h"
 
+#include <algorithm>
 #include <thread>
 #include "seal.h"
 #include "identity.h"
@@ -126,7 +127,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 8 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 9 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -573,6 +574,85 @@ int main()
         CHECK(pond.ctl("member role " + ann.id + " member --yes") == 0);
         CHECK(pond.call(&ann, "GET", "/pond/v1/admin/bans").status == 404);
         CHECK(pond.ctl("log", &out) == 0 && has(out, "offer_role") && has(out, "accept_role") && has(out, "ban") && has(out, "channel_create"));
+    }
+
+    /* ---- roles for channels, and the channels' order (docs/design.md, "Roles for channels") ---- */
+    {
+        /* Dan is an operator; Ann and Fay are members */
+        Identity fay;
+        CHECK(pond.call(&fay, "POST", "/pond/v1/join", join_body(fay, invite(pond, ""), "Fay"), "*").status == 200);
+        auto channel_id = [&](Identity &who, const std::string &name) -> int64_t {
+            const Json::Value info = parse(pond.call(&who, "GET", "/pond/v1/info").body); /* kept: a range over a temporary's member dangles */
+            for (const auto &c : info["channels"])
+                if (c["name"].asString() == name)
+                    return c["id"].asInt64();
+            return 0;
+        };
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/roles/create", "{\"name\":\"Mods\"}").status == 404); /* no rank */
+        a = pond.call(&dan, "POST", "/pond/v1/admin/roles/create", "{\"name\":\"Mods\"}");
+        CHECK(a.status == 200 && has(a.body, "\"name\":\"Mods\""));
+        const std::string mods = std::to_string(num_of(a.body, "id"));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/create", "{\"name\":\"Mods\"}").status == 400); /* taken */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/create", "{\"name\":\"  \"}").status == 400);
+        CHECK(has(pond.call(&fay, "GET", "/pond/v1/info").body, "\"roles\":[{\"id\":" + mods + ",\"name\":\"Mods\"}]"));
+
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/create", "{\"name\":\"staff\"}").status == 204);
+        const int64_t staff = channel_id(dan, "staff");
+        const std::string S = std::to_string(staff);
+        CHECK(staff > 0 && channel_id(ann, "staff") == staff); /* open to everyone at first */
+        int64_t c0 = num_of(pond.call(&ann, "GET", "/pond/v1/info").body, "cursor");
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/channels/" + S + "/roles", "{\"roles\":[" + mods + "]}").status == 404);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + S + "/roles", "{\"roles\":[999999]}").status == 404); /* no such role */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + S + "/roles", "{\"roles\":[" + mods + "]}").status == 204);
+        CHECK(channel_id(ann, "staff") == 0 && channel_id(fay, "staff") == 0 && channel_id(dan, "staff") == staff);
+        CHECK(has(pond.call(&dan, "GET", "/pond/v1/info").body, "\"roles\":[" + mods + "]}"));
+        CHECK(pond.call(&ann, "GET", "/pond/v1/channels/" + S + "/messages").status == 404);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/channels/" + S + "/send", "{\"text\":\"let me in\"}").status == 404);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/channels/" + S + "/send", "{\"text\":\"for mods only\"}").status == 200);
+        a = pond.call(&ann, "GET", "/pond/v1/events?after=" + std::to_string(c0));
+        CHECK(has(a.body, "\"kind\":\"channels\"") && !has(a.body, "staff") && !has(a.body, "for mods only")); /* what Ann sees now */
+        CHECK(has(pond.call(&dan, "GET", "/pond/v1/events?after=" + std::to_string(c0)).body, "for mods only"));
+
+        /* given the role, Ann sees it; Fay still does not */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + ann.id + "/roles", "{\"roles\":[999999]}").status == 404);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + ann.id + "/roles", "{\"roles\":[" + mods + "]}").status == 404);
+        int64_t c1 = num_of(pond.call(&ann, "GET", "/pond/v1/info").body, "cursor");
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + ann.id + "/roles", "{\"roles\":[" + mods + "," + mods + "]}").status == 204);
+        CHECK(channel_id(ann, "staff") == staff && channel_id(fay, "staff") == 0);
+        CHECK(pond.call(&ann, "GET", "/pond/v1/channels/" + S + "/messages").status == 200);
+        a = pond.call(&ann, "GET", "/pond/v1/events?after=" + std::to_string(c1));
+        CHECK(has(a.body, "\"kind\":\"channels\"") && has(a.body, "staff") && has(a.body, "\"roles\":[" + mods + "]")); /* hers */
+        CHECK(!has(pond.call(&fay, "GET", "/pond/v1/events?after=" + std::to_string(c1)).body, "staff"));
+        CHECK(has(pond.call(&fay, "GET", "/pond/v1/members").body, "\"roles\":[" + mods + "]"));
+
+        /* renamed, then the order */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/" + mods + "/edit", "{\"name\":\"Moderators\"}").status == 204);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/999999/edit", "{\"name\":\"x\"}").status == 404);
+        CHECK(has(pond.call(&fay, "GET", "/pond/v1/info").body, "\"name\":\"Moderators\""));
+        std::vector<int64_t> order;
+        const Json::Value info = parse(pond.call(&dan, "GET", "/pond/v1/info").body);
+        for (const auto &c : info["channels"])
+            order.push_back(c["id"].asInt64());
+        CHECK(order.size() >= 2 && order.back() == staff);
+        std::reverse(order.begin(), order.end());
+        std::string list;
+        for (int64_t id : order)
+            list += (list.empty() ? "" : ",") + std::to_string(id);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/channels/order", "{\"channels\":[" + list + "]}").status == 404); /* no rank */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/order", "{\"channels\":[" + S + "]}").status == 409); /* not all */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/order", "{\"channels\":[" + list + "," + S + "]}").status == 409);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/order", "{\"channels\":[" + list + "]}").status == 204);
+        CHECK(parse(pond.call(&ann, "GET", "/pond/v1/info").body)["channels"][0]["id"].asInt64() == staff);
+        CHECK(parse(pond.call(&fay, "GET", "/pond/v1/info").body)["channels"][0]["id"].asInt64() == order[1]); /* staff left out */
+
+        /* deleting the role leaves the channel to operators and administrators; then open to everyone */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/" + mods + "/delete").status == 204);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/" + mods + "/delete").status == 404);
+        CHECK(channel_id(ann, "staff") == 0 && has(pond.call(&dan, "GET", "/pond/v1/info").body, "\"roles\":[]}"));
+        CHECK(has(pond.call(&ann, "GET", "/pond/v1/members").body, "\"roles\":[]"));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + S + "/roles", "{\"roles\":null}").status == 204);
+        CHECK(channel_id(fay, "staff") == staff);
+        CHECK(pond.ctl("log", &out) == 0 && has(out, "role_create") && has(out, "channel_roles") && has(out, "channel_order"));
     }
 
     /* ---- what nobody may ask ---- */

@@ -83,8 +83,11 @@ static std::optional<std::string> nullable(const std::string &s)
     return s;
 }
 
-static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until, dms";
-static const char CHANNEL_COLS[] = "id, name, topic, position, kind";
+/* each list of roles is from GROUP_CONCAT: ids, with commas, or NULL for none */
+static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until, dms,"
+                                  " (SELECT GROUP_CONCAT(mr.role ORDER BY mr.role) FROM member_roles mr WHERE mr.member = members.id)";
+static const char CHANNEL_COLS[] = "id, name, topic, position, kind, restricted,"
+                                   " (SELECT GROUP_CONCAT(cr.role ORDER BY cr.role) FROM channel_roles cr WHERE cr.channel = channels.id)";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
 
 /* "muted": null, or {"until": ms, or null until they are unmuted} (docs/design.md, "Muting") */
@@ -95,17 +98,24 @@ static std::string muted_json(const drogon::orm::Field &f)
     return num(f) == 0 ? std::string("{\"until\":null}") : "{\"until\":" + std::to_string(num(f)) + "}";
 }
 
+/* GROUP_CONCAT's ids as a JSON array: numbers from the database, so safe as they are */
+static std::string id_list(const drogon::orm::Field &f)
+{
+    return "[" + text(f) + "]";
+}
+
 static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
 {
     return "{\"id\":" + jstr(text(row[0])) + ",\"profile\":" + (row[1].isNull() ? std::string("null") : text(row[1])) +
            ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + ",\"muted\":" + muted_json(row[4]) +
-           ",\"dms\":" + (num(row[5]) ? "true" : "false") + "}";
+           ",\"dms\":" + (num(row[5]) ? "true" : "false") + ",\"roles\":" + id_list(row[6]) + "}";
 }
 
 static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
 {
     return "{\"id\":" + std::to_string(num(row[0])) + ",\"name\":" + jstr(text(row[1])) + ",\"topic\":" + jstr(text(row[2])) +
-           ",\"position\":" + std::to_string(num(row[3])) + ",\"kind\":" + jstr(text(row[4])) + "}";
+           ",\"position\":" + std::to_string(num(row[3])) + ",\"kind\":" + jstr(text(row[4])) +
+           ",\"roles\":" + (num(row[5]) ? id_list(row[6]) : std::string("null")) + "}"; /* null: open to everyone */
 }
 
 /* `files` is the message's "files" array, or "" for a message without any */
@@ -178,13 +188,46 @@ Task<std::string> Service::pond_json(DbPtr db)
               std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "},\"dms\":" + dms + "}";
 }
 
-Task<std::string> Service::channels_json()
+Task<std::string> Service::channels_json(std::string member)
 {
+    const std::set<int64_t> hidden = co_await hidden_channels(member);
     Result r = co_await db_->execSqlCoro(std::string("SELECT ") + CHANNEL_COLS + " FROM channels WHERE deleted = 0 ORDER BY position, id");
     std::string out = "[";
     for (size_t i = 0; i < r.size(); i++)
-        out += (i ? "," : "") + channel_json(r[i]);
+        if (!hidden.count(num(r[i][0])))
+            out += (out.size() > 1 ? "," : "") + channel_json(r[i]);
     co_return out + "]";
+}
+
+Task<std::string> Service::roles_json()
+{
+    Result r = co_await db_->execSqlCoro("SELECT id, name FROM roles ORDER BY id");
+    std::string out = "[";
+    for (size_t i = 0; i < r.size(); i++)
+        out += std::string(i ? "," : "") + "{\"id\":" + std::to_string(num(r[i][0])) + ",\"name\":" + jstr(text(r[i][1])) + "}";
+    co_return out + "]";
+}
+
+/* Who may see a channel (docs/design.md, "Roles for channels"): everyone, unless it is restricted; then operators,
+ * administrators, and members holding one of its roles. */
+Task<std::set<int64_t>> Service::hidden_channels(std::string member)
+{
+    std::set<int64_t> hidden;
+    Role rank = co_await role(member);
+    if (rank != Role::MEMBER)
+        co_return hidden;
+    Result r = co_await db_->execSqlCoro("SELECT c.id FROM channels c WHERE c.restricted = 1 AND NOT EXISTS (SELECT 1 FROM channel_roles cr"
+                                         " JOIN member_roles mr ON mr.role = cr.role WHERE cr.channel = c.id AND mr.member = ?)",
+                                         member);
+    for (const auto &row : r)
+        hidden.insert(num(row[0]));
+    co_return hidden;
+}
+
+Task<bool> Service::may_see(std::string member, int64_t channel)
+{
+    const std::set<int64_t> hidden = co_await hidden_channels(member);
+    co_return !hidden.count(channel);
 }
 
 Task<std::string> Service::setting(std::string name)
@@ -322,10 +365,12 @@ Task<Answer> Service::info(std::string member)
         /* each co_await on its own, then the text (docs/design.md, "Coroutines") */
         const std::string pond = co_await pond_json(db_);
         const std::string offer = co_await offer_json(member);
-        const std::string channels = co_await channels_json();
-        const std::string voice = voice_now ? voice_now() : "[]";
+        const std::string channels = co_await channels_json(member);
+        const std::string roles = co_await roles_json();
+        const std::set<int64_t> hidden = co_await hidden_channels(member);
+        const std::string voice = voice_now ? voice_now(hidden) : "[]";
         std::string body = "{\"protocol\":" + std::to_string(PROTOCOL) + ",\"features\":" + features + "],\"pond\":" + pond +
-                           ",\"me\":" + me + ",\"offer\":" + offer + ",\"channels\":" + channels + ",\"voice\":" + voice +
+                           ",\"me\":" + me + ",\"offer\":" + offer + ",\"channels\":" + channels + ",\"roles\":" + roles + ",\"voice\":" + voice +
                            ",\"cursor\":" + std::to_string(num(c[0][0])) + "}";
         co_return Answer{200, std::move(body)};
     } catch (const DrogonDbException &e) {
@@ -333,11 +378,12 @@ Task<Answer> Service::info(std::string member)
     }
 }
 
-Task<Answer> Service::history(int64_t channel, int64_t before, int limit)
+Task<Answer> Service::history(std::string member, int64_t channel, int64_t before, int limit)
 {
     try {
         Result live = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0", channel);
-        if (live.empty())
+        const bool seen = co_await may_see(member, channel);
+        if (live.empty() || !seen)
             co_return fail(404, "no_channel");
         Result r = co_await db_->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS +
                                                  " FROM messages WHERE channel = ? AND id < ? ORDER BY id DESC LIMIT ?",
@@ -395,7 +441,8 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
     TxPtr tx;
     try {
         Result live = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0", channel);
-        if (live.empty())
+        const bool seen = co_await may_see(member, channel);
+        if (live.empty() || !seen)
             co_return fail(404, "no_channel");
         if (!files.empty() && co_await files_max() == 0)
             co_return fail(409, "files_off");
@@ -427,7 +474,7 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
         std::string msg = list.substr(1, list.size() - 2);
         if (msg.empty())
             throw std::out_of_range("message");
-        int64_t ev = co_await add_event(tx, "message", msg);
+        int64_t ev = co_await add_event(tx, "message", msg, "", channel);
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
         bump(ev);
@@ -497,6 +544,7 @@ Task<Outcome> Service::remove_member(std::string id)
         /* a role does not outlast membership: someone who comes back comes back a member */
         Result r = co_await tx->execSqlCoro("UPDATE members SET left_ms = ?, role = 'member' WHERE id = ? AND left_ms IS NULL", now_ms(), id);
         co_await tx->execSqlCoro("DELETE FROM role_offers WHERE member = ?", id);
+        co_await tx->execSqlCoro("DELETE FROM member_roles WHERE member = ?", id);
         int64_t ev = 0;
         if (r.affectedRows()) {
             const std::string left = "{\"id\":" + jstr(id) + "}";
@@ -529,10 +577,14 @@ Task<Answer> Service::leave(std::string member)
 
 Task<> Service::voice_event(std::string kind, std::string data)
 {
+    /* both kinds begin {"channel":N,...}: only those who may see it hear of it */
+    int64_t channel = 0;
+    if (data.rfind("{\"channel\":", 0) == 0)
+        channel = strtoll(data.c_str() + 11, nullptr, 10);
     TxPtr tx;
     try {
         tx = co_await db_->newTransactionCoro();
-        int64_t ev = co_await add_event(tx, kind.c_str(), data);
+        int64_t ev = co_await add_event(tx, kind.c_str(), data, "", channel);
         if (co_await Committed(std::move(tx)))
             bump(ev);
     } catch (const DrogonDbException &e) {
@@ -542,32 +594,39 @@ Task<> Service::voice_event(std::string kind, std::string data)
     }
 }
 
-Task<std::pair<std::vector<std::string>, std::vector<int64_t>>> Service::voice_gone(std::vector<std::string> members, std::vector<int64_t> channels)
+Task<std::vector<std::pair<std::string, int64_t>>> Service::voice_gone(std::vector<std::pair<std::string, int64_t>> in)
 {
-    std::pair<std::vector<std::string>, std::vector<int64_t>> gone;
-    for (auto &m : members)
-        if (!co_await is_member(m))
-            gone.first.push_back(m);
-    for (int64_t c : channels)
-        if (!co_await is_voice_channel(c))
-            gone.second.push_back(c);
+    std::vector<std::pair<std::string, int64_t>> gone;
+    for (auto &[m, c] : in) {
+        const bool member = co_await is_member(m);
+        bool still = false;
+        if (member)
+            still = co_await is_voice_channel(c, m);
+        if (!still)
+            gone.emplace_back(m, c);
+    }
     co_return gone;
 }
 
-Task<bool> Service::is_voice_channel(int64_t channel)
+Task<bool> Service::is_voice_channel(int64_t channel, std::string member)
 {
     Result r = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0 AND kind = 'voice'", channel);
-    co_return !r.empty();
+    if (r.empty())
+        co_return false;
+    const bool seen = co_await may_see(member, channel);
+    co_return seen;
 }
 
 /* ---- the event log ---- */
 
-Task<int64_t> Service::add_event(TxPtr tx, const char *kind, std::string data, std::string only_for)
+Task<int64_t> Service::add_event(TxPtr tx, const char *kind, std::string data, std::string only_for, int64_t channel)
 {
     co_await tx->execSqlCoro("SELECT value FROM settings WHERE name = 'event_lock' FOR UPDATE");
     const std::string k(kind);
     const std::optional<std::string> to = nullable(only_for);
-    Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms, only_for) VALUES (?, ?, ?, ?)", k, data, now_ms(), to);
+    const std::optional<int64_t> about = channel > 0 ? std::optional<int64_t>(channel) : std::nullopt;
+    Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms, only_for, channel) VALUES (?, ?, ?, ?, ?)", k, data, now_ms(),
+                                        to, about);
     co_return (int64_t)r.insertId();
 }
 
@@ -635,8 +694,8 @@ Task<Answer> Service::events(int64_t after, std::string member)
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
     for (;;) {
         try {
-            Result r = co_await db_->execSqlCoro("SELECT id, kind, data, only_for FROM events WHERE id > ? ORDER BY id LIMIT ?", after,
-                                                 (int64_t)EVENTS_MAX);
+            Result r = co_await db_->execSqlCoro("SELECT id, kind, data, only_for, channel FROM events WHERE id > ? ORDER BY id LIMIT ?",
+                                                 after, (int64_t)EVENTS_MAX);
             int64_t oldest;
             {
                 std::lock_guard<std::mutex> g(mu_);
@@ -654,14 +713,29 @@ Task<Answer> Service::events(int64_t after, std::string member)
             /* direct messages and what goes with them (dms.cpp): for this member alone, from memory, with no number */
             const std::vector<std::string> mine = take_inbox(member);
             if (!r.empty() || !mine.empty()) {
-                /* an event for one member is left out for the rest; the cursor still moves past it */
+                /* an event for one member is left out for the rest, and one about a channel for those who may not see it now
+                 * (docs/design.md, "Roles for channels"); the cursor still moves past it. `channels` is written for each member:
+                 * the channels they see now, in order. */
+                std::set<int64_t> hidden;
+                std::string mine_now;
+                bool asked = false;
+                for (size_t i = 0; i < r.size(); i++)
+                    if (!asked && (!r[i][4].isNull() || text(r[i][1]) == "channels")) {
+                        hidden = co_await hidden_channels(member);
+                        mine_now = co_await channels_json(member);
+                        asked = true;
+                    }
                 std::string out = "{\"events\":[";
                 bool first = true;
                 for (size_t i = 0; i < r.size(); i++) {
                     if (!r[i][3].isNull() && text(r[i][3]) != member)
                         continue;
-                    out += std::string(first ? "" : ",") + "{\"id\":" + std::to_string(num(r[i][0])) + ",\"kind\":" + jstr(text(r[i][1])) +
-                           ",\"data\":" + text(r[i][2]) + "}";
+                    if (!r[i][4].isNull() && hidden.count(num(r[i][4])))
+                        continue;
+                    const std::string kind = text(r[i][1]);
+                    const std::string data = kind == "channels" ? "{\"channels\":" + mine_now + "}" : text(r[i][2]);
+                    out += std::string(first ? "" : ",") + "{\"id\":" + std::to_string(num(r[i][0])) + ",\"kind\":" + jstr(kind) +
+                           ",\"data\":" + data + "}";
                     first = false;
                 }
                 for (const std::string &e : mine) {
@@ -782,7 +856,7 @@ Task<Outcome> Service::channel_create(std::string name, std::string topic, std::
                                             " SELECT ?, ?, COALESCE(MAX(position), -1) + 1, ?, ? FROM channels WHERE deleted = 0",
                                             name, t, now_ms(), kind);
         Result c = co_await tx->execSqlCoro(std::string("SELECT ") + CHANNEL_COLS + " FROM channels WHERE id = ?", (int64_t)r.insertId());
-        int64_t ev = co_await add_event(tx, "channel", channel_json(c.at(0)));
+        int64_t ev = co_await add_event(tx, "channel", channel_json(c.at(0)), "", num(c.at(0)[0]));
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);
@@ -812,7 +886,7 @@ Task<Outcome> Service::channel_set(std::string name, const char *column, std::st
         }
         const std::string now_called = std::string(column) == "name" ? value : name;
         Result c = co_await tx->execSqlCoro(std::string("SELECT ") + CHANNEL_COLS + " FROM channels WHERE name = ? AND deleted = 0", now_called);
-        int64_t ev = co_await add_event(tx, "channel", channel_json(c.at(0)));
+        int64_t ev = co_await add_event(tx, "channel", channel_json(c.at(0)), "", num(c.at(0)[0]));
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);

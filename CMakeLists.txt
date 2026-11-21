@@ -108,6 +108,7 @@ add_library(pond_lib STATIC
   src/seal.cpp
   src/ratelimit.cpp
   src/roles.cpp
+  src/channel_roles.cpp
   src/pond.cpp
   src/reqsig.cpp
   src/routes.cpp

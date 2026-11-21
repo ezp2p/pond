@@ -70,6 +70,20 @@ static const char *const STEPS[][8] = {
         "ALTER TABLE members ADD COLUMN dms TINYINT NOT NULL DEFAULT 1",
         nullptr,
     },
+    {
+        /* roles for channels (docs/design.md, "Roles for channels"): named by the admins, held by members, and asked for by a
+         * channel that is not open to everyone (`restricted`). An event about one channel says which, so members who may not
+         * see it are not given it. */
+        "CREATE TABLE roles (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(32) NOT NULL, created_ms BIGINT NOT NULL,"
+        " UNIQUE KEY (name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE member_roles (member CHAR(52) NOT NULL, role BIGINT NOT NULL, PRIMARY KEY (member, role), KEY (role))"
+        " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE channel_roles (channel BIGINT NOT NULL, role BIGINT NOT NULL, PRIMARY KEY (channel, role), KEY (role))"
+        " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "ALTER TABLE channels ADD COLUMN restricted TINYINT NOT NULL DEFAULT 0",
+        "ALTER TABLE events ADD COLUMN channel BIGINT NULL",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run
