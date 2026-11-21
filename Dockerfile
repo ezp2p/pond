@@ -14,6 +14,7 @@ WORKDIR /src
 COPY CMakeLists.txt ./
 COPY patches patches
 COPY src src
+COPY third_party third_party
 COPY tests tests
 # Drogon and libdatachannel are fetched and built here, at the releases CMakeLists.txt names, and linked in
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \

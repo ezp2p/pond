@@ -1,117 +1,65 @@
 #include "encoding.h"
 
-#include <openssl/evp.h>
+#include <puddle_proto.h>
+
 #include <openssl/rand.h>
+
+#include <cstring>
+
+/* The protocol's encodings are libpuddle-proto's (third_party/protocol/lib); these are the Pond's std::string faces on them. */
 
 namespace pond {
 
 std::string base32(const unsigned char *in, size_t len)
 {
-    static const char alpha[] = "abcdefghijklmnopqrstuvwxyz234567";
-    std::string out;
-    uint32_t buf = 0;
-    int bits = 0;
-    for (size_t i = 0; i < len; i++) {
-        buf = (buf << 8) | in[i];
-        bits += 8;
-        while (bits >= 5) {
-            out += alpha[(buf >> (bits - 5)) & 31];
-            bits -= 5;
-        }
-    }
-    if (bits > 0)
-        out += alpha[(buf << (5 - bits)) & 31];
+    std::string out((len * 8 + 4) / 5 + 1, '\0');
+    out.resize(pp_base32_encode(in, len, out.data(), out.size()));
     return out;
 }
-
-static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 std::string base64(const unsigned char *in, size_t len)
 {
-    std::string out;
-    for (size_t i = 0; i < len; i += 3) {
-        uint32_t v = (uint32_t)in[i] << 16 | (i + 1 < len ? (uint32_t)in[i + 1] << 8 : 0) | (i + 2 < len ? in[i + 2] : 0);
-        out += B64[v >> 18 & 63];
-        out += B64[v >> 12 & 63];
-        out += i + 1 < len ? B64[v >> 6 & 63] : '=';
-        out += i + 2 < len ? B64[v & 63] : '=';
-    }
+    std::string out((len + 2) / 3 * 4 + 1, '\0');
+    out.resize(pp_base64_encode(in, len, out.data(), out.size()));
     return out;
-}
-
-static int b64_value(char c)
-{
-    if (c >= 'A' && c <= 'Z')
-        return c - 'A';
-    if (c >= 'a' && c <= 'z')
-        return c - 'a' + 26;
-    if (c >= '0' && c <= '9')
-        return c - '0' + 52;
-    return c == '+' ? 62 : c == '/' ? 63 : -1;
 }
 
 bool unbase64(std::string_view in, unsigned char *out, size_t want)
 {
-    if (in.size() % 4 != 0 || in.size() / 4 * 3 < want || in.size() / 4 * 3 >= want + 3)
-        return false;
-    size_t pad = in.size() / 4 * 3 - want; /* 0, 1 or 2 '=' at the end */
+    std::string s(in);
+    std::string buf(want + 3, '\0');
     size_t n = 0;
-    for (size_t i = 0; i < in.size(); i += 4) {
-        int v[4];
-        for (int k = 0; k < 4; k++) {
-            bool padding = i + 4 == in.size() && k >= 4 - (int)pad;
-            v[k] = padding ? (in[i + k] == '=' ? 0 : -1) : b64_value(in[i + k]);
-            if (v[k] < 0)
-                return false;
-        }
-        uint32_t w = (uint32_t)v[0] << 18 | (uint32_t)v[1] << 12 | (uint32_t)v[2] << 6 | (uint32_t)v[3];
-        unsigned char b[3] = {(unsigned char)(w >> 16), (unsigned char)(w >> 8), (unsigned char)w};
-        for (int k = 0; k < 3; k++) {
-            if (n < want)
-                out[n++] = b[k];
-            else if (b[k]) /* bits past the end must be zero */
-                return false;
-        }
-    }
-    return n == want;
+    if (pp_base64_decode(s.c_str(), (unsigned char *)buf.data(), buf.size(), &n) != 0 || n != want)
+        return false;
+    memcpy(out, buf.data(), want);
+    return true;
 }
 
 std::string hex(const unsigned char *in, size_t len)
 {
-    static const char digits[] = "0123456789abcdef";
-    std::string out;
-    for (size_t i = 0; i < len; i++) {
-        out += digits[in[i] >> 4];
-        out += digits[in[i] & 15];
-    }
+    std::string out(2 * len + 1, '\0');
+    pp_hex_encode(in, (unsigned)len, out.data());
+    out.resize(2 * len);
     return out;
 }
 
 bool unhex(std::string_view in, unsigned char *out, size_t want)
 {
-    if (in.size() != want * 2)
+    if (in.size() != 2 * want)
         return false;
-    auto v = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
-    for (size_t i = 0; i < want; i++) {
-        int hi = v(in[2 * i]), lo = v(in[2 * i + 1]);
-        if (hi < 0 || lo < 0)
-            return false;
-        out[i] = (unsigned char)(hi << 4 | lo);
-    }
-    return true;
+    return pp_hex_decode(std::string(in).c_str(), out, want) == 0;
 }
 
 void sha256(const void *data, size_t len, unsigned char out[32])
 {
-    unsigned n = 32;
-    EVP_Digest(data, len, out, &n, EVP_sha256(), nullptr);
+    pp_sha256(data, len, out);
 }
 
 std::string sha256_hex(std::string_view data)
 {
-    unsigned char h[32];
-    sha256(data.data(), data.size(), h);
-    return hex(h, 32);
+    char h[65];
+    pp_sha256_hex(data.data(), data.size(), h);
+    return h;
 }
 
 bool random_bytes(unsigned char *out, size_t len)

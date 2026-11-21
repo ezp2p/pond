@@ -25,7 +25,8 @@ docker exec pond pondctl invite create     # the pond://… link to give out
 
 It is C++20, built on [Drogon](https://github.com/drogonframework/drogon), which CMake fetches and builds the first time
 (a few minutes). It needs MariaDB (the server, and its C client), OpenSSL 3 or later, hiredis, jsoncpp and yaml-cpp. It
-shares no code with Puddle.
+shares one library with Puddle and Levee, libpuddle-proto (the protocol's bytes), from the submodule `third_party/protocol`:
+clone with `--recurse-submodules`, or run `git submodule update --init`.
 
 ```sh
 brew install mariadb openssl hiredis jsoncpp yaml-cpp

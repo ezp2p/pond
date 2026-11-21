@@ -61,6 +61,13 @@ if(NOT TARGET yaml-cpp::yaml-cpp AND TARGET yaml-cpp)   # before 0.8 (Debian 12)
 endif()
 find_package(OpenSSL 3 REQUIRED)
 
+# libpuddle-proto: the protocol's bytes (ids, chains, signatures, receipts, sealing), shared with Puddle and Levee. A git
+# submodule: `git submodule update --init` after cloning.
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/protocol/lib/CMakeLists.txt)
+  message(FATAL_ERROR "third_party/protocol is missing: run git submodule update --init")
+endif()
+add_subdirectory(third_party/protocol/lib EXCLUDE_FROM_ALL)
+
 # Voice channels (docs/voice.md) need libdatachannel: the system's when it has one (Arch, Homebrew), otherwise built from
 # source at a fixed release (Debian has no package). Without it Pond builds with no voice: `features` doesn't say `voice`.
 option(POND_VOICE "Voice channels, with libdatachannel" ON)
@@ -108,7 +115,7 @@ add_library(pond_lib STATIC
   src/tls.cpp
   src/voice.cpp)
 target_include_directories(pond_lib PUBLIC src)
-target_link_libraries(pond_lib PUBLIC drogon yaml-cpp::yaml-cpp OpenSSL::Crypto ${POND_DATACHANNEL})
+target_link_libraries(pond_lib PUBLIC drogon yaml-cpp::yaml-cpp puddle_proto OpenSSL::Crypto ${POND_DATACHANNEL})
 if(POND_DATACHANNEL)
   target_compile_definitions(pond_lib PUBLIC POND_HAVE_VOICE=1)
 endif()
@@ -127,8 +134,8 @@ install(TARGETS pondd pondctl RUNTIME DESTINATION bin)
 # skipped without one.
 set(PUDDLED ${CMAKE_CURRENT_SOURCE_DIR}/../puddle/build/puddled CACHE FILEPATH "A built puddled, for the e2e test")
 enable_testing()
-# protocol checks Pond against the Puddle Protocol's test vectors, from a checkout of ezp2p/protocol beside this one (or
-# POND_PROTOCOL_DIR), and is skipped without one.
+# protocol checks Pond against the Puddle Protocol's test vectors, from the submodule third_party/protocol (or
+# POND_PROTOCOL_DIR).
 foreach(t config identity protocol pond e2e voice)
   add_executable(${t}_test tests/${t}_test.cpp)
   target_link_libraries(${t}_test PRIVATE pond_lib OpenSSL::SSL)
