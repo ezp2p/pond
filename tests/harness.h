@@ -388,7 +388,7 @@ struct PondProc {
         conf = db.dir + "/pond.yaml";
         port = free_port();
         std::ofstream f(conf);
-        f << "listen: 127.0.0.1\nport: " << port << "\ndata_dir: " << dir << "\nevents_wait_ms: " << events_wait_ms
+        f << "listen: 127.0.0.1\nports:\n  chat: " << port << "\ndata_dir: " << dir << "\nevents_wait_ms: " << events_wait_ms
           << "\ndatabase:\n  host: 127.0.0.1\n  port: " << db.port << "\n  user: root\n  name: pond\n";
         f.close();
         std::string out;

@@ -2,10 +2,14 @@
 
 # Where pondd listens. Put IPv6 addresses in quotes.
 listen: 0.0.0.0
-port: 8443
 
-# What invite links say: how people reach this Pond, host[:port] (the port is left off when it is 443).
-address: pond.example.org:8443
+# The two ports, both 443 unless said: open 443 for TCP and UDP on the router.
+ports:
+  chat: 443     # TCP (HTTPS): everything but voice: joining, channels, messages, files
+  voice: 443    # UDP: voice and video in voice channels
+
+# What invite links say: how people reach this Pond, host[:chat port] (the port is left off when it is 443).
+address: pond.example.org
 
 # The Pond's key (pond.key) and TLS certificate (cert.pem, key.pem; a self-signed one is made if there is none).
 data_dir: /var/lib/pond

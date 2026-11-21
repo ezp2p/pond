@@ -69,7 +69,7 @@ static bool database(const YAML::Node &map, DbConfig &db, std::string &err)
     return true;
 }
 
-static bool voice(const YAML::Node &n, VoiceConfig &v, std::string &err)
+static bool voice(const YAML::Node &n, VoiceConfig &v, unsigned &old_port, std::string &err)
 {
     if (n.IsScalar() && (n.Scalar() == "false" || n.Scalar() == "true")) {
         v.on = n.Scalar() == "true";
@@ -82,7 +82,7 @@ static bool voice(const YAML::Node &n, VoiceConfig &v, std::string &err)
     for (auto it : n) {
         std::string k = it.first.as<std::string>();
         const YAML::Node &x = it.second;
-        bool ok = k == "port"             ? number(x, "voice.port", 1, 65535, v.port, err)
+        bool ok = k == "port"             ? number(x, "voice.port", 1, 65535, old_port, err)
                   : k == "max_in_channel" ? number(x, "voice.max_in_channel", 0, 65535, v.max_in_channel, err)
                                           : (err = "unknown setting voice." + k, false);
         if (!ok)
@@ -91,8 +91,29 @@ static bool voice(const YAML::Node &n, VoiceConfig &v, std::string &err)
     return true;
 }
 
+/* ports: {chat, voice}, both optional */
+static bool ports(const YAML::Node &n, unsigned &chat, unsigned &voice, std::string &err)
+{
+    if (!n.IsMap()) {
+        err = "ports must be a map: chat (TCP) and voice (UDP)" + where(n);
+        return false;
+    }
+    for (auto it : n) {
+        std::string k = it.first.as<std::string>();
+        const YAML::Node &x = it.second;
+        bool ok = k == "chat"    ? number(x, "ports.chat", 1, 65535, chat, err)
+                  : k == "voice" ? number(x, "ports.voice", 1, 65535, voice, err)
+                                 : (err = "unknown setting ports." + k + " (there are two: chat, TCP; voice, UDP)", false);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
 bool load_config(const std::string &path, Config &out, std::string &err)
 {
+    /* given in the file, new names and old: 0 when not */
+    unsigned chat = 0, voice_new = 0, port_old = 0, voice_old = 0;
     YAML::Node root;
     try {
         root = YAML::LoadFile(path);
@@ -110,14 +131,34 @@ bool load_config(const std::string &path, Config &out, std::string &err)
         YAML::Node v = it->second; /* a copy: it-> is a temporary the iterator makes, gone after this line */
         long wait;
         ok = k == "listen"           ? scalar(v, "listen", out.listen, err)
-             : k == "port"           ? number(v, "port", 1, 65535, out.port, err)
+             : k == "ports"          ? ports(v, chat, voice_new, err)
+             : k == "port"           ? number(v, "port", 1, 65535, port_old, err)
              : k == "address"        ? scalar(v, "address", out.address, err)
              : k == "data_dir"       ? scalar(v, "data_dir", out.data_dir, err)
              : k == "threads"        ? number(v, "threads", 0, 1024, out.threads, err)
              : k == "events_wait_ms" ? number(v, "events_wait_ms", 100, 60000, wait, err) && (out.events_wait_ms = (int)wait, true)
              : k == "database"       ? database(v, out.db, err)
-             : k == "voice"          ? voice(v, out.voice, err)
+             : k == "voice"          ? voice(v, out.voice, voice_old, err)
                                      : (err = "unknown setting " + k, false);
+    }
+    /* the older names: port (now ports.chat) and voice.port (now ports.voice). An older pond.yaml set only port, and voice
+     * followed it, so it still does. */
+    if (ok && chat && port_old) {
+        err = "port and ports.chat are the same setting: keep ports.chat";
+        ok = false;
+    }
+    if (ok && voice_new && voice_old) {
+        err = "voice.port and ports.voice are the same setting: keep ports.voice";
+        ok = false;
+    }
+    if (ok) {
+        if (port_old)
+            out.notes.push_back("pond.yaml: port is now called ports.chat (TCP); it still works, but rename it");
+        if (voice_old)
+            out.notes.push_back("pond.yaml: voice.port is now called ports.voice (UDP); it still works, but rename it");
+        out.chat_port = chat ? chat : port_old ? port_old : out.chat_port;
+        unsigned v = voice_new ? voice_new : voice_old;
+        out.voice_port = v ? v : out.chat_port;
     }
     if (ok && out.data_dir.empty()) {
         err = "data_dir is required";
@@ -135,7 +176,7 @@ std::string link_address(const Config &c)
     std::string host = c.listen == "0.0.0.0" || c.listen == "::" ? "127.0.0.1" : c.listen;
     if (host.find(':') != std::string::npos)
         host = "[" + host + "]";
-    return c.port == 443 ? host : host + ":" + std::to_string(c.port);
+    return c.chat_port == 443 ? host : host + ":" + std::to_string(c.chat_port);
 }
 
 } // namespace pond

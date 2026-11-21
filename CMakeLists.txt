@@ -127,7 +127,7 @@ set(PUDDLED ${CMAKE_CURRENT_SOURCE_DIR}/../puddle/build/puddled CACHE FILEPATH "
 enable_testing()
 # protocol checks Pond against the Puddle Protocol's test vectors, from a checkout of ezp2p/protocol beside this one (or
 # POND_PROTOCOL_DIR), and is skipped without one.
-foreach(t identity protocol pond e2e voice)
+foreach(t config identity protocol pond e2e voice)
   add_executable(${t}_test tests/${t}_test.cpp)
   target_link_libraries(${t}_test PRIVATE pond_lib OpenSSL::SSL)
   target_compile_options(${t}_test PRIVATE -Wall -Wextra)

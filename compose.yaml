@@ -1,11 +1,12 @@
 # A Pond and its MariaDB, in Docker (docs/docker.md). The file on its own is enough: no checkout needed.
 #
 #   1. Beside this file, a .env (copy .env.example) with:
-#        POND_ADDRESS      how people reach this Pond, host[:port]: "pond.example.org:8443", with that port (TCP and UDP)
-#                          forwarded to this machine
+#        POND_ADDRESS      how people reach this Pond: "pond.example.org", with port 443 forwarded to this machine for
+#                          TCP and UDP (host:port if the chat port isn't 443)
 #        POND_NAME         the Pond's name, given to it on the first start
 #        POND_DB_PASSWORD  the database password (anything long; nothing outside these two containers uses it)
-#      and optionally POND_IMAGE (ghcr.io/ezp2p/pond:dev for the newest build of dev) and POND_PORT (8443).
+#      and optionally POND_IMAGE (ghcr.io/ezp2p/pond:dev for the newest build of dev), POND_CHAT_PORT (TCP, 443) and
+#      POND_VOICE_PORT (UDP, the chat port's number).
 #   2. docker compose up -d
 #   3. docker exec pond pondctl invite create      the pond://… link to give out
 #
@@ -21,14 +22,15 @@ services:
       db:
         condition: service_healthy
     environment:
-      POND_ADDRESS: ${POND_ADDRESS:?set POND_ADDRESS in .env, e.g. pond.example.org:8443}
+      POND_ADDRESS: ${POND_ADDRESS:?set POND_ADDRESS in .env, e.g. pond.example.org}
       POND_NAME: ${POND_NAME:?set POND_NAME in .env, the Pond's name}
-      POND_PORT: ${POND_PORT:-8443}
+      POND_CHAT_PORT: ${POND_CHAT_PORT:-443}
+      POND_VOICE_PORT: ${POND_VOICE_PORT:-${POND_CHAT_PORT:-443}}
       POND_DB_HOST: db
       POND_DB_PASSWORD: ${POND_DB_PASSWORD:?set POND_DB_PASSWORD in .env}
     ports:
-      - "${POND_PORT:-8443}:${POND_PORT:-8443}/tcp"
-      - "${POND_PORT:-8443}:${POND_PORT:-8443}/udp"
+      - "${POND_CHAT_PORT:-443}:${POND_CHAT_PORT:-443}/tcp"                                       # chat
+      - "${POND_VOICE_PORT:-${POND_CHAT_PORT:-443}}:${POND_VOICE_PORT:-${POND_CHAT_PORT:-443}}/udp"   # voice and video
     volumes:
       - pond:/data
 

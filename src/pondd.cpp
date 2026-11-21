@@ -51,11 +51,11 @@ int main(int argc, char **argv)
     /* TLS only carries what members and the Pond say to each other, sealed (spec/09): any certificate will do, the Pond's own
      * or a reverse proxy's in front of it, and nothing depends on which. */
     std::string cert = cfg.data_dir + "/cert.pem";
-    /* voice channels (docs/voice.md): one UDP port, the HTTPS port's number unless said */
+    /* voice channels (docs/voice.md): one UDP port, ports.voice */
     std::unique_ptr<Voice> voice;
     if (cfg.voice.on && Voice::built()) {
         VoiceSettings vs;
-        vs.port = cfg.voice.port ? cfg.voice.port : cfg.port;
+        vs.port = cfg.voice_port;
         vs.bind = cfg.listen == "0.0.0.0" || cfg.listen == "::" ? "" : cfg.listen;
         vs.max_in_channel = cfg.voice.max_in_channel;
         voice = std::make_unique<Voice>(svc, vs, app().getLoop());
@@ -79,7 +79,7 @@ int main(int argc, char **argv)
     };
     app()
         .setLogLevel(trantor::Logger::kInfo)
-        .addListener(cfg.listen, (uint16_t)cfg.port, true, cert, cfg.data_dir + "/key.pem")
+        .addListener(cfg.listen, (uint16_t)cfg.chat_port, true, cert, cfg.data_dir + "/key.pem")
         .setThreadNum(cfg.threads)
         .enableServerHeader(false)
         .setClientMaxBodySize(2 << 20) /* a chunk of a file and its headers; the routes refuse more than each takes, with a 404 */
@@ -91,9 +91,11 @@ int main(int argc, char **argv)
         svc.watch();
         if (voice) {
             voice->start();
-            LOG_INFO << "voice channels on UDP port " << (cfg.voice.port ? cfg.voice.port : cfg.port);
+            LOG_INFO << "voice port: " << cfg.voice_port << " (UDP, voice and video)";
         }
-        LOG_INFO << "Pond " << key.id << " listening on " << cfg.listen << ":" << cfg.port;
+        for (const std::string &n : cfg.notes)
+            LOG_WARN << n;
+        LOG_INFO << "Pond " << key.id << " listening on " << cfg.listen << ", chat port: " << cfg.chat_port << " (TCP)";
     });
     app().run();
     return 0;

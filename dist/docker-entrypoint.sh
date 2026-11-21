@@ -2,7 +2,9 @@
 # Start pondd in the container (docs/docker.md). On the first start, write /data/pond.yaml from these variables; after that
 # the file is yours to edit and they are not read again:
 #   POND_ADDRESS      how people reach this Pond, host[:port], as invite links say it (needed for invites that work)
-#   POND_PORT         the port pondd listens on inside the container, HTTPS and voice's UDP (default 8443)
+#   POND_CHAT_PORT    the chat port: TCP, HTTPS, everything but voice (default 443)
+#   POND_VOICE_PORT   the voice port: UDP, voice and video (default: the chat port's number)
+#   (POND_PORT, the older name, sets both)
 #   POND_DB_HOST      MariaDB (default "db", compose.yaml's), POND_DB_PORT (3306), POND_DB_USER (pond),
 #   POND_DB_PASSWORD  POND_DB_NAME (pond)
 # Then, if the Pond has no key yet: with POND_NAME set, `pondctl init "$POND_NAME"` once MariaDB answers; without it, wait
@@ -13,19 +15,26 @@ config=/data/pond.yaml
 
 quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
 
+chat_port=${POND_CHAT_PORT:-${POND_PORT:-443}}
+voice_port=${POND_VOICE_PORT:-$chat_port}
+
 if [ ! -e "$config" ]; then
     {
         echo "# Pond configuration (written by the container on its first start; docs/design.md says what each setting does)"
         echo
-        echo "# Every interface inside the container; publish the port (TCP and UDP) with docker run -p or compose.yaml."
+        echo "# Every interface inside the container; publish both ports with docker run -p or compose.yaml."
         echo "listen: 0.0.0.0"
-        echo "port: ${POND_PORT:-8443}"
         echo
-        echo "# What invite links say: how people reach this Pond, host[:port] (the port is left off when it is 443)."
+        echo "# Both 443 unless said: one number, opened on the router for TCP and UDP."
+        echo "ports:"
+        printf '  chat: %-6s # TCP (HTTPS): everything but voice: joining, channels, messages, files\n' "$chat_port"
+        printf '  voice: %-5s # UDP: voice and video in voice channels\n' "$voice_port"
+        echo
+        echo "# What invite links say: how people reach this Pond, host[:chat port] (the port is left off when it is 443)."
         if [ -n "${POND_ADDRESS:-}" ]; then
             echo "address: $(quote "$POND_ADDRESS")"
         else
-            echo "# address: pond.example.org:8443"
+            echo "# address: pond.example.org"
         fi
         echo
         echo "# The Pond's key, its TLS certificate (self-signed unless you put your own here) and uploads."

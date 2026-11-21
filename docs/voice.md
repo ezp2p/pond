@@ -76,7 +76,7 @@ The Puddle makes the connection, signed like every request a member makes, and a
   tracks `v1` to `v16` that only come in; and a
   data channel `frames` (unordered, never sent again) for the voices that come back. `udp` is the port the Puddle's calls
   use, so the Pond can add the Puddle's own addresses; behind NAT those won't answer, and the peer-reflexive one will.
-- **The answer** names the Pond's UDP port for voice (`voice.port` in `pond.yaml`, the HTTPS port's number unless set),
+- **The answer** names the Pond's UDP port for voice (`ports.voice` in `pond.yaml`, the chat port's number unless set),
   and the Pond's advertised address is a candidate at that port. Every connection to the Pond shares that one port, so
   a Pond operator opens one UDP port beside the HTTPS one.
 - **Bound to who they are**: the offer names the Puddle's DTLS fingerprint and travels in a request signed by the member;

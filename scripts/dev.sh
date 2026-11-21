@@ -26,7 +26,8 @@ for _ in $(seq 100); do mariadb --no-defaults -h 127.0.0.1 -P $db_port -u root -
 
 cat > "$dir/pond.yaml" <<YAML
 listen: 127.0.0.1
-port: 8900
+ports:
+  chat: 8900
 data_dir: $dir/data
 database:
   host: 127.0.0.1
