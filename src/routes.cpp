@@ -33,7 +33,8 @@ enum Kind {
     VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET, MEMBER_CHAIN, DM_SEND, DM_SETTINGS, DM_PIECE_GET,
     DM_PIECE_PUT,
     ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN,
-    ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, ADMIN_MUTE, ADMIN_UNMUTE, NONE
+    ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, ADMIN_MUTE, ADMIN_ROLE_CREATE, ADMIN_ROLE_EDIT, ADMIN_ROLE_DELETE,
+    ADMIN_MEMBER_ROLES, ADMIN_CHANNEL_ROLES, ADMIN_CHANNEL_ORDER, ADMIN_UNMUTE, NONE
 };
 
 /* The routes only an operator or administrator may use (docs/design.md, "Roles"). */
@@ -72,6 +73,8 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
     if (post && p == "pond") return ADMIN_POND;
     if (post && p == "icon") return ADMIN_ICON;
     if (post && p == "channels/create") return ADMIN_CHANNEL_CREATE;
+    if (post && p == "channels/order") return ADMIN_CHANNEL_ORDER;
+    if (post && p == "roles/create") return ADMIN_ROLE_CREATE;
     if (get && p == "bans") return ADMIN_BANS;
     if (get && p == "invites") return ADMIN_INVITES;
     if (post && p == "invites/create") return ADMIN_INVITE_CREATE;
@@ -89,6 +92,11 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
     if (post && split("channels/", id, verb) && (channel = number_of(id, false)) > 0) {
         if (verb == "edit") return ADMIN_CHANNEL_EDIT;
         if (verb == "delete") return ADMIN_CHANNEL_DELETE;
+        if (verb == "roles") return ADMIN_CHANNEL_ROLES;
+    }
+    if (post && split("roles/", id, verb) && (channel = number_of(id, false)) > 0) { /* the role's id, in `channel` */
+        if (verb == "edit") return ADMIN_ROLE_EDIT;
+        if (verb == "delete") return ADMIN_ROLE_DELETE;
     }
     if (post && split("members/", id, verb) && user_id_ok(id)) {
         member = std::string(id);
@@ -96,6 +104,7 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
         if (verb == "ban") return ADMIN_BAN;
         if (verb == "mute") return ADMIN_MUTE;
         if (verb == "unmute") return ADMIN_UNMUTE;
+        if (verb == "roles") return ADMIN_MEMBER_ROLES;
     }
     if (post && split("bans/", id, verb) && user_id_ok(id) && verb == "unban") {
         member = std::string(id);
@@ -209,6 +218,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 static bool takes_body(Kind k)
 {
     return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == DM_SEND || k == DM_SETTINGS || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
+           k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH;
 }
@@ -239,6 +249,20 @@ static bool body_files(const Json::Value &json, std::vector<FileRef> &out)
                 *to = o[key].asInt64();
             }
         out.push_back(std::move(f));
+    }
+    return true;
+}
+
+/* `json[key]`: an array of up to `max` ids (whole numbers above 0) */
+static bool body_ids(const Json::Value &json, const char *key, size_t max, std::vector<int64_t> &out)
+{
+    const Json::Value &a = json[key];
+    if (!a.isArray() || a.size() > max)
+        return false;
+    for (const auto &v : a) {
+        if (!v.isInt64() || v.asInt64() < 1)
+            return false;
+        out.push_back(v.asInt64());
     }
     return true;
 }
@@ -421,7 +445,7 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         int64_t before = q.count("before") ? q["before"] : 0, limit = q.count("limit") ? q["limit"] : HISTORY_DEFAULT;
         if (limit < 1 || limit > HISTORY_MAX)
             co_return fail(400, "bad_query");
-        co_return co_await svc_.history(channel, before, (int)limit);
+        co_return co_await svc_.history(sender, channel, before, (int)limit);
     }
     case SEND: {
         std::string text, nonce;
@@ -593,6 +617,43 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
     }
     case ADMIN_UNMUTE:
         co_return co_await svc_.admin_unmute(sender, member);
+    case ADMIN_ROLE_CREATE:
+    case ADMIN_ROLE_EDIT: {
+        std::string name;
+        if (!get_string(json, "name", name))
+            co_return fail(400, "bad_request");
+        if (k == ADMIN_ROLE_CREATE)
+            co_return co_await svc_.admin_role_create(sender, name);
+        co_return co_await svc_.admin_role_edit(sender, channel, name);
+    }
+    case ADMIN_ROLE_DELETE:
+        co_return co_await svc_.admin_role_delete(sender, channel);
+    case ADMIN_MEMBER_ROLES: {
+        /* {roles: [ids]}: the roles they hold now */
+        std::vector<int64_t> roles;
+        if (!body_ids(json, "roles", (size_t)ROLES_MAX, roles))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_member_roles(sender, member, std::move(roles));
+    }
+    case ADMIN_CHANNEL_ROLES: {
+        /* {roles: null}: everyone sees it; {roles: [ids]}: operators, administrators, and members with one of these */
+        std::optional<std::vector<int64_t>> roles;
+        if (!json.isMember("roles"))
+            co_return fail(400, "bad_request");
+        if (!json["roles"].isNull()) {
+            roles.emplace();
+            if (!body_ids(json, "roles", (size_t)ROLES_MAX, *roles))
+                co_return fail(400, "bad_request");
+        }
+        co_return co_await svc_.admin_channel_roles(sender, channel, std::move(roles));
+    }
+    case ADMIN_CHANNEL_ORDER: {
+        /* {channels: [ids]}: every live channel, first to last */
+        std::vector<int64_t> channels;
+        if (!body_ids(json, "channels", 10000, channels))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_channel_order(sender, std::move(channels));
+    }
     case ADMIN_INVITES:
         co_return co_await svc_.admin_invites();
     case ADMIN_INVITE_CREATE: {

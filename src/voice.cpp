@@ -38,7 +38,7 @@ Answer Voice::state(const std::string &, const std::string &, std::optional<bool
 }
 Answer Voice::watch(const std::string &, const std::string &, const std::map<int, std::string> &) { return fail(404, "no_session"); }
 Answer Voice::leave(const std::string &, const std::string &) { return fail(404, "no_session"); }
-std::string Voice::now_json() { return "[]"; }
+std::string Voice::now_json(const std::set<int64_t> &) { return "[]"; }
 
 #else
 
@@ -597,28 +597,25 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
         }
     }
 
-    /* Members removed, banned or gone, and channels deleted: done by pondctl or another route, so asked of the database */
+    /* Members removed, banned or gone, channels deleted, and channels a member may no longer see (docs/design.md, "Roles for
+     * channels"): done by pondctl or another route, so asked of the database */
     Task<> check()
     {
-        std::vector<std::string> members;
-        std::vector<int64_t> channels;
+        std::vector<std::pair<std::string, int64_t>> here;
         {
             std::lock_guard<std::mutex> g(mu);
-            for (auto &[m, s] : of_member)
-                members.push_back(m);
-            for (auto &[c, list] : in_channel)
-                channels.push_back(c);
+            for (auto &[id, s] : sessions)
+                here.emplace_back(s->member, s->channel);
         }
         try {
-            auto [gone_members, gone_channels] = co_await svc.voice_gone(members, channels);
+            auto gone = co_await svc.voice_gone(here);
             std::lock_guard<std::mutex> g(mu);
             std::vector<SessionPtr> out;
             for (auto &[id, s] : sessions)
-                if (std::find(gone_members.begin(), gone_members.end(), s->member) != gone_members.end() ||
-                    std::find(gone_channels.begin(), gone_channels.end(), s->channel) != gone_channels.end())
+                if (std::find(gone.begin(), gone.end(), std::make_pair(s->member, s->channel)) != gone.end())
                     out.push_back(s);
             for (auto &s : out)
-                drop(s, "no longer a member, or the channel went");
+                drop(s, "no longer a member, the channel went, or they may no longer see it");
         } catch (const std::exception &e) {
             LOG_ERROR << "voice: " << e.what();
         }
@@ -682,7 +679,7 @@ void Voice::stop()
 
 Task<Answer> Voice::join(std::string member, int64_t channel, std::string sdp, int udp, std::string peer_ip)
 {
-    const bool voice = co_await impl_->svc.is_voice_channel(channel);
+    const bool voice = co_await impl_->svc.is_voice_channel(channel, member);
     if (!voice)
         co_return fail(404, "no_channel");
     auto impl = impl_;
@@ -735,12 +732,13 @@ Answer Voice::leave(const std::string &member, const std::string &session)
     return Answer{204, ""};
 }
 
-std::string Voice::now_json()
+std::string Voice::now_json(const std::set<int64_t> &hidden)
 {
     std::lock_guard<std::mutex> g(impl_->mu);
     std::string out = "[";
     for (auto &[c, list] : impl_->in_channel)
         for (auto &s : list)
+            if (!hidden.count(c))
             if (s->announced)
                 out += (out.size() > 1 ? "," : "") + impl_->json_of(*s);
     return out + "]";

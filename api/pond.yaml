@@ -509,6 +509,42 @@ paths:
       summary: Delete a channel
       parameters: [{ $ref: "#/components/parameters/Channel" }]
       responses: { "204": { description: Deleted }, "404": { description: "`no_channel`" } }
+  /pond/v1/admin/channels/{channel}/roles:
+    post:
+      summary: Who may see a channel (protocol 9; docs/design.md, "Roles for channels")
+      description: "`roles: null`: everyone. `roles: [ids]`: operators, administrators and members holding one of them; `[]` leaves it to operators and administrators. Everyone is sent a `channels` event."
+      parameters: [{ $ref: "#/components/parameters/Channel" }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [roles], properties: { roles: { oneOf: [{ type: array, items: { type: integer } }, { type: "null" }] } } } } } }
+      responses: { "204": { description: Done }, "404": { description: "`no_channel`, `unknown_role`" } }
+  /pond/v1/admin/channels/order:
+    post:
+      summary: The order of the channels, for everyone (protocol 9)
+      requestBody: { content: { application/json: { schema: { type: object, required: [channels], properties: { channels: { type: array, items: { type: integer }, description: "Every live channel's id, each once, first to last" } } } } } }
+      responses: { "204": { description: Done }, "409": { description: "`channels_changed`: not every live channel once (one was made or deleted meanwhile)" } }
+  /pond/v1/admin/roles/create:
+    post:
+      summary: Make a role for channels (protocol 9)
+      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string, maxLength: 32 } } } } } }
+      responses:
+        "200": { description: "The role: `{id, name}`" }
+        "400": { $ref: "#/components/responses/AdminRefused" }
+  /pond/v1/admin/roles/{role}/edit:
+    post:
+      summary: Rename a role for channels
+      parameters: [{ name: role, in: path, required: true, schema: { type: integer, minimum: 1 } }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string, maxLength: 32 } } } } } }
+      responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" }, "404": { description: "`unknown_role`" } }
+  /pond/v1/admin/roles/{role}/delete:
+    post:
+      summary: Delete a role for channels; a channel that asked for it alone is left to operators and administrators
+      parameters: [{ name: role, in: path, required: true, schema: { type: integer, minimum: 1 } }]
+      responses: { "204": { description: Deleted }, "404": { description: "`unknown_role`" } }
+  /pond/v1/admin/members/{member}/roles:
+    post:
+      summary: The roles for channels a member holds, these and no others (protocol 9)
+      parameters: [{ $ref: "#/components/parameters/Member" }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [roles], properties: { roles: { type: array, items: { type: integer } } } } } } }
+      responses: { "204": { description: Done }, "404": { description: "`no_member`, `unknown_role`" } }
   /pond/v1/admin/members/{member}/remove:
     post:
       summary: Remove a member (they may come back with an invite)
@@ -661,7 +697,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -669,7 +705,8 @@ components:
                 oneOf:
                   - { type: object, properties: { id: { type: integer }, role: { $ref: "#/components/schemas/Role" } } }
                   - { type: "null" }
-              channels: { type: array, items: { $ref: "#/components/schemas/Channel" } }
+              channels: { type: array, items: { $ref: "#/components/schemas/Channel" }, description: "The channels this member may see, in order" }
+              roles: { type: array, items: { $ref: "#/components/schemas/ChannelRole" }, description: "Every role for channels (protocol 9)" }
               voice: { type: array, items: { $ref: "#/components/schemas/InVoice" }, description: "Who is in a voice channel now (protocol 4)" }
               cursor: { type: integer, description: The newest event; follow /pond/v1/events from here }
     AdminRefused:
@@ -752,6 +789,13 @@ components:
             - { type: object, properties: { until: { oneOf: [{ type: integer }, { type: "null" }] } } }
             - type: "null"
         dms: { type: boolean, description: "Takes direct messages here (protocol 8; docs/dms.md)" }
+        roles: { type: array, items: { type: integer }, description: "The roles for channels they hold (protocol 9)" }
+    ChannelRole:
+      type: object
+      description: 'A role for channels (docs/design.md, "Roles for channels"); not a rank (`Role`)'
+      properties:
+        id: { type: integer }
+        name: { type: string, maxLength: 32 }
     Role:
       enum: [operator, administrator, member]
       description: "docs/design.md, \"Roles\". Missing (protocol 1) means member."
@@ -763,6 +807,9 @@ components:
         topic: { type: string }
         position: { type: integer }
         kind: { enum: [text, voice], description: "Protocol 4; missing means text. A voice channel takes messages too." }
+        roles:
+          description: "Protocol 9: null when everyone may see it; else the roles that may (with operators and administrators)"
+          oneOf: [{ type: array, items: { type: integer } }, { type: "null" }]
     InVoice:
       type: object
       description: Someone in a voice channel (docs/voice.md, "Who is in it")
@@ -806,10 +853,13 @@ components:
       required: [id, kind, data]
       properties:
         id: { type: integer }
-        kind: { enum: [message, channel, channel_deleted, member, member_left, pond, role_offer, voice, voice_left] }
+        kind: { enum: [message, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, voice, voice_left] }
         data:
           description: |
             message: a Message. channel: a Channel (made or changed). channel_deleted: {id}. member: a Member (joined, or a
             new profile, or a new role). member_left: {id}. pond: a Pond (new name or description, or new limits on files).
             role_offer: {id, role}, sent only to the member it is offered to. voice: an InVoice (came in, or muted, deafened
-            or camera changed). voice_left: {channel, member}.
+            or camera changed). voice_left: {channel, member}. Protocol 9 (docs/design.md, "Roles for channels"): channels:
+            {channels: [Channel]}, every channel this member may see now, in order, replacing what they had. role: a
+            ChannelRole (made or renamed). role_deleted: {id}, taken out of every member and channel. An event about a
+            channel the member may not see is not given to them.

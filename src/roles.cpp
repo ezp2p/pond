@@ -118,7 +118,8 @@ Task<Answer> Service::answer_offer(std::string member, int64_t offer, bool accep
         if (accept) {
             co_await tx->execSqlCoro("UPDATE members SET role = ? WHERE id = ? AND left_ms IS NULL", role, member);
             std::string mj = co_await member_json_of(tx, member);
-            ev = co_await add_event(tx, "member", mj);
+            co_await add_event(tx, "member", mj);
+            ev = co_await add_event(tx, "channels", "{}", member); /* a rank sees every channel */
         }
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
@@ -151,7 +152,8 @@ Task<Outcome> Service::set_role(std::string id, Role role, std::string by)
         }
         co_await tx->execSqlCoro("DELETE FROM role_offers WHERE member = ?", id);
         std::string mj = co_await member_json_of(tx, id);
-        int64_t ev = co_await add_event(tx, "member", mj);
+        co_await add_event(tx, "member", mj);
+        int64_t ev = co_await add_event(tx, "channels", "{}", id); /* what they see may have changed */
         if (!co_await Committed(std::move(tx)))
             co_return "the database did not commit it";
         bump(ev);

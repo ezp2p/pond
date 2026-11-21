@@ -61,7 +61,7 @@ int main(int argc, char **argv)
         vs.max_in_channel = cfg.voice.max_in_channel;
         voice = std::make_unique<Voice>(svc, vs, app().getLoop());
         svc.voice_on = true;
-        svc.voice_now = [v = voice.get()] { return v->now_json(); };
+        svc.voice_now = [v = voice.get()](const std::set<int64_t> &hidden) { return v->now_json(hidden); };
     }
     Routes routes(svc, voice.get());
     /* every request goes to the routes, whatever its path and method, so that nothing is answered differently from an

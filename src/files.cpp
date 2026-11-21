@@ -176,8 +176,12 @@ Task<bool> Service::may_read(std::string member, std::string id)
 {
     Result r = co_await db_->execSqlCoro(
         "SELECT 1 FROM files f WHERE f.id = ? AND f.whole = 1 AND (f.uploader = ? OR EXISTS (SELECT 1 FROM message_files mf"
-        " JOIN messages m ON m.id = mf.message JOIN channels c ON c.id = m.channel WHERE mf.file = f.id AND c.deleted = 0))",
-        id, member);
+        " JOIN messages m ON m.id = mf.message JOIN channels c ON c.id = m.channel WHERE mf.file = f.id AND c.deleted = 0"
+        /* in a channel they may see (docs/design.md, "Roles for channels") */
+        " AND (c.restricted = 0 OR EXISTS (SELECT 1 FROM channel_roles cr JOIN member_roles mr ON mr.role = cr.role"
+        " WHERE cr.channel = c.id AND mr.member = ?) OR EXISTS (SELECT 1 FROM members a WHERE a.id = ? AND a.left_ms IS NULL"
+        " AND a.role IN ('operator', 'administrator')))))",
+        id, member, member, member);
     co_return !r.empty();
 }
 
