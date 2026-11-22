@@ -74,7 +74,7 @@ static std::string clean_data(const std::string &kind, const std::string &in, st
     std::string t;
     if (kind == "roles") {
         /* {roles: [{role, description}], multiple: bool}: the roles members may take for themselves */
-        const Json::Value &a = v["roles"];
+        const Json::Value a = v.isMember("roles") ? v["roles"] : Json::Value(Json::arrayValue); /* none yet: a new page */
         if (!a.isArray() || a.size() > PAGE_OPTIONS_MAX)
             return "a roles page offers up to 50 roles";
         o["roles"] = Json::arrayValue;
@@ -92,7 +92,7 @@ static std::string clean_data(const std::string &kind, const std::string &in, st
         o["multiple"] = v.get("multiple", true).isBool() ? v.get("multiple", true).asBool() : true;
     } else if (kind == "form") {
         /* {questions: [{id, label, kind: text|long|choice|checks, choices: [], required}], required_to_join: bool} */
-        const Json::Value &a = v["questions"];
+        const Json::Value a = v.isMember("questions") ? v["questions"] : Json::Value(Json::arrayValue);
         if (!a.isArray() || a.size() > FORM_QUESTIONS_MAX)
             return "a form has up to 30 questions";
         o["questions"] = Json::arrayValue;
@@ -520,7 +520,12 @@ Task<Answer> Service::admin_page_edit(std::string by, int64_t page, PageEdit edi
             tx->rollback();
         co_return server_error(e);
     }
-    co_await log_admin(by, "page_edit", title, "");
+    std::string what;
+    if (edit.body)
+        what = std::to_string(edit.body->size()) + " bytes of markdown";
+    if (edit.files)
+        what += (what.empty() ? "" : ", ") + std::to_string(edit.files->size()) + " files";
+    co_await log_admin(by, "page_edit", title, what);
     co_return Answer{204, ""};
 }
 

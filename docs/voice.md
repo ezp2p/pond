@@ -225,6 +225,15 @@ more than one.
 4. **Video in the app:** the camera, choosing whom to watch, the tiles.
 5. **Moderation:** disconnect and mute by admins.
 
+## Moderation
+
+Built 2026-11-23 (protocol 13; docs/design.md, "Voice moderation" and "Permissions"). Whoever may there mutes someone in
+the channel for everyone (`POST /pond/v1/voice/members/{member}/mute {muted}`: the Pond forwards nothing of theirs) or
+disconnects them (`/disconnect`: their session is dropped, and `voice_left` says `by`; their Puddle doesn't come back by
+itself). The channel's permissions apply too: without `connect` nobody joins it, without `speak` the Pond forwards none of
+their voice, without `video` none of their camera or screen. The Pond looks at them again every second or two, so a role
+or a channel changed applies to those already in it, and someone's state says `server_muted`, `speak` and `video`.
+
 ## Later
 
 - **Encryption only members can undo** (SFrame): each member encrypts their frames with a key the channel's members
