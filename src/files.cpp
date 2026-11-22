@@ -180,7 +180,9 @@ Task<bool> Service::may_read(std::string member, std::string id)
         /* in a channel they may see (docs/design.md, "Roles for channels") */
         " AND (c.restricted = 0 OR EXISTS (SELECT 1 FROM channel_roles cr JOIN member_roles mr ON mr.role = cr.role"
         " WHERE cr.channel = c.id AND mr.member = ?) OR EXISTS (SELECT 1 FROM members a WHERE a.id = ? AND a.left_ms IS NULL"
-        " AND a.role IN ('operator', 'administrator')))))",
+        " AND a.role IN ('operator', 'administrator'))))"
+        /* or a page carries it (docs/design.md, "Pages"): every member sees every page */
+        " OR EXISTS (SELECT 1 FROM page_files pf WHERE pf.file = f.id))",
         id, member, member, member);
     co_return !r.empty();
 }
@@ -234,13 +236,14 @@ Task<Answer> Service::file_chunk(std::string member, std::string id, int64_t n)
 Task<> Service::sweep_files()
 {
     Result r = co_await db_->execSqlCoro("SELECT id FROM files f WHERE created_ms < ? AND NOT EXISTS"
-                                         " (SELECT 1 FROM message_files mf WHERE mf.file = f.id) LIMIT 1000",
+                                         " (SELECT 1 FROM message_files mf WHERE mf.file = f.id) AND NOT EXISTS (SELECT 1 FROM page_files pf WHERE pf.file = f.id) LIMIT 1000",
                                          now_ms() - FILE_UNSENT_KEEP_MS);
     int gone = 0;
     for (const auto &row : r) {
         std::string id = text(row[0]);
-        Result d = co_await db_->execSqlCoro("DELETE FROM files WHERE id = ? AND NOT EXISTS (SELECT 1 FROM message_files WHERE file = ?)",
-                                             id, id);
+        Result d = co_await db_->execSqlCoro("DELETE FROM files WHERE id = ? AND NOT EXISTS (SELECT 1 FROM message_files WHERE file = ?)"
+                                             " AND NOT EXISTS (SELECT 1 FROM page_files WHERE file = ?)",
+                                             id, id, id);
         if (d.affectedRows() == 1) {
             unlink(file_path(id, false).c_str());
             unlink(file_path(id, true).c_str());

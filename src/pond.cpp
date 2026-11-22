@@ -169,7 +169,7 @@ Task<std::string> Service::member_json_of(DbPtr db, std::string id)
 
 Task<std::string> Service::pond_json(DbPtr db)
 {
-    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon', 'dms', 'dms.files_max')");
+    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon', 'banner', 'dms', 'dms.files_max')");
     std::map<std::string, std::string> v;
     for (const auto &row : r)
         v[text(row[0])] = text(row[1]);
@@ -179,12 +179,16 @@ Task<std::string> Service::pond_json(DbPtr db)
     std::string icon = "null";
     if (!v["icon"].empty() && !picture_ref(v["icon"], icon))
         icon = "null";
+    /* the banner (protocol 11, docs/design.md, "Pages"): over its name in the channel list; the same, or null */
+    std::string banner = "null";
+    if (!v["banner"].empty() && !picture_ref(v["banner"], banner))
+        banner = "null";
     /* direct messages (docs/dms.md): on or off, and the largest file one may carry (0: none) */
     const std::string dms = std::string("{\"on\":") + (v["dms"] != "off" ? "true" : "false") + ",\"files_max\":" +
                             std::to_string(strtoll(dm_max.c_str(), nullptr, 10)) + "}";
     /* what members may send: "files" (docs/design.md, "Files"); max_size 0 is files turned off */
     co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"seal_key\":" + jstr(hex(key_.seal_pub, 32)) + ",\"name\":" + jstr(v["name"]) + ",\"description\":" + jstr(v["description"]) +
-              ",\"icon\":" + icon + ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
+              ",\"icon\":" + icon + ",\"banner\":" + banner + ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
               std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "},\"dms\":" + dms + "}";
 }
 
@@ -367,10 +371,11 @@ Task<Answer> Service::info(std::string member)
         const std::string offer = co_await offer_json(member);
         const std::string channels = co_await channels_json(member);
         const std::string roles = co_await roles_json();
+        const std::string pages = co_await pages_json();
         const std::set<int64_t> hidden = co_await hidden_channels(member);
         const std::string voice = voice_now ? voice_now(hidden) : "[]";
         std::string body = "{\"protocol\":" + std::to_string(PROTOCOL) + ",\"features\":" + features + "],\"pond\":" + pond +
-                           ",\"me\":" + me + ",\"offer\":" + offer + ",\"channels\":" + channels + ",\"roles\":" + roles + ",\"voice\":" + voice +
+                           ",\"me\":" + me + ",\"offer\":" + offer + ",\"channels\":" + channels + ",\"roles\":" + roles + ",\"pages\":" + pages + ",\"voice\":" + voice +
                            ",\"cursor\":" + std::to_string(num(c[0][0])) + "}";
         co_return Answer{200, std::move(body)};
     } catch (const DrogonDbException &e) {
@@ -396,7 +401,7 @@ Task<Answer> Service::history(std::string member, int64_t channel, int64_t befor
 }
 
 /* What a message says of a file, cleaned: false if it cannot be. */
-static bool clean_file(FileRef &f)
+bool clean_file(FileRef &f)
 {
     std::string name;
     if (!clean_text(f.name, FILE_NAME_MAX, false, name) || name.empty() || name.size() > FILE_NAME_MAX || name == "." || name == "..")

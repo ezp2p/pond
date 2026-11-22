@@ -460,6 +460,7 @@ some of what an administrator does, has a colour and a place in an order, and ca
 | `kick_members` | Remove a member, who may come back with an invite |
 | `ban_members` | Ban a member, see the bans, and unban |
 | `mute_members` | Mute and unmute a member |
+| `manage_pages` | Make, edit, order and delete pages (protocol 11, "Pages") |
 
 | Question | Decision |
 |---|---|
@@ -485,11 +486,41 @@ Protocol 10, feature `role_permissions`. A Puddle of protocol 9 sees roles as be
 admin screens only for ranks, so a member with permissions needs a newer Puddle to use them (the routes work for them
 either way).
 
+## Pages
+
+Built 2026-11-22. A Pond shows its members **pages** above its channels, set off from them by a line, as Discord's server
+guide is: rules, a list of servers, a guide. The apps show a page where a channel's messages would be.
+
+| Question | Decision |
+|---|---|
+| What a page is | A title (1 to 64 characters, one line), a **kind**, a body, and the files it carries; in an order the admins set (`position`). At most 50 in a Pond. |
+| Kinds | `markdown` only, for now: its body is markdown, at most 64 KiB of text. A kind is where the later pages come in, each a kind of its own with its own body: roles members pick for themselves, an events calendar, an entry form, a shop. A kind the Pond doesn't know is `400 unknown_kind`. |
+| `#channel-name` | Written as it is. The apps make it a link to that channel when it is one the member sees; the Pond does nothing with it, so a rename doesn't rewrite pages. |
+| Files | Sent to the Pond first, as a message's are (`POST /pond/v1/files/...`), then named in the page's `files` (at most 10, as a message). Any member may fetch a file a page carries. A file no page or message carries any more goes in the hourly sweep. |
+| Who sees them | Every member sees every page. Pages for some roles only may come later. |
+| Who manages them | Operators, administrators, and members whose roles have the permission `manage_pages` ("Permissions"). |
+| The banner | A picture over the Pond's name in the channel list: a setting, `banner`, as the icon is, sent first as a picture (at most 1 MiB). Whoever may `manage_pond` sets it. `pond` gains `banner` (`{hash, mime, size}` or null). |
+
+| Route | Does |
+|---|---|
+| `GET /pond/v1/pages/{page}` | `{id, title, kind, body, files, updated, updated_by}`, for any member |
+| `POST /pond/v1/admin/pages/create` | `{title, kind?, body?, files?}`: answers `{id, title, kind, updated}`; it goes last |
+| `POST /pond/v1/admin/pages/{page}/edit` | `{title?, kind?, body?, files?}`: what is given changes; `files` replaces what it carried. `409 no_file` if one isn't on the Pond whole |
+| `POST /pond/v1/admin/pages/{page}/delete` | |
+| `POST /pond/v1/admin/pages/order` | `{pages: [ids]}`: every page, first to last; `409 pages_changed` if one was made or deleted meanwhile |
+| `POST /pond/v1/admin/banner` | `{hash}`, or `{hash: null}` for none |
+
+`/info` gains `pages` (`[{id, title, kind, updated}]`, in order); the body is asked for when a page is opened. New events:
+`page` (`{id, title, kind, updated}`: made or changed; a new one is last), `page_deleted` (`{id}`) and `page_order`
+(`{pages: [ids]}`). The banner comes in the `pond` event, as the icon does. Each change goes in `admin_log`.
+
+Protocol 11, feature `pages`.
+
 ## What the database holds
 
 | Table | Columns |
 |---|---|
-| `settings` | `name`, `value`: the Pond's name and description, its `icon` (a picture's hash), `files.max_size`, and `event_lock` (see "Events") |
+| `settings` | `name`, `value`: the Pond's name and description, its `icon` and `banner` (pictures' hashes), `files.max_size`, and `event_lock` (see "Events") |
 | `schema_version` | `version`: which of `db.cpp`'s steps have been run |
 | `channels` | `id`, `name`, `topic`, `position`, `created_ms`, `deleted`, `kind` (`text` or `voice`) |
 | `members` | `id` (user id), `sign_pub`, `kid`, `chain`, `profile` (JSON), `joined_ms`, `left_ms` |
@@ -505,6 +536,8 @@ either way).
 | `member_roles` | `member`, `role` |
 | `channel_roles` | `channel`, `role` |
 | `channels` (more) | `restricted`: 1 when only some roles (and operators and administrators) see it |
+| `pages` | `id`, `title`, `kind`, `body`, `position`, `created_ms`, `updated_ms`, `updated_by` |
+| `page_files` | `page`, `position`, `file`, `name`, `mime`, `size`, `w`, `h` |
 | `files` | `id`, `size`, `chunks` (the hashes, 32 bytes each), `have` (a `0` or `1` per chunk), `whole`, `uploader`, `created_ms` |
 | `message_files` | `message`, `position`, `file`, and what the sender said of it: `name`, `mime`, `size`, `w`, `h`, `duration_ms`, `preview` |
 
@@ -589,7 +622,7 @@ the protocol, not the version of either program.
 - Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
   it does not know, so an older Puddle keeps working with a newer Pond.
 - `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
-  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `role_permissions`, `voice`, `dms`, `dm_files`). A Puddle checks these before using an addition, rather than guessing from
+  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `role_permissions`, `pages`, `voice`, `dms`, `dm_files`). A Puddle checks these before using an addition, rather than guessing from
   a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
 
 A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.

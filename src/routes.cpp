@@ -20,6 +20,7 @@ using drogon::HttpResponse;
 using drogon::HttpResponsePtr;
 
 constexpr size_t BODY_MAX = 32 * 1024;
+constexpr size_t PAGE_EDIT_MAX = 512 * 1024;      /* a page: its text (up to 4 bytes a character, escaped), and its files */
 constexpr size_t SEND_MAX = 64 * 1024;           /* ten files with previews, and the text */
 constexpr size_t BEGIN_MAX = 256 * 1024;         /* the hashes of a file of FILE_HARD_MAX, in base64 */
 constexpr size_t VOICE_JOIN_MAX = 64 * 1024;     /* an offer: eighteen media sections, each with its candidates */
@@ -31,10 +32,11 @@ static const Answer NOT_FOUND = {UNKNOWN, ""};
 enum Kind {
     JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
     VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET, MEMBER_CHAIN, DM_SEND, DM_SETTINGS, DM_PIECE_GET,
-    DM_PIECE_PUT,
+    DM_PIECE_PUT, PAGE_GET,
     ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN,
     ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, ADMIN_MUTE, ADMIN_ROLE_CREATE, ADMIN_ROLE_EDIT, ADMIN_ROLE_DELETE,
-    ADMIN_MEMBER_ROLES, ADMIN_CHANNEL_ROLES, ADMIN_CHANNEL_ORDER, ADMIN_ROLE_ORDER, ADMIN_UNMUTE, NONE
+    ADMIN_MEMBER_ROLES, ADMIN_CHANNEL_ROLES, ADMIN_CHANNEL_ORDER, ADMIN_ROLE_ORDER, ADMIN_BANNER, ADMIN_PAGE_CREATE,
+    ADMIN_PAGE_EDIT, ADMIN_PAGE_DELETE, ADMIN_PAGE_ORDER, ADMIN_UNMUTE, NONE
 };
 
 /* The routes only an operator or administrator may use (docs/design.md, "Roles"), or a member whose roles let them. */
@@ -49,7 +51,13 @@ static int64_t permission_for(int k)
     switch (k) {
     case ADMIN_POND:
     case ADMIN_ICON:
+    case ADMIN_BANNER:
         return MANAGE_POND;
+    case ADMIN_PAGE_CREATE:
+    case ADMIN_PAGE_EDIT:
+    case ADMIN_PAGE_DELETE:
+    case ADMIN_PAGE_ORDER:
+        return MANAGE_PAGES;
     case ADMIN_CHANNEL_CREATE:
     case ADMIN_CHANNEL_EDIT:
     case ADMIN_CHANNEL_DELETE:
@@ -108,6 +116,9 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
 {
     if (post && p == "pond") return ADMIN_POND;
     if (post && p == "icon") return ADMIN_ICON;
+    if (post && p == "banner") return ADMIN_BANNER;
+    if (post && p == "pages/create") return ADMIN_PAGE_CREATE;
+    if (post && p == "pages/order") return ADMIN_PAGE_ORDER;
     if (post && p == "channels/create") return ADMIN_CHANNEL_CREATE;
     if (post && p == "channels/order") return ADMIN_CHANNEL_ORDER;
     if (post && p == "roles/create") return ADMIN_ROLE_CREATE;
@@ -130,6 +141,10 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
         if (verb == "edit") return ADMIN_CHANNEL_EDIT;
         if (verb == "delete") return ADMIN_CHANNEL_DELETE;
         if (verb == "roles") return ADMIN_CHANNEL_ROLES;
+    }
+    if (post && split("pages/", id, verb) && (channel = number_of(id, false)) > 0) { /* the page's id, in `channel` */
+        if (verb == "edit") return ADMIN_PAGE_EDIT;
+        if (verb == "delete") return ADMIN_PAGE_DELETE;
     }
     if (post && split("roles/", id, verb) && (channel = number_of(id, false)) > 0) { /* the role's id, in `channel` */
         if (verb == "edit") return ADMIN_ROLE_EDIT;
@@ -199,6 +214,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     if (p.substr(0, 6) == "files/")
         return file_route(get, post, p.substr(6), file, n);
     if (post && p == "roles/answer") return ROLE_ANSWER;
+    if (get && p.substr(0, 6) == "pages/" && (channel = number_of(p.substr(6), false)) > 0) return PAGE_GET; /* the page's id, in `channel` */
     if (get && p.substr(0, 8) == "members/" && p.size() == 8 + 52 + 6 && p.substr(8 + 52) == "/chain" && user_id_ok(p.substr(8, 52))) {
         member = std::string(p.substr(8, 52));
         return MEMBER_CHAIN;
@@ -255,23 +271,23 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 static bool takes_body(Kind k)
 {
     return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == DM_SEND || k == DM_SETTINGS || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
-           k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER || k == ADMIN_ROLE_ORDER ||
+           k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER || k == ADMIN_ROLE_ORDER || k == ADMIN_BANNER || k == ADMIN_PAGE_CREATE || k == ADMIN_PAGE_EDIT || k == ADMIN_PAGE_ORDER ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH;
 }
 
 static size_t body_max(Kind k)
 {
-    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == DM_PIECE_PUT ? DM_PIECE_MAX : k == DM_SEND ? DM_SEND_MAX : k == PICTURE_PUT ? PICTURE_MAX : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : BODY_MAX;
+    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == DM_PIECE_PUT ? DM_PIECE_MAX : k == DM_SEND ? DM_SEND_MAX : k == PICTURE_PUT ? PICTURE_MAX : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : (k == ADMIN_PAGE_CREATE || k == ADMIN_PAGE_EDIT) ? PAGE_EDIT_MAX : BODY_MAX;
 }
 
 /* "files": [{id, name, mime, w?, h?, duration_ms?, preview?}], as a send says them; cleaned by the Service. */
-static bool body_files(const Json::Value &json, std::vector<FileRef> &out)
+static bool body_files(const Json::Value &json, std::vector<FileRef> &out, size_t max = FILES_PER_MESSAGE)
 {
     if (!json.isMember("files"))
         return true;
     const Json::Value &a = json["files"];
-    if (!a.isArray() || a.size() > FILES_PER_MESSAGE)
+    if (!a.isArray() || a.size() > max)
         return false;
     for (const auto &o : a) {
         FileRef f;
@@ -574,12 +590,42 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
             co_return fail(400, "bad_request");
         co_return co_await svc_.admin_pond(sender, name, description);
     }
-    case ADMIN_ICON: {
+    case ADMIN_ICON:
+    case ADMIN_BANNER: {
         /* {"hash": a picture sent first (POST /pond/v1/pictures)} or {"hash": null} for none */
         std::optional<std::string> hash;
         if (!json.isMember("hash") || (!json["hash"].isNull() && !opt_string("hash", hash)))
             co_return fail(400, "bad_request");
+        if (k == ADMIN_BANNER)
+            co_return co_await svc_.admin_icon(sender, hash, "banner");
         co_return co_await svc_.admin_icon(sender, hash);
+    }
+    case PAGE_GET:
+        co_return co_await svc_.page_get(sender, channel);
+    case ADMIN_PAGE_CREATE:
+    case ADMIN_PAGE_EDIT: {
+        /* {title?, kind?, body?, files?}: a new page needs its title; files as a message's, sent first */
+        PageEdit e;
+        if (!opt_string("title", e.title) || !opt_string("kind", e.kind) || !opt_string("body", e.body))
+            co_return fail(400, "bad_request");
+        if (json.isMember("files")) {
+            std::vector<FileRef> files;
+            if (!json["files"].isArray() || json["files"].size() > PAGE_FILES_MAX || !body_files(json, files, PAGE_FILES_MAX))
+                co_return fail(400, "bad_file");
+            e.files = std::move(files);
+        }
+        if (k == ADMIN_PAGE_CREATE)
+            co_return co_await svc_.admin_page_create(sender, std::move(e));
+        co_return co_await svc_.admin_page_edit(sender, channel, std::move(e));
+    }
+    case ADMIN_PAGE_DELETE:
+        co_return co_await svc_.admin_page_delete(sender, channel);
+    case ADMIN_PAGE_ORDER: {
+        /* {pages: [ids]}: every page, first to last */
+        std::vector<int64_t> pages;
+        if (!body_ids(json, "pages", (size_t)PAGES_MAX, pages))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_page_order(sender, std::move(pages));
     }
     case ADMIN_CHANNEL_CREATE: {
         std::optional<std::string> name, topic, kind;

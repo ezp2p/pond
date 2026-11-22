@@ -478,6 +478,47 @@ paths:
       description: "For operators and administrators; to anyone else, every /pond/v1/admin route is a `404` like any refusal."
       requestBody: { content: { application/json: { schema: { type: object, properties: { name: { type: string }, description: { type: string } } } } } }
       responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" } }
+  /pond/v1/pages/{page}:
+    get:
+      summary: One page, whole (protocol 11; docs/design.md, "Pages"), for any member
+      parameters: [{ name: page, in: path, required: true, schema: { type: integer, minimum: 1 } }]
+      responses:
+        "200": { description: The page, content: { application/json: { schema: { $ref: "#/components/schemas/Page" } } } }
+        "404": { description: "`no_page`" }
+  /pond/v1/admin/pages/create:
+    post:
+      summary: Make a page (protocol 11), last in the order; for whoever may `manage_pages`
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/PageChange", required: [title] } } } }
+      responses:
+        "200": { description: "`{id, title, kind, updated}`" }
+        "400": { description: "In words an app may show; `unknown_kind`, `bad_file`" }
+        "409": { description: "`no_file` (with `file`): a file not on the Pond whole; send it first" }
+  /pond/v1/admin/pages/{page}/edit:
+    post:
+      summary: Change a page; what is given changes, and `files` replaces what it carried
+      parameters: [{ name: page, in: path, required: true, schema: { type: integer, minimum: 1 } }]
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/PageChange" } } } }
+      responses:
+        "204": { description: Done }
+        "400": { description: "In words an app may show; `unknown_kind`, `bad_file`" }
+        "404": { description: "`no_page`" }
+        "409": { description: "`no_file` (with `file`)" }
+  /pond/v1/admin/pages/{page}/delete:
+    post:
+      summary: Delete a page, for everyone
+      parameters: [{ name: page, in: path, required: true, schema: { type: integer, minimum: 1 } }]
+      responses: { "204": { description: Deleted }, "404": { description: "`no_page`" } }
+  /pond/v1/admin/pages/order:
+    post:
+      summary: The order of the pages, first to last (protocol 11)
+      requestBody: { content: { application/json: { schema: { type: object, required: [pages], properties: { pages: { type: array, items: { type: integer }, description: "Every page's id, each once" } } } } } }
+      responses: { "204": { description: Done }, "409": { description: "`pages_changed`: not every page once" } }
+  /pond/v1/admin/banner:
+    post:
+      summary: Set the Pond's banner, or take it away (protocol 11, feature `pages`)
+      description: As the icon is set; for whoever may `manage_pond`. Every member hears of it in a `pond` event, whose `banner` changes.
+      requestBody: { content: { application/json: { schema: { type: object, required: [hash], properties: { hash: { oneOf: [{ type: string, pattern: "^[0-9a-f]{64}$" }, { type: "null" }] } } } } } }
+      responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" } }
   /pond/v1/admin/icon:
     post:
       summary: Set the Pond's icon, or take it away
@@ -711,7 +752,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -721,6 +762,7 @@ components:
                   - { type: "null" }
               channels: { type: array, items: { $ref: "#/components/schemas/Channel" }, description: "The channels this member may see, in order" }
               roles: { type: array, items: { $ref: "#/components/schemas/ChannelRole" }, description: "Every role (protocol 9), highest first (protocol 10)" }
+              pages: { type: array, items: { $ref: "#/components/schemas/PageHead" }, description: "Every page, in order (protocol 11)" }
               voice: { type: array, items: { $ref: "#/components/schemas/InVoice" }, description: "Who is in a voice channel now (protocol 4)" }
               cursor: { type: integer, description: The newest event; follow /pond/v1/events from here }
     AdminRefused:
@@ -764,6 +806,11 @@ components:
         description: { type: string }
         icon:
           description: The Pond's icon (protocol 6, feature `pictures`), fetched from `/pond/v1/pictures/{hash}`; null for none
+          oneOf:
+            - { $ref: "#/components/schemas/PictureRef" }
+            - type: "null"
+        banner:
+          description: Its banner, over its name in the channel list (protocol 11), fetched as the icon is; null for none
           oneOf:
             - { $ref: "#/components/schemas/PictureRef" }
             - type: "null"
@@ -821,7 +868,32 @@ components:
         hoist: { type: boolean }
         permissions: { type: array, items: { $ref: "#/components/schemas/Permission" } }
     Permission:
-      enum: [manage_pond, manage_channels, manage_roles, manage_invites, kick_members, ban_members, mute_members]
+      enum: [manage_pond, manage_channels, manage_roles, manage_invites, kick_members, ban_members, mute_members, manage_pages]
+    PageHead:
+      type: object
+      description: 'A page as /info lists it (protocol 11; docs/design.md, "Pages")'
+      properties:
+        id: { type: integer }
+        title: { type: string, maxLength: 64 }
+        kind: { type: string, description: "`markdown`; later kinds will be added (roles to pick, events, an entry form, a shop)" }
+        updated: { type: integer, description: When it last changed (ms) }
+    Page:
+      type: object
+      properties:
+        id: { type: integer }
+        title: { type: string, maxLength: 64 }
+        kind: { type: string }
+        body: { type: string, description: "Markdown, at most 64 KiB of text" }
+        files: { type: array, maxItems: 10, items: { type: object, properties: { id: { type: string }, name: { type: string }, mime: { type: string }, size: { type: integer }, w: { type: integer }, h: { type: integer } } } }
+        updated: { type: integer }
+        updated_by: { type: string, description: The member who last changed it }
+    PageChange:
+      type: object
+      properties:
+        title: { type: string, maxLength: 64 }
+        kind: { type: string }
+        body: { type: string }
+        files: { type: array, maxItems: 10, items: { type: object, required: [id, name, mime], properties: { id: { type: string }, name: { type: string }, mime: { type: string }, w: { type: integer }, h: { type: integer } } } }
     Role:
       enum: [operator, administrator, member]
       description: "docs/design.md, \"Roles\". Missing (protocol 1) means member."
@@ -879,7 +951,7 @@ components:
       required: [id, kind, data]
       properties:
         id: { type: integer }
-        kind: { enum: [message, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, role_order, voice, voice_left] }
+        kind: { enum: [message, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, role_order, page, page_deleted, page_order, voice, voice_left] }
         data:
           description: |
             message: a Message. channel: a Channel (made or changed). channel_deleted: {id}. member: a Member (joined, or a
@@ -889,4 +961,6 @@ components:
             {channels: [Channel]}, every channel this member may see now, in order, replacing what they had. role: a
             ChannelRole (made or renamed). role_deleted: {id}, taken out of every member and channel. An event about a
             channel the member may not see is not given to them. Protocol 10: role carries the whole ChannelRole (made or
-            changed; a new one is at the bottom), and role_order: {roles: [ids]}, every role, highest first.
+            changed; a new one is at the bottom), and role_order: {roles: [ids]}, every role, highest first. Protocol 11
+            (docs/design.md, "Pages"): page: a PageHead (made or changed; a new one is last), page_deleted: {id}, page_order:
+            {pages: [ids]}, first to last.
