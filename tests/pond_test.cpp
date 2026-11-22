@@ -127,7 +127,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 9 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 11 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -594,7 +594,7 @@ int main()
         const std::string mods = std::to_string(num_of(a.body, "id"));
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/create", "{\"name\":\"Mods\"}").status == 400); /* taken */
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/create", "{\"name\":\"  \"}").status == 400);
-        CHECK(has(pond.call(&fay, "GET", "/pond/v1/info").body, "\"roles\":[{\"id\":" + mods + ",\"name\":\"Mods\"}]"));
+        CHECK(has(pond.call(&fay, "GET", "/pond/v1/info").body, "\"roles\":[{\"id\":" + mods + ",\"name\":\"Mods\",\"color\":null,\"hoist\":false,\"permissions\":[]}]"));
 
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/create", "{\"name\":\"staff\"}").status == 204);
         const int64_t staff = channel_id(dan, "staff");
@@ -653,6 +653,126 @@ int main()
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + S + "/roles", "{\"roles\":null}").status == 204);
         CHECK(channel_id(fay, "staff") == staff);
         CHECK(pond.ctl("log", &out) == 0 && has(out, "role_create") && has(out, "channel_roles") && has(out, "channel_order"));
+
+        /* ---- what roles let members do, and their order (docs/design.md, "Permissions") ---- */
+        /* Dan is an operator; Ann and Fay are members, from above; Gil joins */
+        Identity gil;
+        CHECK(pond.call(&gil, "POST", "/pond/v1/join", join_body(gil, invite(pond, ""), "Gil"), "*").status == 200);
+        const std::string R = "/pond/v1/admin/roles/";
+        auto made = [&](Identity &who, const std::string &body) -> std::string {
+            Reply r = pond.call(&who, "POST", R + "create", body);
+            return r.status == 200 ? std::to_string(num_of(r.body, "id")) : "";
+        };
+        a = pond.call(&dan, "POST", R + "create", "{\"name\":\"Keepers\",\"color\":\"#FF8800\",\"hoist\":true,"
+                                                    "\"permissions\":[\"mute_members\",\"kick_members\",\"manage_roles\"]}");
+        CHECK(a.status == 200 && has(a.body, "\"color\":\"#ff8800\",\"hoist\":true,\"permissions\":[\"manage_roles\",\"kick_members\",\"mute_members\"]"));
+        const std::string K = std::to_string(num_of(a.body, "id"));
+        CHECK(pond.call(&dan, "POST", R + "create", "{\"name\":\"x\",\"permissions\":[\"fly\"]}").status == 400);
+        CHECK(pond.call(&dan, "POST", R + "create", "{\"name\":\"x\",\"color\":\"red\"}").status == 400);
+        const std::string H = made(dan, "{\"name\":\"Helpers\"}");
+        CHECK(!H.empty());
+
+        /* Ann, a Keeper, may mute and kick members below her, and nothing else */
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + fay.id + "/mute", "{}").status == 404);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + ann.id + "/roles", "{\"roles\":[" + K + "]}").status == 204);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + fay.id + "/mute", "{}").status == 204);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + fay.id + "/unmute").status == 204);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + fay.id + "/ban", "{}").status == 404); /* not hers */
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/channels/create", "{\"name\":\"annex\"}").status == 404);
+        CHECK(pond.call(&ann, "GET", "/pond/v1/admin/invites").status == 404);
+        a = pond.call(&ann, "POST", "/pond/v1/admin/members/" + dan.id + "/mute", "{}");
+        CHECK(a.status == 409 && has(a.body, "outranked")); /* an operator */
+
+        /* she makes and gives roles below her own, with only what she may do */
+        CHECK(pond.call(&ann, "POST", R + "create", "{\"name\":\"Bouncers\",\"permissions\":[\"ban_members\"]}").status == 409);
+        const std::string G = made(ann, "{\"name\":\"Greeters\",\"permissions\":[\"mute_members\"]}");
+        CHECK(!G.empty());
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + fay.id + "/roles", "{\"roles\":[" + K + "]}").status == 409);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + fay.id + "/roles", "{\"roles\":[" + G + "]}").status == 204);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + ann.id + "/roles", "{\"roles\":[]}").status == 409); /* hers is not below */
+        a = pond.call(&fay, "POST", "/pond/v1/admin/members/" + ann.id + "/mute", "{}");
+        CHECK(a.status == 409 && has(a.body, "outranked")); /* Greeters are below Keepers */
+        CHECK(pond.call(&fay, "POST", "/pond/v1/admin/members/" + gil.id + "/mute", "{}").status == 204);
+        CHECK(pond.call(&fay, "POST", "/pond/v1/admin/members/" + gil.id + "/unmute").status == 204);
+        CHECK(pond.call(&ann, "POST", R + K + "/edit", "{\"color\":null}").status == 409);
+        CHECK(pond.call(&ann, "POST", R + G + "/edit", "{\"permissions\":[\"mute_members\",\"ban_members\"]}").status == 409);
+        CHECK(pond.call(&ann, "POST", R + G + "/edit", "{\"color\":\"#00aa00\",\"hoist\":true}").status == 204);
+        CHECK(has(pond.call(&gil, "GET", "/pond/v1/info").body, "\"name\":\"Greeters\",\"color\":\"#00aa00\",\"hoist\":true"));
+
+        /* the order: highest first; she moves only roles below hers */
+        int64_t c2 = num_of(pond.call(&gil, "GET", "/pond/v1/info").body, "cursor");
+        CHECK(pond.call(&ann, "POST", R + "order", "{\"roles\":[" + G + "," + K + "," + H + "]}").status == 409);
+        CHECK(pond.call(&ann, "POST", R + "order", "{\"roles\":[" + K + "," + G + "]}").status == 409); /* not all */
+        CHECK(pond.call(&ann, "POST", R + "order", "{\"roles\":[" + K + "," + G + "," + H + "]}").status == 204);
+        const Json::Value rinfo = parse(pond.call(&gil, "GET", "/pond/v1/info").body);
+        CHECK(rinfo["roles"].size() == 3 && std::to_string(rinfo["roles"][1]["id"].asInt64()) == G);
+        CHECK(has(pond.call(&gil, "GET", "/pond/v1/events?after=" + std::to_string(c2)).body, "\"kind\":\"role_order\""));
+
+        /* a member with no role is below everyone; a Keeper can't be deleted by one */
+        CHECK(pond.call(&ann, "POST", R + K + "/delete").status == 409);
+        CHECK(pond.call(&ann, "POST", R + H + "/delete").status == 204);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + gil.id + "/remove").status == 204);
+        CHECK(pond.call(&dan, "POST", R + K + "/delete").status == 204);
+        CHECK(pond.call(&ann, "POST", "/pond/v1/admin/members/" + fay.id + "/mute", "{}").status == 404); /* not a Keeper now */
+        CHECK(pond.call(&dan, "POST", R + G + "/delete").status == 204);
+        CHECK(pond.ctl("log", &out) == 0 && has(out, "role_order"));
+
+        /* ---- pages, and the banner (docs/design.md, "Pages") ---- */
+        const std::string PG = "/pond/v1/admin/pages/";
+        CHECK(pond.call(&fay, "POST", PG + "create", "{\"title\":\"Rules\"}").status == 404); /* not hers to make */
+        a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Rules\",\"body\":\"# Rules\\n\\nBe kind. See #general.\"}");
+        CHECK(a.status == 200 && has(a.body, "\"title\":\"Rules\",\"kind\":\"markdown\""));
+        const std::string P1 = std::to_string(num_of(a.body, "id"));
+        a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Shop\",\"kind\":\"shop\"}");
+        CHECK(a.status == 400 && has(a.body, "unknown_kind")); /* not yet */
+        CHECK(pond.call(&dan, "POST", PG + "create", "{\"title\":\" \"}").status == 400);
+        CHECK(has(pond.call(&fay, "GET", "/pond/v1/info").body, "\"pages\":[{\"id\":" + P1 + ",\"title\":\"Rules\",\"kind\":\"markdown\""));
+        a = pond.call(&fay, "GET", "/pond/v1/pages/" + P1);
+        CHECK(a.status == 200 && has(a.body, "Be kind. See #general.") && has(a.body, "\"files\":[]") && has(a.body, "\"updated_by\":\"" + dan.id));
+        CHECK(pond.call(&fay, "GET", "/pond/v1/pages/999999").status == 404);
+
+        /* Fay, a Scribe, may manage pages: a file sent first, then carried by the page, which every member may fetch */
+        const std::string SC = made(dan, "{\"name\":\"Scribes\",\"permissions\":[\"manage_pages\"]}");
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + fay.id + "/roles", "{\"roles\":[" + SC + "]}").status == 204);
+        const std::string guide = "a guide, in a file of its own";
+        unsigned char gh[32];
+        sha256(guide.data(), guide.size(), gh);
+        const std::string ghashes((const char *)gh, 32), gid = sha256_hex(ghashes), GF = "/pond/v1/files/" + gid;
+        CHECK(pond.call(&fay, "POST", GF, "{\"size\":" + std::to_string(guide.size()) + ",\"chunks\":\"" + base64(gh, 32) + "\"}").status == 200);
+        CHECK(pond.call(&fay, "POST", GF + "/chunks/0", guide).status == 204);
+        CHECK(pond.call(&ann, "GET", GF + "/chunks").status == 404); /* nothing carries it yet */
+        a = pond.call(&fay, "POST", PG + P1 + "/edit", "{\"files\":[{\"id\":\"" + std::string(64, 'c') + "\",\"name\":\"x\",\"mime\":\"x/y\"}]}");
+        CHECK(a.status == 409 && has(a.body, "no_file"));
+        CHECK(pond.call(&fay, "POST", PG + P1 + "/edit", "{\"files\":[{\"id\":\"" + gid + "\",\"name\":\"guide.txt\",\"mime\":\"text/plain\"}]}").status == 204);
+        CHECK(has(pond.call(&ann, "GET", "/pond/v1/pages/" + P1).body, "\"files\":[{\"id\":\"" + gid + "\",\"name\":\"guide.txt\",\"mime\":\"text/plain\",\"size\":29}]"));
+        CHECK(pond.call(&ann, "GET", GF + "/chunks").status == 200);
+
+        /* the order, and deleting */
+        int64_t c3 = num_of(pond.call(&ann, "GET", "/pond/v1/info").body, "cursor");
+        a = pond.call(&fay, "POST", PG + "create", "{\"title\":\"Servers\"}");
+        const std::string P2 = std::to_string(num_of(a.body, "id"));
+        CHECK(pond.call(&fay, "POST", PG + "order", "{\"pages\":[" + P2 + "]}").status == 409); /* not all */
+        CHECK(pond.call(&fay, "POST", PG + "order", "{\"pages\":[" + P2 + "," + P1 + "]}").status == 204);
+        CHECK(parse(pond.call(&ann, "GET", "/pond/v1/info").body)["pages"][0]["id"].asInt64() == std::stoll(P2));
+        a = pond.call(&ann, "GET", "/pond/v1/events?after=" + std::to_string(c3));
+        CHECK(has(a.body, "\"kind\":\"page\"") && has(a.body, "\"kind\":\"page_order\""));
+        CHECK(pond.call(&fay, "POST", PG + P2 + "/delete").status == 204);
+        CHECK(pond.call(&ann, "GET", "/pond/v1/pages/" + P2).status == 404);
+        CHECK(has(pond.call(&ann, "GET", "/pond/v1/events?after=" + std::to_string(c3)).body, "\"kind\":\"page_deleted\""));
+
+        /* the banner: a picture, over the Pond's name; for whoever may manage the Pond */
+        {
+            const std::string png = std::string("\x89PNG\r\n\x1a\n", 8) + std::string(400, 'b'), BH = sha256_hex(png);
+            CHECK(pond.call(&dan, "POST", "/pond/v1/pictures", png).status == 200);
+            CHECK(pond.call(&fay, "POST", "/pond/v1/admin/banner", "{\"hash\":\"" + BH + "\"}").status == 404); /* not a Scribe's */
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/banner", "{\"hash\":\"" + BH + "\"}").status == 204);
+            CHECK(has(pond.call(&ann, "GET", "/pond/v1/info").body, "\"banner\":{\"hash\":\"" + BH));
+            CHECK(pond.call(&ann, "GET", "/pond/v1/pictures/" + BH).status == 200);
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/banner", "{\"hash\":null}").status == 204);
+            CHECK(has(pond.call(&ann, "GET", "/pond/v1/info").body, "\"banner\":null"));
+        }
+        CHECK(pond.call(&dan, "POST", R + SC + "/delete").status == 204);
+        CHECK(pond.ctl("log", &out) == 0 && has(out, "page_create") && has(out, "page_order") && has(out, "set_banner"));
     }
 
     /* ---- what nobody may ask ---- */

@@ -109,6 +109,7 @@ add_library(pond_lib STATIC
   src/ratelimit.cpp
   src/roles.cpp
   src/channel_roles.cpp
+    src/pages.cpp
   src/pond.cpp
   src/reqsig.cpp
   src/routes.cpp

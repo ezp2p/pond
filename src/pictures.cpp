@@ -131,11 +131,12 @@ Task<Answer> Service::picture_put(std::string member, std::string bytes)
     co_return Answer{200, ref};
 }
 
-/* Is the picture shown to the members: the Pond's icon, or in the profile of someone who is a member? */
+/* Is the picture shown to the members: the Pond's icon or banner, or in the profile of someone who is a member? */
 Task<bool> Service::picture_shown(std::string hash)
 {
     std::string icon = co_await setting("icon");
-    if (icon == hash)
+    std::string banner = co_await setting("banner");
+    if (icon == hash || banner == hash)
         co_return true;
     /* the hash is 64 hex characters (checked), so it can only match where a profile names it */
     Result r = co_await db_->execSqlCoro("SELECT 1 FROM members WHERE left_ms IS NULL AND profile LIKE CONCAT('%', ?, '%') LIMIT 1", hash);
@@ -160,7 +161,7 @@ Task<Answer> Service::picture_get(std::string member, std::string hash)
     }
 }
 
-Task<Outcome> Service::set_icon(std::optional<std::string> hash)
+Task<Outcome> Service::set_icon(std::optional<std::string> hash, std::string which)
 {
     std::string ref;
     if (hash && !picture_ref(*hash, ref))
@@ -169,9 +170,9 @@ Task<Outcome> Service::set_icon(std::optional<std::string> hash)
     try {
         tx = co_await db_->newTransactionCoro();
         if (hash)
-            co_await tx->execSqlCoro("REPLACE INTO settings (name, value) VALUES ('icon', ?)", *hash);
+            co_await tx->execSqlCoro("REPLACE INTO settings (name, value) VALUES (?, ?)", which, *hash);
         else
-            co_await tx->execSqlCoro("DELETE FROM settings WHERE name = 'icon'");
+            co_await tx->execSqlCoro("DELETE FROM settings WHERE name = ?", which);
         std::string pj = co_await pond_json(tx);
         int64_t ev = co_await add_event(tx, "pond", pj);
         if (!co_await Committed(std::move(tx)))
@@ -185,15 +186,15 @@ Task<Outcome> Service::set_icon(std::optional<std::string> hash)
     }
 }
 
-Task<Answer> Service::admin_icon(std::string by, std::optional<std::string> hash)
+Task<Answer> Service::admin_icon(std::string by, std::optional<std::string> hash, std::string which)
 {
     if (hash && !picture_hash_ok(*hash))
         co_return fail(400, "bad_request");
-    Outcome o = co_await set_icon(hash);
+    Outcome o = co_await set_icon(hash, which);
     if (!o.empty())
         co_return Answer{400, "{\"error\":\"bad_request\",\"message\":" + jstr(o) + "}"};
     std::string detail = hash ? *hash : std::string("removed");
-    co_await log_admin(by, "set_icon", "", detail);
+    co_await log_admin(by, "set_" + which, "", detail);
     co_return Answer{204, ""};
 }
 

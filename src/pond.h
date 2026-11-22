@@ -42,15 +42,19 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 9; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 11; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
                              * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
                              * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures");
                              * 7: muting, and a member's `muted` ("Muting");
                              * 8: direct messages, relayed (docs/dms.md), where `features` says `dms`; a member's `dms`;
                              * 9: roles for channels, and the channels' order from the app ("Roles for channels"): `roles` in
-                             *    /info, a member's and a channel's `roles`, and the events `role`, `role_deleted` and `channels` */
-constexpr std::array<const char *, 6> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles"}; /* and "voice", when voice is on */
+                             *    /info, a member's and a channel's `roles`, and the events `role`, `role_deleted` and `channels`;
+                             * 10: what roles let their members do, their colour, order, and whether they are shown apart ("Permissions"):
+                             *    a role's `color`, `hoist` and `permissions`, the order of `roles` in /info, and the event `role_order`;
+                             * 11: pages, and the Pond's banner ("Pages"): `pages` in /info, GET /pond/v1/pages/{page}, the `banner` in
+                             *    `pond`, the permission `manage_pages`, and the events `page`, `page_deleted` and `page_order` */
+constexpr std::array<const char *, 8> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles", "role_permissions", "pages"}; /* and "voice", when voice is on */
 
 /* Direct messages (docs/dms.md, dms.cpp): relayed, never stored. */
 constexpr size_t DM_SEALED_MAX = 128 * 1024;           /* a sealed letter, as base64: a message with ten files' previews fits */
@@ -75,6 +79,49 @@ constexpr int64_t OFFER_KEEP_MS = 7LL * 24 * 3600 * 1000;
 constexpr size_t BAN_REASON_MAX = 500;
 constexpr size_t ROLE_NAME_MAX = 32;   /* characters in the name of a role for channels */
 constexpr int64_t ROLES_MAX = 200;     /* roles for channels in one Pond */
+
+/* What a role lets the members who hold it do (docs/design.md, "Permissions"): bits in `roles.permissions`, names on the wire.
+ * An operator or administrator may do all of it. */
+enum Permission : int64_t {
+    MANAGE_POND = 1, MANAGE_CHANNELS = 2, MANAGE_ROLES = 4, MANAGE_INVITES = 8, KICK_MEMBERS = 16, BAN_MEMBERS = 32, MUTE_MEMBERS = 64,
+    MANAGE_PAGES = 128
+};
+struct PermissionName {
+    int64_t bit;
+    const char *name;
+};
+constexpr std::array<PermissionName, 8> PERMISSIONS{{{MANAGE_POND, "manage_pond"}, {MANAGE_CHANNELS, "manage_channels"},
+                                                     {MANAGE_ROLES, "manage_roles"}, {MANAGE_INVITES, "manage_invites"},
+                                                     {KICK_MEMBERS, "kick_members"}, {BAN_MEMBERS, "ban_members"},
+                                                     {MUTE_MEMBERS, "mute_members"}, {MANAGE_PAGES, "manage_pages"}}};
+
+/* Pages (docs/design.md, "Pages"): what a Pond shows above its channels. A page has a kind; "markdown" is the only one yet,
+ * and the others (roles to pick, events, an entry form, a shop) will each be one. */
+constexpr int64_t PAGES_MAX = 50;
+constexpr size_t PAGE_TITLE_MAX = 64;          /* characters */
+constexpr size_t PAGE_BODY_MAX = 64 * 1024;    /* characters of markdown */
+constexpr size_t PAGE_FILES_MAX = 10;         /* as many as a message: a Puddle sends no more at once */
+constexpr std::array<const char *, 1> PAGE_KINDS{"markdown"};
+std::string permissions_json(int64_t bits);
+/* A role on the wire: {id, name, color (null or "#rrggbb"), hoist, permissions} */
+std::string role_json(int64_t id, const std::string &name, const std::string &color, bool hoist, int64_t permissions);
+
+/* What a member may do: their rank, what the roles they hold let them do, and the highest of those roles (its `position`:
+ * the lower, the higher; INT64_MAX for none). */
+struct Powers {
+    Role rank = Role::MEMBER;
+    int64_t permissions = 0;
+    int64_t top = INT64_MAX;
+    bool ranked() const { return rank != Role::MEMBER; }
+    bool has(int64_t p) const { return ranked() || (permissions & p) == p; }
+};
+
+/* A role made or changed from the app: what is to be set. `color` "" for none. */
+struct RoleEdit {
+    std::optional<std::string> name, color;
+    std::optional<bool> hoist;
+    std::optional<int64_t> permissions;
+};
 constexpr int INVITE_USES_MAX = 1000000;
 constexpr int64_t INVITE_EXPIRY_MAX_MS = 10LL * 366 * 24 * 3600 * 1000; /* made from the app: at most ten years ahead */
 
@@ -125,6 +172,14 @@ struct FileRef {
     std::string id, name, mime, preview;
     int64_t w = 0, h = 0, duration_ms = 0; /* 0 if not said */
 };
+/* A file as a message or page carries it: its name cleaned, its type checked. false if it can't be. */
+bool clean_file(FileRef &f);
+
+/* A page made or changed from the app: what is to be set */
+struct PageEdit {
+    std::optional<std::string> title, kind, body;
+    std::optional<std::vector<FileRef>> files;
+};
 
 /* What an admin action did: "" if it worked, else why not. */
 using Outcome = std::string;
@@ -168,7 +223,10 @@ public:
     Task<Answer> answer_offer(std::string member, int64_t offer, bool accept);
     /* `member`'s role; MEMBER for someone who is not one. */
     Task<Role> role(std::string member);
-    /* What an operator or administrator does from the app; `by` is checked to hold a role first (the routes). */
+    /* What `member` may do (channel_roles.cpp). */
+    Task<Powers> powers(std::string member);
+    /* What an operator or administrator, or a member whose roles allow it, does from the app; `by` is checked to have the
+     * permission first (the routes), and rank and the order of roles here. */
     Task<Answer> admin_pond(std::string by, std::optional<std::string> name, std::optional<std::string> description);
     Task<Answer> admin_channel_create(std::string by, std::string name, std::string topic, std::string kind = "text");
     Task<Answer> admin_channel_edit(std::string by, int64_t channel, std::optional<std::string> name, std::optional<std::string> topic);
@@ -188,8 +246,18 @@ public:
     Task<Answer> admin_unban(std::string by, std::string member);
     /* Roles for channels (channel_roles.cpp; docs/design.md, "Roles for channels"): named by operators and administrators,
      * given to members, and asked for by channels that are not open to everyone. */
-    Task<Answer> admin_role_create(std::string by, std::string name);
-    Task<Answer> admin_role_edit(std::string by, int64_t role, std::string name);
+    Task<Answer> admin_role_create(std::string by, RoleEdit e);
+    Task<Answer> admin_role_edit(std::string by, int64_t role, RoleEdit e);
+    /* Pages (pages.cpp; docs/design.md, "Pages"): every page, in order, as /info lists them; one, whole, for a member; made,
+     * changed, deleted and ordered by whoever may manage pages. */
+    Task<std::string> pages_json();
+    Task<Answer> page_get(std::string member, int64_t page);
+    Task<Answer> admin_page_create(std::string by, PageEdit edit);
+    Task<Answer> admin_page_edit(std::string by, int64_t page, PageEdit edit);
+    Task<Answer> admin_page_delete(std::string by, int64_t page);
+    Task<Answer> admin_page_order(std::string by, std::vector<int64_t> pages);
+    /* the order of the roles: every role's id, highest first */
+    Task<Answer> admin_role_order(std::string by, std::vector<int64_t> roles);
     Task<Answer> admin_role_delete(std::string by, int64_t role);
     /* the roles `member` holds now: these, and no others */
     Task<Answer> admin_member_roles(std::string by, std::string member, std::vector<int64_t> roles);
@@ -206,7 +274,8 @@ public:
     Task<Answer> picture_put(std::string member, std::string bytes);
     Task<Answer> picture_get(std::string member, std::string hash);
     /* The Pond's icon: a picture sent first, or nullopt for none. */
-    Task<Answer> admin_icon(std::string by, std::optional<std::string> hash);
+    /* ...or its banner (`which` "banner": the picture over its name in the channel list; docs/design.md, "Pages") */
+    Task<Answer> admin_icon(std::string by, std::optional<std::string> hash, std::string which = "icon");
 
     /* Direct messages (dms.cpp, docs/dms.md). A member's chain, for sealing to them; a letter relayed (or its sender told the
      * recipient isn't there); whether `member` takes them; a piece of a letter's file, asked for by its recipient and sent by its
@@ -251,7 +320,7 @@ public:
     /* Keep a picture (pondctl's `icon`; picture_put for members): its hash in `hash`. */
     Outcome store_picture(const std::string &bytes, std::string &hash);
     /* The icon: the hash of a picture kept, or nullopt to have none. */
-    Task<Outcome> set_icon(std::optional<std::string> hash);
+    Task<Outcome> set_icon(std::optional<std::string> hash, std::string which = "icon");
     /* `bytes` 0 turns files off. */
     Task<Outcome> set_files_max(int64_t bytes);
     /* How many files are kept, and the bytes they take. */

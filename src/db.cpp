@@ -84,6 +84,25 @@ static const char *const STEPS[][8] = {
         "ALTER TABLE events ADD COLUMN channel BIGINT NULL",
         nullptr,
     },
+    {
+        /* what roles let their members do, their colour, their order, and whether they are shown apart (docs/design.md,
+         * "Permissions"): `permissions` is bits, `color` "#rrggbb" or "" for none, and the lower the `position` the higher */
+        "ALTER TABLE roles ADD COLUMN permissions BIGINT NOT NULL DEFAULT 0, ADD COLUMN color VARCHAR(7) NOT NULL DEFAULT '',"
+        " ADD COLUMN hoist TINYINT NOT NULL DEFAULT 0, ADD COLUMN position BIGINT NOT NULL DEFAULT 0",
+        "UPDATE roles SET position = id",
+        nullptr,
+    },
+    {
+        /* pages (docs/design.md, "Pages"): shown above the channels, in their order; markdown, and the files they carry. The
+         * banner is a setting, as the icon is. */
+        "CREATE TABLE pages (id BIGINT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(64) NOT NULL, kind VARCHAR(16) NOT NULL DEFAULT 'markdown',"
+        " body MEDIUMTEXT NOT NULL, position BIGINT NOT NULL DEFAULT 0, created_ms BIGINT NOT NULL, updated_ms BIGINT NOT NULL,"
+        " updated_by CHAR(52) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE page_files (page BIGINT NOT NULL, position TINYINT NOT NULL, file CHAR(64) NOT NULL, name VARCHAR(255) NOT NULL,"
+        " mime VARCHAR(127) NOT NULL, size BIGINT NOT NULL, w INT NULL, h INT NULL, PRIMARY KEY (page, position), KEY (file))"
+        " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run
