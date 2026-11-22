@@ -486,6 +486,16 @@ Protocol 10, feature `role_permissions`. A Puddle of protocol 9 sees roles as be
 admin screens only for ranks, so a member with permissions needs a newer Puddle to use them (the routes work for them
 either way).
 
+## Role colours
+
+A role's colour shows on its chips. Whose *name* shows in it is up to each member: a member's `role_color` says they chose
+it, by `POST /pond/v1/role_color {"use": bool}`, and their name then shows in the colour of their highest role that has
+one. Otherwise their name keeps the colour of their own profile. Those who may `manage_pond` can make everyone's name show
+in their role's colour instead (`POST /pond/v1/admin/role_colors {"enforced": bool}`); the Pond's `role_colors` says
+`"choice"` or `"enforced"`. Neither changes anyone's profile: it is how the apps draw names here.
+
+Protocol 12, feature `role_colors`. A member's choice comes in a `member` event, the Pond's in a `pond` event.
+
 ## Pages
 
 Built 2026-11-22. A Pond shows its members **pages** above its channels, set off from them by a line, as Discord's server
@@ -509,6 +519,7 @@ guide is: rules, a list of servers, a guide. The apps show a page where a channe
 | `POST /pond/v1/admin/pages/{page}/delete` | |
 | `POST /pond/v1/admin/pages/order` | `{pages: [ids]}`: every page, first to last; `409 pages_changed` if one was made or deleted meanwhile |
 | `POST /pond/v1/admin/banner` | `{hash}`, or `{hash: null}` for none |
+| `POST /pond/v1/admin/role_colors` | `{enforced}`: everyone's name in their role's colour, or each member's choice ("Role colours") |
 
 `/info` gains `pages` (`[{id, title, kind, updated}]`, in order); the body is asked for when a page is opened. New events:
 `page` (`{id, title, kind, updated}`: made or changed; a new one is last), `page_deleted` (`{id}`) and `page_order`

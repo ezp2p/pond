@@ -42,7 +42,7 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 11; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 12; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
                              * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
                              * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures");
@@ -53,8 +53,10 @@ constexpr int PROTOCOL = 11; /* 2: roles (docs/design.md, "Roles"); 3: receipts,
                              * 10: what roles let their members do, their colour, order, and whether they are shown apart ("Permissions"):
                              *    a role's `color`, `hoist` and `permissions`, the order of `roles` in /info, and the event `role_order`;
                              * 11: pages, and the Pond's banner ("Pages"): `pages` in /info, GET /pond/v1/pages/{page}, the `banner` in
-                             *    `pond`, the permission `manage_pages`, and the events `page`, `page_deleted` and `page_order` */
-constexpr std::array<const char *, 8> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles", "role_permissions", "pages"}; /* and "voice", when voice is on */
+                             *    `pond`, the permission `manage_pages`, and the events `page`, `page_deleted` and `page_order`;
+                             * 12: names in a role's colour ("Role colours"): a member's `role_color`, `role_colors` in `pond`,
+                             *    POST /pond/v1/role_color and /pond/v1/admin/role_colors */
+constexpr std::array<const char *, 9> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles", "role_permissions", "pages", "role_colors"}; /* and "voice", when voice is on */
 
 /* Direct messages (docs/dms.md, dms.cpp): relayed, never stored. */
 constexpr size_t DM_SEALED_MAX = 128 * 1024;           /* a sealed letter, as base64: a message with ten files' previews fits */
@@ -283,6 +285,10 @@ public:
     Task<Answer> member_chain(std::string member);
     Task<Answer> dm_send(std::string from, std::string to, std::string id, std::string kid, std::string enc, std::string sealed);
     Task<Answer> dm_accept(std::string member, bool accept);
+    /* Role colours (docs/design.md, "Role colours"): whether a member's name shows in their highest coloured role's colour, as
+     * they choose; and whether the Pond makes everyone's do (`enforced`, set by those who may manage it). */
+    Task<Answer> role_color(std::string member, bool use);
+    Task<Answer> admin_role_colors(std::string by, bool enforced);
     Task<Answer> dm_piece_get(std::string to, std::string from, std::string letter, int n, std::string part);
     Task<Answer> dm_piece_put(std::string from, std::string to, std::string letter, int n, std::string part, std::string bytes);
     struct DmSettings {
