@@ -287,6 +287,47 @@ paths:
         "404": { description: "`no_member`: either is not a member now" }
         "409": { description: "`not_accepted` (they take no direct messages here), `dms_off` (the Pond relays none)" }
         "429": { description: "`slow_down`, `too_many_new` (20 new people a day)" }
+  /pond/v1/apply:
+    post:
+      summary: Apply to join, answering the entry form (protocol 13; docs/design.md, "Entry form")
+      description: As a join is sent (a stranger, sealed to the invite's key, signed by the chain). Spends one use of the invite.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [invite, chain, answers], properties: { invite: { type: string }, chain: { type: string }, profile: { type: object }, answers: { type: object, description: "question id: text, or [choices]" } } } } } }
+      responses:
+        "200": { description: "`{status: pending}`" }
+        "400": { description: "`bad_request`, with a message saying which answer" }
+        "404": { description: Not a good invite (as for joining) }
+        "409": { description: "`application_pending`, `already_member`, `no_form`" }
+  /pond/v1/orders:
+    get:
+      summary: The member's own orders, newest first (protocol 13, "Shop")
+      responses: { "200": { description: "`{orders: [Order]}`" } }
+  /pond/v1/pages/{page}/roles:
+    post:
+      summary: Of the roles a roles page offers, those the member holds now (protocol 13)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [roles], properties: { roles: { type: array, items: { type: integer } } } } } } }
+      responses: { "200": { description: "`{roles}`" }, "409": { description: "`not_offered`, `one_only`" } }
+  /pond/v1/pages/{page}/events/{event}/going:
+    post:
+      summary: Whether the member is going (protocol 13)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [going], properties: { going: { type: boolean } } } } } }
+      responses: { "200": { description: "`{going, count}`" } }
+  /pond/v1/pages/{page}/items/{item}/buy:
+    post:
+      summary: 'Buy (protocol 13, "Shop"): a Stripe Payment Link for this order alone'
+      requestBody: { content: { application/json: { schema: { type: object, properties: { quantity: { type: integer, minimum: 1, maximum: 100 }, amount: { type: integer, description: "For one paid as wished: what one costs, at least its price" } } } } } }
+      responses:
+        "200": { description: "`{order, url}`: where to pay" }
+        "409": { description: "`no_payments`, `sold_out`, `too_little` (`least`)" }
+        "502": { description: "`stripe_failed`, with Stripe's message" }
+  /pond/v1/voice/members/{member}/mute:
+    post:
+      summary: Mute someone in voice for everyone, or unmute (protocol 13, "Voice moderation"); needs voice_mute in their channel
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [muted], properties: { muted: { type: boolean } } } } } }
+      responses: { "204": { description: Done }, "404": { description: "`no_session`" }, "409": { description: "`outranked`, `not_yourself`" } }
+  /pond/v1/voice/members/{member}/disconnect:
+    post:
+      summary: 'Take someone out of their voice channel (protocol 13); needs move_members there. `voice_left` says `by`.'
+      responses: { "204": { description: Done }, "404": { description: "`no_session`" }, "409": { description: "`outranked`, `not_yourself`" } }
   /pond/v1/role_color:
     post:
       summary: Whether this member's name shows in their highest coloured role's colour (protocol 12, feature `role_colors`)
@@ -526,6 +567,52 @@ paths:
       description: As the icon is set; for whoever may `manage_pond`. Every member hears of it in a `pond` event, whose `banner` changes.
       requestBody: { content: { application/json: { schema: { type: object, required: [hash], properties: { hash: { oneOf: [{ type: string, pattern: "^[0-9a-f]{64}$" }, { type: "null" }] } } } } } }
       responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" } }
+  /pond/v1/admin/everyone:
+    post:
+      summary: What everyone may do (protocol 13, "Permissions"), for whoever may manage roles
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [permissions], properties: { permissions: { type: array, items: { $ref: "#/components/schemas/Permission" } } } } } } }
+      responses: { "204": { description: Done }, "400": { description: "`unknown_permission`" }, "409": { description: "`outranked`" } }
+  /pond/v1/admin/channels/{channel}/overrides:
+    post:
+      summary: What a channel allows and denies everyone and each role, all at once (protocol 13)
+      parameters: [{ $ref: "#/components/parameters/Channel" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [overrides], properties: { overrides: { type: array, items: { $ref: "#/components/schemas/Override" } } } } } } }
+      responses: { "204": { description: Done }, "400": { description: "`bad_override`, `unknown_permission`" }, "404": { description: "`no_channel`, `unknown_role`" }, "409": { description: "`outranked`" } }
+  /pond/v1/admin/pages/{page}/events/create:
+    post:
+      summary: An event on an events page (protocol 13), for whoever may manage events
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [title, starts], properties: { title: { type: string }, starts: { type: integer }, ends: { type: integer }, place: { type: string }, description: { type: string } } } } } }
+      responses: { "200": { description: "`{id}`" } }
+  /pond/v1/admin/pages/{page}/events/{event}/edit:
+    post: { summary: "What is given changes; ends null for none", responses: { "204": { description: Done } } }
+  /pond/v1/admin/pages/{page}/events/{event}/delete:
+    post: { summary: "Deleted, with who was going", responses: { "204": { description: Done } } }
+  /pond/v1/admin/pages/{page}/items/create:
+    post:
+      summary: Something a shop page sells (protocol 13), for whoever may manage the shop
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [title, price], properties: { title: { type: string }, price: { type: integer }, description: { type: string }, image: { type: string }, custom: { type: boolean }, stock: { oneOf: [{ type: integer }, { type: "null" }] }, active: { type: boolean } } } } } }
+      responses: { "200": { description: "`{id}`" } }
+  /pond/v1/admin/pages/{page}/items/{item}/edit:
+    post: { summary: "What is given changes", responses: { "204": { description: Done } } }
+  /pond/v1/admin/pages/{page}/items/{item}/delete:
+    post: { summary: "Taken off the page; orders keep its title", responses: { "204": { description: Done } } }
+  /pond/v1/admin/orders:
+    get: { summary: "Every order, newest 200, for whoever may manage the shop", responses: { "200": { description: "`{orders: [Order]}` with `member`" } } }
+  /pond/v1/admin/shop/stripe:
+    post:
+      summary: The Stripe key the shop takes payments with, or null to stop (protocol 13), for whoever may manage the Pond
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [key], properties: { key: { oneOf: [{ type: string }, { type: "null" }] } } } } } }
+      responses: { "204": { description: Done }, "400": { description: Not a Stripe key }, "409": { description: "`stripe_refused`, with Stripe's message" } }
+  /pond/v1/admin/applications:
+    get: { summary: "Applications to join, waiting first (protocol 13, \"Entry form\")", responses: { "200": { description: "`{applications: [{member, profile, answers, status, reason, created, decided_by, decided}]}`" } } }
+  /pond/v1/admin/applications/{member}/accept:
+    post: { summary: "They are a member now", parameters: [{ $ref: "#/components/parameters/Member" }], responses: { "204": { description: Done }, "404": { description: "`no_application`" } } }
+  /pond/v1/admin/applications/{member}/decline:
+    post:
+      summary: Declined; they may apply again
+      parameters: [{ $ref: "#/components/parameters/Member" }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { reason: { type: string, maxLength: 500 } } } } } }
+      responses: { "204": { description: Done }, "404": { description: "`no_application`" } }
   /pond/v1/admin/role_colors:
     post:
       summary: Make everyone's name show in their role's colour, or leave it to each member (protocol 12, feature `role_colors`)
@@ -765,7 +852,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). `role_colors`: names in a role's colour, as each member chooses or the Pond enforces (protocol 12, "Role colours"). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). `role_colors`: names in a role's colour, as each member chooses or the Pond enforces (protocol 12, "Role colours"). `overrides`: what everyone may do, and each channel's permissions (protocol 13, "Permissions"). `page_kinds`: roles, events, form and shop pages and pages for some roles ("Pages"). `applications`: the entry form ("Entry form"). `shop`: the shop ("Shop"). `voice_moderation`: muting and disconnecting in voice ("Voice moderation"). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -886,15 +973,27 @@ components:
         hoist: { type: boolean }
         permissions: { type: array, items: { $ref: "#/components/schemas/Permission" } }
     Permission:
-      enum: [manage_pond, manage_channels, manage_roles, manage_invites, kick_members, ban_members, mute_members, manage_pages]
+      enum: [manage_pond, manage_channels, manage_roles, manage_invites, kick_members, ban_members, mute_members, manage_pages,
+             view_channels, send_messages, attach_files, connect, speak, video, move_members, voice_mute, manage_events,
+             manage_applications, manage_shop]
+      description: 'docs/design.md, "Permissions". From view_channels on, protocol 13; view_channels to voice_mute are those a channel may allow or deny.'
+    Override:
+      type: object
+      description: 'What a channel allows and denies a role, or everyone (role 0) (protocol 13)'
+      required: [role, allow, deny]
+      properties:
+        role: { type: integer, minimum: 0 }
+        allow: { type: array, items: { $ref: "#/components/schemas/Permission" } }
+        deny: { type: array, items: { $ref: "#/components/schemas/Permission" } }
     PageHead:
       type: object
       description: 'A page as /info lists it (protocol 11; docs/design.md, "Pages")'
       properties:
         id: { type: integer }
         title: { type: string, maxLength: 64 }
-        kind: { type: string, description: "`markdown`; later kinds will be added (roles to pick, events, an entry form, a shop)" }
+        kind: { enum: [markdown, roles, events, form, shop], description: "Protocol 13 for all but markdown" }
         updated: { type: integer, description: When it last changed (ms) }
+        roles: { description: "Protocol 13: null for everyone, or the roles it is for", oneOf: [{ type: array, items: { type: integer } }, { type: "null" }] }
     Page:
       type: object
       properties:
@@ -905,6 +1004,49 @@ components:
         files: { type: array, maxItems: 10, items: { type: object, properties: { id: { type: string }, name: { type: string }, mime: { type: string }, size: { type: integer }, w: { type: integer }, h: { type: integer } } } }
         updated: { type: integer }
         updated_by: { type: string, description: The member who last changed it }
+        roles: { oneOf: [{ type: array, items: { type: integer } }, { type: "null" }] }
+        data: { type: object, description: 'The kind''s settings (docs/design.md, "The kinds")' }
+        mine: { type: array, items: { type: integer }, description: "A roles page: those offered that the member holds" }
+        events: { type: array, items: { $ref: "#/components/schemas/Event" } }
+        items: { type: array, items: { $ref: "#/components/schemas/Item" } }
+        payments: { type: boolean, description: "A shop page: the Pond takes payments" }
+    Event:
+      type: object
+      properties:
+        id: { type: integer }
+        title: { type: string, maxLength: 100 }
+        description: { type: string }
+        place: { type: string, maxLength: 200 }
+        starts: { type: integer, description: ms }
+        ends: { oneOf: [{ type: integer }, { type: "null" }] }
+        going: { type: integer }
+        me: { type: boolean, description: The member asking is going }
+    Item:
+      type: object
+      properties:
+        id: { type: integer }
+        title: { type: string, maxLength: 100 }
+        description: { type: string }
+        image: { type: string, description: "The name of one of the page's media, or empty" }
+        price: { type: integer, description: "In the currency's smallest unit; the least, for one paid as wished" }
+        custom: { type: boolean, description: The buyer says how much }
+        stock: { oneOf: [{ type: integer }, { type: "null" }] }
+        active: { type: boolean }
+    Order:
+      type: object
+      properties:
+        id: { type: integer }
+        item: { type: integer }
+        title: { type: string }
+        quantity: { type: integer }
+        amount: { type: integer, description: "The whole order, in the currency's smallest unit" }
+        currency: { type: string }
+        status: { enum: [creating, open, paid, lapsed, failed] }
+        url: { type: string, description: "While open, to the buyer: where to pay" }
+        live: { type: boolean, description: "Stripe's live mode, not a test" }
+        created: { type: integer }
+        paid: { oneOf: [{ type: integer }, { type: "null" }] }
+        member: { type: string, description: "admin/orders only" }
     PageChange:
       type: object
       properties:
@@ -912,6 +1054,8 @@ components:
         kind: { type: string }
         body: { type: string }
         files: { type: array, maxItems: 10, items: { type: object, required: [id, name, mime], properties: { id: { type: string }, name: { type: string }, mime: { type: string }, w: { type: integer }, h: { type: integer } } } }
+        data: { type: object, description: "Protocol 13: the kind's settings" }
+        roles: { description: "Protocol 13: null for everyone, or role ids", oneOf: [{ type: array, items: { type: integer } }, { type: "null" }] }
     Role:
       enum: [operator, administrator, member]
       description: "docs/design.md, \"Roles\". Missing (protocol 1) means member."
@@ -926,6 +1070,7 @@ components:
         roles:
           description: "Protocol 9: null when everyone may see it; else the roles that may (with operators and administrators)"
           oneOf: [{ type: array, items: { type: integer } }, { type: "null" }]
+        overrides: { type: array, items: { $ref: "#/components/schemas/Override" }, description: "Protocol 13" }
     InVoice:
       type: object
       description: Someone in a voice channel (docs/voice.md, "Who is in it")

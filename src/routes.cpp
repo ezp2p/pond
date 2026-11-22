@@ -32,11 +32,13 @@ static const Answer NOT_FOUND = {UNKNOWN, ""};
 enum Kind {
     JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
     VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET, MEMBER_CHAIN, DM_SEND, DM_SETTINGS, DM_PIECE_GET,
-    DM_PIECE_PUT, PAGE_GET, ROLE_COLOR,
+    DM_PIECE_PUT, PAGE_GET, ROLE_COLOR, APPLY, PAGE_PICK_ROLES, PAGE_EVENT_GOING, SHOP_BUY, ORDERS, VOICE_MODERATE,
     ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN,
     ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, ADMIN_MUTE, ADMIN_ROLE_CREATE, ADMIN_ROLE_EDIT, ADMIN_ROLE_DELETE,
     ADMIN_MEMBER_ROLES, ADMIN_CHANNEL_ROLES, ADMIN_CHANNEL_ORDER, ADMIN_ROLE_ORDER, ADMIN_BANNER, ADMIN_PAGE_CREATE,
-    ADMIN_PAGE_EDIT, ADMIN_PAGE_DELETE, ADMIN_PAGE_ORDER, ADMIN_ROLE_COLORS, ADMIN_UNMUTE, NONE
+    ADMIN_PAGE_EDIT, ADMIN_PAGE_DELETE, ADMIN_PAGE_ORDER, ADMIN_ROLE_COLORS, ADMIN_EVERYONE, ADMIN_CHANNEL_OVERRIDES,
+    ADMIN_EVENT_CREATE, ADMIN_EVENT_EDIT, ADMIN_EVENT_DELETE, ADMIN_ITEM_CREATE, ADMIN_ITEM_EDIT, ADMIN_ITEM_DELETE, ADMIN_ORDERS,
+    ADMIN_STRIPE, ADMIN_APPLICATIONS, ADMIN_APPLICATION_ACCEPT, ADMIN_APPLICATION_DECLINE, ADMIN_UNMUTE, NONE
 };
 
 /* The routes only an operator or administrator may use (docs/design.md, "Roles"), or a member whose roles let them. */
@@ -53,7 +55,25 @@ static int64_t permission_for(int k)
     case ADMIN_ICON:
     case ADMIN_BANNER:
     case ADMIN_ROLE_COLORS:
+    case ADMIN_STRIPE:
         return MANAGE_POND;
+    case ADMIN_EVERYONE:
+        return MANAGE_ROLES;
+    case ADMIN_CHANNEL_OVERRIDES:
+        return MANAGE_CHANNELS;
+    case ADMIN_EVENT_CREATE:
+    case ADMIN_EVENT_EDIT:
+    case ADMIN_EVENT_DELETE:
+        return MANAGE_EVENTS;
+    case ADMIN_ITEM_CREATE:
+    case ADMIN_ITEM_EDIT:
+    case ADMIN_ITEM_DELETE:
+    case ADMIN_ORDERS:
+        return MANAGE_SHOP;
+    case ADMIN_APPLICATIONS:
+    case ADMIN_APPLICATION_ACCEPT:
+    case ADMIN_APPLICATION_DECLINE:
+        return MANAGE_APPLICATIONS;
     case ADMIN_PAGE_CREATE:
     case ADMIN_PAGE_EDIT:
     case ADMIN_PAGE_DELETE:
@@ -113,8 +133,12 @@ static bool hex_id_ok(std::string_view s)
 }
 
 /* The routes under /pond/v1/admin/: the channel or member in the path, if any. */
-static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channel, std::string &member)
+static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channel, std::string &member, int64_t &n)
 {
+    if (post && p == "everyone") return ADMIN_EVERYONE;
+    if (post && p == "shop/stripe") return ADMIN_STRIPE;
+    if (get && p == "orders") return ADMIN_ORDERS;
+    if (get && p == "applications") return ADMIN_APPLICATIONS;
     if (post && p == "pond") return ADMIN_POND;
     if (post && p == "icon") return ADMIN_ICON;
     if (post && p == "banner") return ADMIN_BANNER;
@@ -143,10 +167,26 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
         if (verb == "edit") return ADMIN_CHANNEL_EDIT;
         if (verb == "delete") return ADMIN_CHANNEL_DELETE;
         if (verb == "roles") return ADMIN_CHANNEL_ROLES;
+        if (verb == "overrides") return ADMIN_CHANNEL_OVERRIDES;
     }
     if (post && split("pages/", id, verb) && (channel = number_of(id, false)) > 0) { /* the page's id, in `channel` */
         if (verb == "edit") return ADMIN_PAGE_EDIT;
         if (verb == "delete") return ADMIN_PAGE_DELETE;
+        /* events/create, events/{event}/edit, items/{item}/delete, ...: the event's or item's id in `n` */
+        for (auto [what, create, change, remove] : {std::tuple{std::string_view("events/"), ADMIN_EVENT_CREATE, ADMIN_EVENT_EDIT, ADMIN_EVENT_DELETE},
+                                                    std::tuple{std::string_view("items/"), ADMIN_ITEM_CREATE, ADMIN_ITEM_EDIT, ADMIN_ITEM_DELETE}}) {
+            if (verb.substr(0, what.size()) != what)
+                continue;
+            std::string_view rest = verb.substr(what.size());
+            if (rest == "create")
+                return create;
+            size_t slash = rest.find('/');
+            if (slash == std::string_view::npos || (n = number_of(rest.substr(0, slash), false)) < 1)
+                return NONE;
+            if (rest.substr(slash + 1) == "edit") return change;
+            if (rest.substr(slash + 1) == "delete") return remove;
+            return NONE;
+        }
     }
     if (post && split("roles/", id, verb) && (channel = number_of(id, false)) > 0) { /* the role's id, in `channel` */
         if (verb == "edit") return ADMIN_ROLE_EDIT;
@@ -159,6 +199,11 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
         if (verb == "mute") return ADMIN_MUTE;
         if (verb == "unmute") return ADMIN_UNMUTE;
         if (verb == "roles") return ADMIN_MEMBER_ROLES;
+    }
+    if (post && split("applications/", id, verb) && user_id_ok(id)) {
+        member = std::string(id);
+        if (verb == "accept") return ADMIN_APPLICATION_ACCEPT;
+        if (verb == "decline") return ADMIN_APPLICATION_DECLINE;
     }
     if (post && split("bans/", id, verb) && user_id_ok(id) && verb == "unban") {
         member = std::string(id);
@@ -207,6 +252,34 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
         return NONE;
     p.remove_prefix(9);
     if (post && p == "join") return JOIN;
+    if (post && p == "apply") return APPLY;
+    if (get && p == "orders") return ORDERS;
+    /* voice/members/{member}/mute or /disconnect: moderating someone in a voice channel */
+    if (post && p.substr(0, 14) == "voice/members/" && p.size() > 14 + 53 && p[14 + 52] == '/' && user_id_ok(p.substr(14, 52))) {
+        member = std::string(p.substr(14, 52));
+        file = std::string(p.substr(14 + 53)); /* what to do */
+        return file == "mute" || file == "disconnect" ? VOICE_MODERATE : NONE;
+    }
+    /* pages/{page}/roles, pages/{page}/events/{event}/going, pages/{page}/items/{item}/buy */
+    if (post && p.substr(0, 6) == "pages/") {
+        std::string_view rest = p.substr(6);
+        size_t slash = rest.find('/');
+        if (slash == std::string_view::npos || (channel = number_of(rest.substr(0, slash), false)) < 1)
+            return NONE;
+        rest.remove_prefix(slash + 1);
+        if (rest == "roles") return PAGE_PICK_ROLES;
+        for (auto [what, tail, kind] : {std::tuple{std::string_view("events/"), std::string_view("/going"), PAGE_EVENT_GOING},
+                                        std::tuple{std::string_view("items/"), std::string_view("/buy"), SHOP_BUY}}) {
+            if (rest.substr(0, what.size()) != what)
+                continue;
+            rest.remove_prefix(what.size());
+            size_t s2 = rest.find('/');
+            if (s2 == std::string_view::npos || rest.substr(s2) != tail || (n = number_of(rest.substr(0, s2), false)) < 1)
+                return NONE;
+            return kind;
+        }
+        return NONE;
+    }
     if (post && p == "keys") return KEYS;
     if (get && p == "info") return INFO;
     if (get && p == "events") return EVENTS;
@@ -252,7 +325,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
         return NONE;
     }
     if (p.substr(0, 6) == "admin/")
-        return admin_route(get, post, p.substr(6), channel, member);
+        return admin_route(get, post, p.substr(6), channel, member, n);
     if (p.substr(0, 9) != "channels/")
         return NONE;
     p.remove_prefix(9);
@@ -276,12 +349,20 @@ static bool takes_body(Kind k)
     return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == DM_SEND || k == DM_SETTINGS || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
            k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER || k == ADMIN_ROLE_ORDER || k == ADMIN_BANNER || k == ADMIN_PAGE_CREATE || k == ADMIN_PAGE_EDIT || k == ADMIN_PAGE_ORDER || k == ADMIN_ROLE_COLORS || k == ROLE_COLOR ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
-           k == VOICE_WATCH;
+           k == VOICE_WATCH || k == APPLY || k == PAGE_PICK_ROLES || k == PAGE_EVENT_GOING || k == SHOP_BUY || k == VOICE_MODERATE ||
+           k == ADMIN_EVERYONE || k == ADMIN_CHANNEL_OVERRIDES || k == ADMIN_EVENT_CREATE || k == ADMIN_EVENT_EDIT || k == ADMIN_ITEM_CREATE ||
+           k == ADMIN_ITEM_EDIT || k == ADMIN_STRIPE || k == ADMIN_APPLICATION_DECLINE || k == ADMIN_APPLICATION_ACCEPT;
+}
+
+/* A stranger's request: signed by the chain it carries, sealed to the Pond's key from the invite */
+static bool stranger(Kind k)
+{
+    return k == JOIN || k == APPLY;
 }
 
 static size_t body_max(Kind k)
 {
-    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == DM_PIECE_PUT ? DM_PIECE_MAX : k == DM_SEND ? DM_SEND_MAX : k == PICTURE_PUT ? PICTURE_MAX : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : (k == ADMIN_PAGE_CREATE || k == ADMIN_PAGE_EDIT) ? PAGE_EDIT_MAX : BODY_MAX;
+    return k == FILE_PUT ? (size_t)FILE_CHUNK : k == DM_PIECE_PUT ? DM_PIECE_MAX : k == DM_SEND ? DM_SEND_MAX : k == PICTURE_PUT ? PICTURE_MAX : k == FILE_BEGIN ? BEGIN_MAX : k == SEND ? SEND_MAX : k == VOICE_JOIN ? VOICE_JOIN_MAX : (k == ADMIN_PAGE_CREATE || k == ADMIN_PAGE_EDIT || k == APPLY) ? PAGE_EDIT_MAX : BODY_MAX;
 }
 
 /* "files": [{id, name, mime, w?, h?, duration_ms?, preview?}], as a send says them; cleaned by the Service. */
@@ -361,6 +442,23 @@ static bool body_profile(const std::string &body, const Json::Value &json, std::
     return true;
 }
 
+/* `json[key]`: permission names, as bits; false if one is not a permission (`unknown` set) */
+static bool body_permissions(const Json::Value &v, int64_t &bits, bool &unknown)
+{
+    bits = 0, unknown = false;
+    if (!v.isArray() || v.size() > PERMISSIONS.size())
+        return false;
+    for (const auto &n : v) {
+        const int64_t bit = n.isString() ? permission_bit(n.asString()) : 0;
+        if (!bit) {
+            unknown = true;
+            return false;
+        }
+        bits |= bit;
+    }
+    return true;
+}
+
 /* The key chain a join or keys request carries, checked. */
 static bool body_chain(const Json::Value &json, Chain &out)
 {
@@ -397,7 +495,7 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
     ReqSig claimed, sig;
     if (!parse_reqsig(header, claimed))
         co_return NOT_FOUND;
-    std::string me = k == JOIN ? "*" : svc_.key().id;
+    std::string me = stranger(k) ? "*" : svc_.key().id;
     std::string body; /* opened: what the request says */
     if (has_seal) {
         std::string kid;
@@ -415,9 +513,9 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
     Json::Value json;
     bool json_ok = takes_body(k) && parse_object(body, json);
     Chain chain;
-    if (k == JOIN || k == KEYS) {
+    if (stranger(k) || k == KEYS) {
         /* checking a chain costs signatures, and anyone can send one: refuse floods before the work */
-        if (k == JOIN) {
+        if (stranger(k)) {
             std::lock_guard<std::mutex> g(strangers_mu_);
             if (!strangers_.take(now))
                 co_return NOT_FOUND;
@@ -428,7 +526,7 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
 
     /* whose key the signature must be by: for join and keys the chain's, otherwise the member's as kept */
     std::array<unsigned char, 32> pub;
-    if (k == JOIN || k == KEYS) {
+    if (stranger(k) || k == KEYS) {
         if (claimed.id != chain.id || claimed.kid != chain.kid || !unhex(chain.sign_pub_hex, pub.data(), 32))
             co_return NOT_FOUND;
     } else {
@@ -444,7 +542,7 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
     Authn authn = authenticate(header, method, target, sent, me, lookup, replay_, now, sig);
     if (authn != Authn::REJECT) { /* who it says: answers to them are signed */
         signing.nonce = sig.nonce;
-        signing.only_ok = k == JOIN;
+        signing.only_ok = stranger(k);
     }
     switch (authn) {
     case Authn::OK:
@@ -482,6 +580,20 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
     };
 
     switch (k) {
+    case APPLY: {
+        /* {invite, chain, profile?, answers: {question id: text, or [choices]}}: to join a Pond with an entry form */
+        std::string invite, profile;
+        if (!get_string(json, "invite", invite) || !token_ok(invite) || !body_profile(body, json, profile) || !json.isMember("answers") ||
+            !json["answers"].isObject())
+            co_return fail(400, "bad_request");
+        std::string_view raw;
+        if (!raw_member(body, "answers", raw))
+            co_return fail(400, "bad_request");
+        Answer a = co_await svc_.apply(chain, invite, profile, std::string(raw));
+        if (a.status == 404)
+            co_return NOT_FOUND;
+        co_return a;
+    }
     case JOIN: {
         std::string invite, profile;
         if (!get_string(json, "invite", invite) || !token_ok(invite) || !body_profile(body, json, profile))
@@ -613,6 +725,149 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
     }
     case PAGE_GET:
         co_return co_await svc_.page_get(sender, channel);
+    case PAGE_PICK_ROLES: {
+        /* {roles: [ids]}: of the roles the page offers, those they hold now */
+        std::vector<int64_t> roles;
+        if (!body_ids(json, "roles", PAGE_OPTIONS_MAX, roles))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.page_pick_roles(sender, channel, std::move(roles));
+    }
+    case PAGE_EVENT_GOING:
+        if (!json.isMember("going") || !json["going"].isBool())
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.event_going(sender, channel, chunk, json["going"].asBool());
+    case SHOP_BUY: {
+        /* {quantity?, amount?: what they pay for one, for an item paid as wished} */
+        int64_t quantity = 1, amount = 0;
+        if (json.isMember("quantity")) {
+            if (!json["quantity"].isInt64())
+                co_return fail(400, "bad_request");
+            quantity = json["quantity"].asInt64();
+        }
+        if (json.isMember("amount")) {
+            if (!json["amount"].isInt64())
+                co_return fail(400, "bad_request");
+            amount = json["amount"].asInt64();
+        }
+        co_return co_await svc_.shop_buy(sender, channel, chunk, quantity, amount);
+    }
+    case ORDERS:
+        co_return co_await svc_.orders(sender, false);
+    case ADMIN_ORDERS:
+        co_return co_await svc_.orders(sender, true);
+    case ADMIN_STRIPE: {
+        /* {key: a Stripe secret or restricted key, or null to stop taking payments} */
+        std::optional<std::string> key;
+        if (!json.isMember("key") || (!json["key"].isNull() && !opt_string("key", key)))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_stripe(sender, key);
+    }
+    case ADMIN_EVENT_CREATE:
+    case ADMIN_EVENT_EDIT: {
+        EventEdit e;
+        if (!opt_string("title", e.title) || !opt_string("description", e.description) || !opt_string("place", e.place))
+            co_return fail(400, "bad_request");
+        for (auto [key, to] : {std::pair<const char *, std::optional<int64_t> *>{"starts", &e.starts}, {"ends", &e.ends}})
+            if (json.isMember(key)) {
+                if (json[key].isNull())
+                    *to = 0;
+                else if (!json[key].isInt64() || json[key].asInt64() < 1)
+                    co_return fail(400, "bad_request");
+                else
+                    *to = json[key].asInt64();
+            }
+        if (k == ADMIN_EVENT_CREATE)
+            co_return co_await svc_.admin_event_create(sender, channel, std::move(e));
+        co_return co_await svc_.admin_event_edit(sender, channel, chunk, std::move(e));
+    }
+    case ADMIN_EVENT_DELETE:
+        co_return co_await svc_.admin_event_delete(sender, channel, chunk);
+    case ADMIN_ITEM_CREATE:
+    case ADMIN_ITEM_EDIT: {
+        ItemEdit e;
+        if (!opt_string("title", e.title) || !opt_string("description", e.description) || !opt_string("image", e.image))
+            co_return fail(400, "bad_request");
+        if (json.isMember("price")) {
+            if (!json["price"].isInt64())
+                co_return fail(400, "bad_request");
+            e.price = json["price"].asInt64();
+        }
+        for (auto [key, to] : {std::pair<const char *, std::optional<bool> *>{"custom", &e.custom}, {"active", &e.active}})
+            if (json.isMember(key)) {
+                if (!json[key].isBool())
+                    co_return fail(400, "bad_request");
+                *to = json[key].asBool();
+            }
+        if (json.isMember("stock")) {
+            if (json["stock"].isNull())
+                e.stock = std::optional<int64_t>();
+            else if (!json["stock"].isInt64() || json["stock"].asInt64() < 0)
+                co_return fail(400, "bad_request");
+            else
+                e.stock = std::optional<int64_t>(json["stock"].asInt64());
+        }
+        if (k == ADMIN_ITEM_CREATE)
+            co_return co_await svc_.admin_item_create(sender, channel, std::move(e));
+        co_return co_await svc_.admin_item_edit(sender, channel, chunk, std::move(e));
+    }
+    case ADMIN_ITEM_DELETE:
+        co_return co_await svc_.admin_item_delete(sender, channel, chunk);
+    case ADMIN_APPLICATIONS:
+        co_return co_await svc_.admin_applications();
+    case ADMIN_APPLICATION_ACCEPT:
+        co_return co_await svc_.admin_application(sender, member, true, "");
+    case ADMIN_APPLICATION_DECLINE: {
+        std::optional<std::string> reason;
+        if (!opt_string("reason", reason))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_application(sender, member, false, reason.value_or(""));
+    }
+    case ADMIN_EVERYONE: {
+        /* {permissions: [names]}: what everyone may do */
+        int64_t bits = 0;
+        bool unknown = false;
+        if (!json.isMember("permissions") || !body_permissions(json["permissions"], bits, unknown))
+            co_return fail(400, unknown ? "unknown_permission" : "bad_request");
+        co_return co_await svc_.admin_everyone(sender, bits);
+    }
+    case ADMIN_CHANNEL_OVERRIDES: {
+        /* {overrides: [{role: id, or 0 for everyone, allow: [names], deny: [names]}]} */
+        const Json::Value &a = json["overrides"];
+        if (!a.isArray() || a.size() > (Json::ArrayIndex)ROLES_MAX + 1)
+            co_return fail(400, "bad_request");
+        std::vector<Override> list;
+        for (const auto &o : a) {
+            Override v;
+            bool unknown = false;
+            if (!o.isObject() || !o["role"].isInt64() || o["role"].asInt64() < 0 || !body_permissions(o["allow"], v.allow, unknown) ||
+                !body_permissions(o["deny"], v.deny, unknown))
+                co_return fail(400, unknown ? "unknown_permission" : "bad_request");
+            v.role = o["role"].asInt64();
+            list.push_back(v);
+        }
+        co_return co_await svc_.admin_channel_overrides(sender, channel, std::move(list));
+    }
+    case VOICE_MODERATE: {
+        /* mute {muted: bool}, or disconnect {}: someone in a voice channel, by whoever may there (docs/voice.md, "Moderation") */
+        std::optional<bool> muted;
+        if (file == "mute") {
+            if (!json.isMember("muted") || !json["muted"].isBool())
+                co_return fail(400, "bad_request");
+            muted = json["muted"].asBool();
+        }
+        if (!voice_)
+            co_return fail(404, "no_session");
+        const int64_t where = voice_->channel_of(member);
+        if (!where)
+            co_return fail(404, "no_session");
+        const int64_t need = muted ? VOICE_MUTE : MOVE_MEMBERS;
+        const std::string why = co_await svc_.may_moderate(sender, member, where, need);
+        if (why == "no_permission")
+            co_return NOT_FOUND;
+        if (!why.empty())
+            co_return fail(409, why.c_str());
+        co_return co_await voice_->moderate(sender, member, muted);
+    }
     case ADMIN_PAGE_CREATE:
     case ADMIN_PAGE_EDIT: {
         /* {title?, kind?, body?, files?}: a new page needs its title; files as a message's, sent first */
@@ -624,6 +879,22 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
             if (!json["files"].isArray() || json["files"].size() > PAGE_FILES_MAX || !body_files(json, files, PAGE_FILES_MAX))
                 co_return fail(400, "bad_file");
             e.files = std::move(files);
+        }
+        if (json.isMember("data")) { /* the kind's settings: an object, checked by the Service */
+            std::string_view raw;
+            if (!json["data"].isObject() || !raw_member(body, "data", raw))
+                co_return fail(400, "bad_request");
+            e.data = std::string(raw);
+        }
+        if (json.isMember("roles")) { /* null: for everyone; [ids]: for those roles */
+            if (json["roles"].isNull()) {
+                e.roles = std::optional<std::vector<int64_t>>();
+            } else {
+                std::vector<int64_t> ids;
+                if (!body_ids(json, "roles", (size_t)ROLES_MAX, ids))
+                    co_return fail(400, "bad_request");
+                e.roles = std::optional<std::vector<int64_t>>(std::move(ids));
+            }
         }
         if (k == ADMIN_PAGE_CREATE)
             co_return co_await svc_.admin_page_create(sender, std::move(e));
@@ -862,7 +1133,7 @@ Task<HttpResponsePtr> Routes::handle(HttpRequestPtr req)
             }
             a.body = std::move(ct);
         }
-        if (!signing.nonce.empty() && (!signing.only_ok || a.status == 200)) {
+        if (!signing.nonce.empty() && (!signing.only_ok || a.status == 200 || a.status == 409)) {
             std::string receipt = receipt_header(svc_.key(), signing.nonce, a.status, a.body);
             if (!receipt.empty())
                 r->addHeader("X-Puddle-Receipt", receipt);

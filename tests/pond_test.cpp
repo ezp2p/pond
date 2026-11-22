@@ -6,6 +6,14 @@
 
 #include <algorithm>
 #include <thread>
+#include <map>
+#include <mutex>
+#include <set>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <drogon/utils/Utilities.h>
 #include "seal.h"
 #include "identity.h"
 #include "reqsig.h"
@@ -36,6 +44,126 @@ static std::string invite(PondProc &p, const std::string &args)
     return at == std::string::npos ? "" : out.substr(at + 7, 26);
 }
 
+/* Stripe, as far as the shop uses it (shop.cpp): prices, payment links, the checkout sessions of a link, and a link closed. A
+ * link is paid when the test says so. Plain HTTP on 127.0.0.1, which pond.yaml's shop.stripe_api allows for this. */
+struct FakeStripe {
+    int fd = -1;
+    unsigned port = 0;
+    std::thread th;
+    std::mutex mu;
+    std::vector<std::string> seen;           /* "METHOD path body" */
+    std::map<std::string, std::string> orders; /* link id: the order it is for */
+    std::set<std::string> paid, closed;
+    int links = 0;
+
+    bool start()
+    {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (bind(fd, (sockaddr *)&a, sizeof a) != 0 || listen(fd, 16) != 0)
+            return false;
+        socklen_t len = sizeof a;
+        getsockname(fd, (sockaddr *)&a, &len);
+        port = ntohs(a.sin_port);
+        th = std::thread([this] { serve(); });
+        return true;
+    }
+    ~FakeStripe()
+    {
+        if (fd >= 0) {
+            shutdown(fd, SHUT_RDWR);
+            close(fd);
+        }
+        if (th.joinable())
+            th.join();
+    }
+    static std::string field(const std::string &form, const std::string &key)
+    {
+        for (size_t p = 0; p < form.size();) {
+            size_t e = form.find('&', p);
+            if (e == std::string::npos)
+                e = form.size();
+            std::string pair = form.substr(p, e - p);
+            size_t eq = pair.find('=');
+            if (eq != std::string::npos && drogon::utils::urlDecode(pair.substr(0, eq)) == key)
+                return drogon::utils::urlDecode(pair.substr(eq + 1));
+            p = e + 1;
+        }
+        return "";
+    }
+    void serve()
+    {
+        for (;;) {
+            int c = accept(fd, nullptr, nullptr);
+            if (c < 0)
+                return;
+            std::string req;
+            char buf[8192];
+            ssize_t n;
+            size_t want = std::string::npos;
+            while ((n = recv(c, buf, sizeof buf, 0)) > 0) {
+                req.append(buf, n);
+                size_t h = req.find("\r\n\r\n");
+                if (h != std::string::npos && want == std::string::npos) {
+                    size_t cl = req.find("content-length: ");
+                    if (cl == std::string::npos)
+                        cl = req.find("Content-Length: ");
+                    want = h + 4 + (cl == std::string::npos || cl > h ? 0 : strtoul(req.c_str() + cl + 16, nullptr, 10));
+                }
+                if (want != std::string::npos && req.size() >= want)
+                    break;
+            }
+            const size_t sp = req.find(' '), sp2 = req.find(' ', sp + 1), h = req.find("\r\n\r\n");
+            const std::string method = req.substr(0, sp), target = req.substr(sp + 1, sp2 - sp - 1),
+                              body = h == std::string::npos ? "" : req.substr(h + 4);
+            const bool good = req.find("Bearer sk_test_good") != std::string::npos;
+            int status = 200;
+            std::string out;
+            {
+                std::lock_guard<std::mutex> g(mu);
+                seen.push_back(method + " " + target + " " + body);
+                const std::string path = target.substr(0, target.find('?')), query = target.find('?') == std::string::npos ? "" : target.substr(target.find('?') + 1);
+                if (!good) {
+                    status = 401, out = "{\"error\":{\"message\":\"Invalid API Key provided\"}}";
+                } else if (method == "GET" && path == "/v1/payment_links") {
+                    out = "{\"data\":[]}";
+                } else if (method == "POST" && path == "/v1/prices") {
+                    out = "{\"id\":\"price_" + std::to_string(seen.size()) + "\"}";
+                } else if (method == "POST" && path == "/v1/payment_links") {
+                    const std::string id = "plink_" + std::to_string(++links);
+                    orders[id] = field(body, "metadata[pond_order]");
+                    out = "{\"id\":\"" + id + "\",\"url\":\"https://buy.stripe.com/test_" + std::to_string(links) + "\"}";
+                } else if (method == "POST" && path.rfind("/v1/payment_links/", 0) == 0) {
+                    closed.insert(path.substr(18));
+                    out = "{}";
+                } else if (method == "GET" && path == "/v1/checkout/sessions") {
+                    const std::string link = field(query, "payment_link");
+                    out = paid.count(link) ? "{\"data\":[{\"status\":\"complete\",\"payment_status\":\"paid\",\"metadata\":{\"pond_order\":\"" + orders[link] + "\"}}]}"
+                                           : std::string("{\"data\":[]}");
+                } else {
+                    status = 404, out = "{\"error\":{\"message\":\"no such route\"}}";
+                }
+            }
+            const std::string reply = "HTTP/1.1 " + std::to_string(status) + " X\r\nContent-Type: application/json\r\nContent-Length: " +
+                                      std::to_string(out.size()) + "\r\nConnection: close\r\n\r\n" + out;
+            send(c, reply.data(), reply.size(), MSG_NOSIGNAL);
+            close(c);
+        }
+    }
+    bool saw(const std::string &part)
+    {
+        std::lock_guard<std::mutex> g(mu);
+        for (auto &s : seen)
+            if (s.find(part) != std::string::npos)
+                return true;
+        return false;
+    }
+};
+
 int main()
 {
     TestDb db;
@@ -43,7 +171,10 @@ int main()
         fprintf(stderr, "cannot start a MariaDB for the test\n");
         return 1;
     }
+    FakeStripe stripe;
+    CHECK(stripe.start());
     PondProc pond(db);
+    pond.extra = "shop:\n  stripe_api: http://127.0.0.1:" + std::to_string(stripe.port) + "\n";
     CHECK(pond.init("Test Pond", 300));
     std::string out;
     CHECK(pond.ctl("init Again", &out) != 0 && has(out, "already has a key")); /* never a second key */
@@ -127,7 +258,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 12 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 13 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -605,7 +736,7 @@ int main()
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + S + "/roles", "{\"roles\":[999999]}").status == 404); /* no such role */
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + S + "/roles", "{\"roles\":[" + mods + "]}").status == 204);
         CHECK(channel_id(ann, "staff") == 0 && channel_id(fay, "staff") == 0 && channel_id(dan, "staff") == staff);
-        CHECK(has(pond.call(&dan, "GET", "/pond/v1/info").body, "\"roles\":[" + mods + "]}"));
+        CHECK(has(pond.call(&dan, "GET", "/pond/v1/info").body, "\"roles\":[" + mods + "],\"overrides\":"));
         CHECK(pond.call(&ann, "GET", "/pond/v1/channels/" + S + "/messages").status == 404);
         CHECK(pond.call(&ann, "POST", "/pond/v1/channels/" + S + "/send", "{\"text\":\"let me in\"}").status == 404);
         CHECK(pond.call(&dan, "POST", "/pond/v1/channels/" + S + "/send", "{\"text\":\"for mods only\"}").status == 200);
@@ -648,11 +779,11 @@ int main()
         /* deleting the role leaves the channel to operators and administrators; then open to everyone */
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/" + mods + "/delete").status == 204);
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/roles/" + mods + "/delete").status == 404);
-        CHECK(channel_id(ann, "staff") == 0 && has(pond.call(&dan, "GET", "/pond/v1/info").body, "\"roles\":[]}"));
+        CHECK(channel_id(ann, "staff") == 0 && has(pond.call(&dan, "GET", "/pond/v1/info").body, "\"roles\":[],\"overrides\":"));
         CHECK(has(pond.call(&ann, "GET", "/pond/v1/members").body, "\"roles\":[]"));
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + S + "/roles", "{\"roles\":null}").status == 204);
         CHECK(channel_id(fay, "staff") == staff);
-        CHECK(pond.ctl("log", &out) == 0 && has(out, "role_create") && has(out, "channel_roles") && has(out, "channel_order"));
+        CHECK(pond.ctl("log", &out) == 0 && has(out, "role_create") && has(out, "channel_overrides") && has(out, "channel_order"));
 
         /* ---- what roles let members do, and their order (docs/design.md, "Permissions") ---- */
         /* Dan is an operator; Ann and Fay are members, from above; Gil joins */
@@ -723,8 +854,8 @@ int main()
         a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Rules\",\"body\":\"# Rules\\n\\nBe kind. See #general.\"}");
         CHECK(a.status == 200 && has(a.body, "\"title\":\"Rules\",\"kind\":\"markdown\""));
         const std::string P1 = std::to_string(num_of(a.body, "id"));
-        a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Shop\",\"kind\":\"shop\"}");
-        CHECK(a.status == 400 && has(a.body, "unknown_kind")); /* not yet */
+        a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Shop\",\"kind\":\"bazaar\"}");
+        CHECK(a.status == 400 && has(a.body, "unknown_kind"));
         CHECK(pond.call(&dan, "POST", PG + "create", "{\"title\":\" \"}").status == 400);
         CHECK(has(pond.call(&fay, "GET", "/pond/v1/info").body, "\"pages\":[{\"id\":" + P1 + ",\"title\":\"Rules\",\"kind\":\"markdown\""));
         a = pond.call(&fay, "GET", "/pond/v1/pages/" + P1);
@@ -792,6 +923,199 @@ int main()
             CHECK(pond.call(&fay, "POST", "/pond/v1/role_color", "{\"use\":false}").status == 200);
             CHECK(pond.ctl("log", &out) == 0 && has(out, "set_role_colors"));
         }
+
+        /* ---- permissions for everyone and for each channel (protocol 13, docs/design.md, "Permissions") ---- */
+        Identity kim, lee;
+        CHECK(pond.call(&kim, "POST", "/pond/v1/join", join_body(kim, invite(pond, ""), "Kim"), "*").status == 200);
+        CHECK(pond.call(&lee, "POST", "/pond/v1/join", join_body(lee, invite(pond, ""), "Lee"), "*").status == 200);
+        CHECK(has(pond.call(&kim, "GET", "/pond/v1/info").body,
+                  "\"everyone\":{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\"]}"));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/create", "{\"name\":\"news\"}").status / 100 == 2);
+        const int64_t news = channel_id(dan, "news");
+        const std::string NEWS = "/pond/v1/admin/channels/" + std::to_string(news) + "/overrides";
+        const std::string W = made(dan, "{\"name\":\"Writers\"}");
+        CHECK(pond.call(&dan, "POST", NEWS, "{\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"send_messages\"]}]}").status == 204);
+        CHECK(pond.call(&dan, "POST", NEWS, "{\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"manage_pond\"]}]}").status == 400);
+        CHECK(pond.call(&dan, "POST", NEWS, "{\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"fly\"]}]}").status == 400);
+        CHECK(pond.call(&kim, "POST", NEWS, "{\"overrides\":[]}").status == 404); /* not his */
+        const std::string NS = "/pond/v1/channels/" + std::to_string(news) + "/send";
+        a = pond.call(&kim, "POST", NS, "{\"text\":\"hi\"}");
+        CHECK(a.status == 409 && has(a.body, "no_permission"));
+        CHECK(pond.call(&dan, "POST", NS, "{\"text\":\"news\"}").status == 200); /* a rank may do everything */
+        CHECK(pond.call(&dan, "POST", NEWS, "{\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"send_messages\"]},{\"role\":" + W +
+                                                ",\"allow\":[\"send_messages\"],\"deny\":[]}]}").status == 204);
+        CHECK(has(pond.call(&kim, "GET", "/pond/v1/info").body, "\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"send_messages\"]},{\"role\":" + W));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + kim.id + "/roles", "{\"roles\":[" + W + "]}").status == 204);
+        CHECK(pond.call(&kim, "POST", NS, "{\"text\":\"a writer\"}").status == 200);
+        CHECK(pond.call(&lee, "POST", NS, "{\"text\":\"no\"}").status == 409);
+        /* hidden from everyone but Writers */
+        CHECK(pond.call(&dan, "POST", NEWS, "{\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"view_channels\"]},{\"role\":" + W +
+                                                ",\"allow\":[\"view_channels\"],\"deny\":[]}]}").status == 204);
+        CHECK(channel_id(lee, "news") == 0 && channel_id(kim, "news") == news);
+        CHECK(pond.call(&lee, "POST", NS, "{\"text\":\"no\"}").status == 404);
+        /* what everyone may do: no sending anywhere, until it is given back */
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/everyone", "{\"permissions\":[\"view_channels\",\"connect\"]}").status == 204);
+        a = pond.call(&lee, "POST", "/pond/v1/channels/" + std::to_string(channel_id(lee, "general")) + "/send", "{\"text\":\"x\"}");
+        CHECK(a.status == 409 && has(a.body, "no_permission"));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/everyone", "{\"permissions\":[\"bogus\"]}").status == 400);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/everyone",
+                        "{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\"]}").status == 204);
+        CHECK(pond.call(&lee, "POST", "/pond/v1/channels/" + std::to_string(channel_id(lee, "general")) + "/send", "{\"text\":\"x\"}").status == 200);
+        /* everyone may now manage invites: Lee sees the route */
+        CHECK(pond.call(&lee, "GET", "/pond/v1/admin/invites").status == 404);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/everyone",
+                        "{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\",\"manage_invites\"]}").status == 204);
+        CHECK(pond.call(&lee, "GET", "/pond/v1/admin/invites").status == 200);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/everyone",
+                        "{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\"]}").status == 204);
+
+        /* ---- a page for some roles only ---- */
+        a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Writers' room\",\"roles\":[" + W + "]}");
+        CHECK(a.status == 200);
+        const std::string WP = std::to_string(num_of(a.body, "id"));
+        CHECK(has(pond.call(&kim, "GET", "/pond/v1/info").body, "\"title\":\"Writers' room\""));
+        CHECK(!has(pond.call(&lee, "GET", "/pond/v1/info").body, "Writers' room"));
+        CHECK(pond.call(&lee, "GET", "/pond/v1/pages/" + WP).status == 404);
+        CHECK(has(pond.call(&kim, "GET", "/pond/v1/pages/" + WP).body, "\"roles\":[" + W + "]"));
+        {
+            int64_t c5 = num_of(pond.call(&lee, "GET", "/pond/v1/info").body, "cursor");
+            CHECK(pond.call(&dan, "POST", PG + WP + "/edit", "{\"roles\":null}").status == 204);
+            a = pond.call(&lee, "GET", "/pond/v1/events?after=" + std::to_string(c5));
+            CHECK(has(a.body, "\"kind\":\"pages\",\"data\":{\"pages\":[") && has(a.body, "Writers' room"));
+        }
+        CHECK(pond.call(&lee, "GET", "/pond/v1/pages/" + WP).status == 200);
+        CHECK(pond.call(&dan, "POST", PG + WP + "/delete").status == 204);
+
+        /* ---- an events page ---- */
+        a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Events\",\"kind\":\"events\"}");
+        const std::string EP = std::to_string(num_of(a.body, "id"));
+        const int64_t tomorrow = (int64_t)time(nullptr) * 1000 + 86400000;
+        CHECK(pond.call(&fay, "POST", PG + EP + "/events/create", "{\"title\":\"x\",\"starts\":" + std::to_string(tomorrow) + "}").status == 404);
+        CHECK(pond.call(&dan, "POST", PG + EP + "/events/create", "{\"title\":\"x\"}").status == 400);
+        a = pond.call(&dan, "POST", PG + EP + "/events/create",
+                      "{\"title\":\"Game night\",\"place\":\"#general\",\"starts\":" + std::to_string(tomorrow) + ",\"ends\":" + std::to_string(tomorrow + 7200000) + "}");
+        CHECK(a.status == 200);
+        const std::string EV = std::to_string(num_of(a.body, "id"));
+        a = pond.call(&kim, "POST", "/pond/v1/pages/" + EP + "/events/" + EV + "/going", "{\"going\":true}");
+        CHECK(a.status == 200 && has(a.body, "\"count\":1"));
+        a = pond.call(&kim, "GET", "/pond/v1/pages/" + EP);
+        CHECK(has(a.body, "\"title\":\"Game night\"") && has(a.body, "\"going\":1,\"me\":true"));
+        CHECK(has(pond.call(&lee, "GET", "/pond/v1/pages/" + EP).body, "\"going\":1,\"me\":false"));
+        CHECK(pond.call(&dan, "POST", PG + EP + "/events/" + EV + "/edit", "{\"title\":\"Games night\"}").status == 204);
+        CHECK(has(pond.call(&kim, "GET", "/pond/v1/pages/" + EP).body, "Games night"));
+        CHECK(pond.call(&dan, "POST", PG + EP + "/events/" + EV + "/delete").status == 204);
+        CHECK(!has(pond.call(&kim, "GET", "/pond/v1/pages/" + EP).body, "Games night"));
+
+        /* ---- a roles page: roles members take for themselves ---- */
+        const std::string PINGS = made(dan, "{\"name\":\"Pings\"}");
+        a = pond.call(&dan, "POST", PG + "create",
+                      "{\"title\":\"Pick roles\",\"kind\":\"roles\",\"data\":{\"roles\":[{\"role\":" + PINGS + ",\"description\":\"Be told of events\"}]}}");
+        CHECK(a.status == 200);
+        const std::string RP = std::to_string(num_of(a.body, "id"));
+        CHECK(has(pond.call(&lee, "GET", "/pond/v1/pages/" + RP).body, "\"data\":{\"multiple\":true,\"roles\":[{\"description\":\"Be told of events\",\"role\":" + PINGS));
+        a = pond.call(&lee, "POST", "/pond/v1/pages/" + RP + "/roles", "{\"roles\":[" + PINGS + "]}");
+        CHECK(a.status == 200 && has(a.body, "\"roles\":[" + PINGS + "]"));
+        CHECK(has(pond.call(&lee, "GET", "/pond/v1/pages/" + RP).body, "\"mine\":[" + PINGS + "]"));
+        CHECK(pond.call(&lee, "POST", "/pond/v1/pages/" + RP + "/roles", "{\"roles\":[" + W + "]}").status == 409); /* not offered */
+        CHECK(pond.call(&lee, "POST", "/pond/v1/pages/" + RP + "/roles", "{\"roles\":[]}").status == 200);
+        CHECK(has(pond.call(&lee, "GET", "/pond/v1/pages/" + RP).body, "\"mine\":[]"));
+        /* someone who may manage pages may offer only roles below their own, with no more than they may do */
+        const std::string ED = made(dan, "{\"name\":\"Editors\",\"permissions\":[\"manage_pages\"]}");
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + kim.id + "/roles", "{\"roles\":[" + W + "," + ED + "]}").status == 204);
+        a = pond.call(&kim, "POST", PG + "create", "{\"title\":\"x\",\"kind\":\"roles\",\"data\":{\"roles\":[{\"role\":" + W + "}]}}"); /* his highest */
+        CHECK(a.status == 409 && has(a.body, "outranked"));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + kim.id + "/roles", "{\"roles\":[" + W + "]}").status == 204);
+
+        /* ---- the shop, paid through Stripe (a fake one here) ---- */
+        a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Shop\",\"kind\":\"shop\",\"data\":{\"currency\":\"eur\"}}");
+        CHECK(a.status == 200);
+        const std::string SP = std::to_string(num_of(a.body, "id"));
+        CHECK(pond.call(&dan, "POST", PG + "create", "{\"title\":\"x\",\"kind\":\"shop\",\"data\":{\"currency\":\"EURO\"}}").status == 400);
+        a = pond.call(&dan, "POST", PG + SP + "/items/create", "{\"title\":\"Sticker\",\"price\":300,\"stock\":5,\"image\":\"sticker.png\"}");
+        CHECK(a.status == 200);
+        const std::string IT = std::to_string(num_of(a.body, "id"));
+        a = pond.call(&dan, "POST", PG + SP + "/items/create", "{\"title\":\"Tip jar\",\"price\":100,\"custom\":true}");
+        const std::string TIP = std::to_string(num_of(a.body, "id"));
+        CHECK(pond.call(&kim, "POST", PG + SP + "/items/create", "{\"title\":\"x\",\"price\":1}").status == 404);
+        a = pond.call(&kim, "GET", "/pond/v1/pages/" + SP);
+        CHECK(has(a.body, "\"title\":\"Sticker\",\"description\":\"\",\"image\":\"sticker.png\",\"price\":300,\"custom\":false,\"stock\":5") &&
+              has(a.body, "\"payments\":false"));
+        const std::string BUY = "/pond/v1/pages/" + SP + "/items/";
+        a = pond.call(&kim, "POST", BUY + IT + "/buy", "{}");
+        CHECK(a.status == 409 && has(a.body, "no_payments"));
+        a = pond.call(&dan, "POST", "/pond/v1/admin/shop/stripe", "{\"key\":\"sk_test_wrongwrongwrong1\"}");
+        CHECK(a.status == 409 && has(a.body, "Invalid API Key"));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/shop/stripe", "{\"key\":\"not a key\"}").status == 400);
+        CHECK(pond.call(&fay, "POST", "/pond/v1/admin/shop/stripe", "{\"key\":null}").status == 404);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/shop/stripe", "{\"key\":\"sk_test_good_0123456789\"}").status == 204);
+        a = pond.call(&kim, "GET", "/pond/v1/info");
+        CHECK(has(a.body, "\"shop\":{\"payments\":true,\"test\":true}") && !has(a.body, "sk_test"));
+        a = pond.call(&kim, "POST", BUY + IT + "/buy", "{\"quantity\":2}");
+        CHECK(a.status == 200 && has(a.body, "\"url\":\"https://buy.stripe.com/test_1\""));
+        const std::string O1 = std::to_string(num_of(a.body, "order"));
+        CHECK(stripe.saw("POST /v1/prices ") && stripe.saw("currency=eur") && stripe.saw("unit_amount=300"));
+        CHECK(stripe.saw("metadata%5Bpond_order%5D=" + O1) && stripe.saw("hosted_confirmation"));
+        a = pond.call(&kim, "POST", BUY + TIP + "/buy", "{\"amount\":50}");
+        CHECK(a.status == 409 && has(a.body, "too_little"));
+        CHECK(pond.call(&kim, "POST", BUY + TIP + "/buy", "{\"amount\":500}").status == 200);
+        CHECK(pond.call(&kim, "POST", BUY + IT + "/buy", "{\"quantity\":6}").status == 409); /* only 5 */
+        a = pond.call(&kim, "GET", "/pond/v1/orders");
+        CHECK(has(a.body, "\"title\":\"Sticker\",\"quantity\":2,\"amount\":600,\"currency\":\"eur\",\"status\":\"open\"") && has(a.body, "test_1"));
+        CHECK(!has(pond.call(&lee, "GET", "/pond/v1/orders").body, "Sticker")); /* hers alone */
+        CHECK(pond.call(&lee, "GET", "/pond/v1/admin/orders").status == 404);
+        CHECK(has(pond.call(&dan, "GET", "/pond/v1/admin/orders").body, "\"member\":\"" + kim.id));
+        {
+            int64_t c6 = num_of(pond.call(&kim, "GET", "/pond/v1/info").body, "cursor");
+            std::lock_guard<std::mutex> g(stripe.mu);
+            stripe.paid.insert("plink_1");
+            (void)c6;
+        }
+        CHECK(until([&] { return has(pond.call(&kim, "GET", "/pond/v1/orders").body, "\"id\":" + O1 + ",\"item\":" + IT + ",\"title\":\"Sticker\",\"quantity\":2,\"amount\":600,\"currency\":\"eur\",\"status\":\"paid\""); }, 20000));
+        CHECK(has(pond.call(&kim, "GET", "/pond/v1/pages/" + SP).body, "\"stock\":3"));
+        CHECK(until([&] { std::lock_guard<std::mutex> g(stripe.mu); return stripe.closed.count("plink_1") == 1; }, 5000));
+        CHECK(pond.call(&dan, "POST", PG + SP + "/items/" + TIP + "/edit", "{\"active\":false}").status == 204);
+        CHECK(!has(pond.call(&kim, "GET", "/pond/v1/pages/" + SP).body, "Tip jar") && has(pond.call(&dan, "GET", "/pond/v1/pages/" + SP).body, "Tip jar"));
+        CHECK(pond.call(&kim, "POST", BUY + TIP + "/buy", "{\"amount\":500}").status == 404);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/shop/stripe", "{\"key\":null}").status == 204);
+        CHECK(pond.ctl("log", &out) == 0 && has(out, "set_stripe") && has(out, "item_create") && !has(out, "sk_test_good"));
+
+        /* ---- an entry form: those joining apply, and are accepted or declined ---- */
+        a = pond.call(&dan, "POST", PG + "create",
+                      "{\"title\":\"Apply\",\"kind\":\"form\",\"body\":\"Tell us about you.\",\"data\":{\"required_to_join\":true,\"questions\":["
+                      "{\"id\":\"why\",\"label\":\"Why join?\",\"kind\":\"long\",\"required\":true},"
+                      "{\"id\":\"from\",\"label\":\"Where from?\",\"kind\":\"choice\",\"choices\":[\"A friend\",\"The web\"]}]}}");
+        CHECK(a.status == 200);
+        const std::string FP = std::to_string(num_of(a.body, "id"));
+        Identity moe;
+        const std::string mi = invite(pond, "--uses 5");
+        a = pond.call(&moe, "POST", "/pond/v1/join", join_body(moe, mi, "Moe"), "*");
+        CHECK(a.status == 409 && has(a.body, "application_required") && has(a.body, "\"intro\":\"Tell us about you.\"") && has(a.body, "Why join?"));
+        CHECK(pond.call(&moe, "POST", "/pond/v1/join", join_body(moe, std::string(26, 'a'), "Moe"), "*").status == 404); /* a bad invite says nothing */
+        auto apply = [&](const std::string &answers) {
+            return pond.call(&moe, "POST", "/pond/v1/apply",
+                             "{\"invite\":" + jstr(mi) + ",\"chain\":" + jstr(moe.chain) + ",\"profile\":{\"display_name\":\"Moe\"},\"answers\":" + answers + "}", "*");
+        };
+        CHECK(apply("{\"from\":\"A friend\"}").status == 400);                     /* why is needed */
+        CHECK(apply("{\"why\":\"fun\",\"from\":\"Somewhere\"}").status == 400);     /* no such choice */
+        CHECK(apply("{\"why\":\"For the frogs\",\"from\":\"A friend\"}").status == 200);
+        CHECK(apply("{\"why\":\"again\"}").status == 409);
+        a = pond.call(&moe, "POST", "/pond/v1/join", join_body(moe, mi, "Moe"), "*");
+        CHECK(a.status == 409 && has(a.body, "application_pending"));
+        CHECK(pond.call(&kim, "GET", "/pond/v1/admin/applications").status == 404);
+        a = pond.call(&dan, "GET", "/pond/v1/admin/applications");
+        CHECK(has(a.body, "\"member\":\"" + moe.id + "\"") && has(a.body, "\"answer\":\"For the frogs\"") && has(a.body, "\"status\":\"pending\""));
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/applications/" + moe.id + "/decline", "{\"reason\":\"Tell us more\"}").status == 204);
+        a = pond.call(&moe, "POST", "/pond/v1/join", join_body(moe, mi, "Moe"), "*");
+        CHECK(a.status == 409 && has(a.body, "application_declined") && has(a.body, "Tell us more"));
+        CHECK(apply("{\"why\":\"For the frogs, and the ponds\"}").status == 200);
+        CHECK(pond.call(&dan, "POST", "/pond/v1/admin/applications/" + moe.id + "/accept", "{}").status == 204);
+        CHECK(pond.call(&moe, "GET", "/pond/v1/info").status == 200); /* a member now */
+        CHECK(pond.call(&moe, "POST", "/pond/v1/join", join_body(moe, mi, "Moe"), "*").status == 200);
+        CHECK(pond.ctl("log", &out) == 0 && has(out, "application_decline") && has(out, "application_accept"));
+        CHECK(pond.call(&dan, "POST", PG + FP + "/delete").status == 204);
+        CHECK(pond.call(&dan, "POST", PG + EP + "/delete").status == 204);
+        CHECK(pond.call(&dan, "POST", PG + RP + "/delete").status == 204);
+        CHECK(pond.call(&dan, "POST", PG + SP + "/delete").status == 204);
     }
 
     /* ---- what nobody may ask ---- */

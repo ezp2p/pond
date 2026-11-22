@@ -10,7 +10,7 @@ using drogon::orm::DrogonDbException;
 
 /* Each step brings the schema up one version. MariaDB commits each CREATE TABLE by itself, so a step that fails part way is
  * finished by hand; each is small. */
-static const char *const STEPS[][8] = {
+static const char *const STEPS[][16] = {
     {
         "CREATE TABLE settings (name VARCHAR(64) PRIMARY KEY, value TEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         "CREATE TABLE channels (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(32) NOT NULL, topic VARCHAR(1024) NOT NULL DEFAULT '',"
@@ -107,6 +107,38 @@ static const char *const STEPS[][8] = {
         /* role colours (docs/design.md, "Role colours"): whether a member's name shows in their role's colour; the Pond's
          * choice to make everyone's do is a setting */
         "ALTER TABLE members ADD COLUMN role_color TINYINT NOT NULL DEFAULT 0",
+        nullptr,
+    },
+    {
+        /* protocol 13 (docs/design.md). Permissions for each channel: what it allows and denies a role, or everyone (role 0).
+         * A channel only some roles saw becomes one that denies everyone `view_channels` (256) and allows it those roles. */
+        "CREATE TABLE channel_overrides (channel BIGINT NOT NULL, role BIGINT NOT NULL, allow BIGINT NOT NULL DEFAULT 0,"
+        " deny BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (channel, role)) ENGINE=InnoDB",
+        "INSERT INTO channel_overrides (channel, role, allow, deny) SELECT id, 0, 0, 256 FROM channels WHERE restricted = 1",
+        "INSERT INTO channel_overrides (channel, role, allow, deny) SELECT channel, role, 256, 0 FROM channel_roles",
+        /* pages: for some roles only, and each kind's settings */
+        "ALTER TABLE pages ADD COLUMN restricted TINYINT NOT NULL DEFAULT 0, ADD COLUMN data MEDIUMTEXT NULL",
+        "CREATE TABLE page_roles (page BIGINT NOT NULL, role BIGINT NOT NULL, PRIMARY KEY (page, role)) ENGINE=InnoDB",
+        /* events on an events page, and who is going */
+        "CREATE TABLE page_events (id BIGINT AUTO_INCREMENT PRIMARY KEY, page BIGINT NOT NULL, title VARCHAR(100) NOT NULL,"
+        " description TEXT NOT NULL, place VARCHAR(200) NOT NULL DEFAULT '', starts_ms BIGINT NOT NULL, ends_ms BIGINT NULL,"
+        " created_by CHAR(52) NOT NULL, created_ms BIGINT NOT NULL, KEY (page, starts_ms)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE event_going (event BIGINT NOT NULL, member CHAR(52) NOT NULL, PRIMARY KEY (event, member)) ENGINE=InnoDB",
+        /* applications to join, while a Pond has an entry form */
+        "CREATE TABLE applications (member CHAR(52) PRIMARY KEY, sign_pub CHAR(64) NOT NULL, kid VARCHAR(64) NOT NULL, seq BIGINT NOT NULL,"
+        " chain MEDIUMTEXT NOT NULL, profile MEDIUMTEXT NULL, invite VARCHAR(32) NOT NULL, answers MEDIUMTEXT NOT NULL,"
+        " status VARCHAR(16) NOT NULL, reason VARCHAR(500) NOT NULL DEFAULT '', created_ms BIGINT NOT NULL,"
+        " decided_by CHAR(52) NULL, decided_ms BIGINT NULL, KEY (status, created_ms)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        /* the shop: what a shop page sells, and orders, paid through Stripe */
+        "CREATE TABLE shop_items (id BIGINT AUTO_INCREMENT PRIMARY KEY, page BIGINT NOT NULL, title VARCHAR(100) NOT NULL,"
+        " description TEXT NOT NULL, image VARCHAR(255) NOT NULL DEFAULT '', price BIGINT NOT NULL, custom TINYINT NOT NULL DEFAULT 0,"
+        " stock BIGINT NULL, active TINYINT NOT NULL DEFAULT 1, position BIGINT NOT NULL DEFAULT 0, KEY (page))"
+        " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE shop_orders (id BIGINT AUTO_INCREMENT PRIMARY KEY, item BIGINT NOT NULL, member CHAR(52) NOT NULL,"
+        " title VARCHAR(100) NOT NULL, quantity BIGINT NOT NULL, amount BIGINT NOT NULL, currency CHAR(3) NOT NULL,"
+        " status VARCHAR(16) NOT NULL, link_id VARCHAR(255) NOT NULL DEFAULT '', link_url VARCHAR(1024) NOT NULL DEFAULT '',"
+        " live TINYINT NOT NULL DEFAULT 0, created_ms BIGINT NOT NULL, paid_ms BIGINT NULL, KEY (member), KEY (status, created_ms))"
+        " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         nullptr,
     },
 };

@@ -461,6 +461,17 @@ some of what an administrator does, has a colour and a place in an order, and ca
 | `ban_members` | Ban a member, see the bans, and unban |
 | `mute_members` | Mute and unmute a member |
 | `manage_pages` | Make, edit, order and delete pages (protocol 11, "Pages") |
+| `view_channels` | See channels and read them (protocol 13, and each below) |
+| `send_messages` | Write in channels |
+| `attach_files` | Send files with a message |
+| `connect` | Join voice channels |
+| `speak` | Be heard in a voice channel |
+| `video` | Show a camera or share a screen in a voice channel |
+| `voice_mute` | Mute someone below them in a voice channel, for everyone ("Voice moderation") |
+| `move_members` | Disconnect someone below them from a voice channel ("Voice moderation") |
+| `manage_events` | Add, change and delete events on events pages ("Pages") |
+| `manage_applications` | Read applications to join, and accept or decline them ("Entry form") |
+| `manage_shop` | Add, change and take off items on shop pages, and see every order ("Shop") |
 
 | Question | Decision |
 |---|---|
@@ -486,6 +497,38 @@ Protocol 10, feature `role_permissions`. A Puddle of protocol 9 sees roles as be
 admin screens only for ranks, so a member with permissions needs a newer Puddle to use them (the routes work for them
 either way).
 
+### Everyone, and each channel (protocol 13)
+
+Built 2026-11-23, so permissions work as Discord's do:
+
+1. An operator or administrator may do everything, everywhere.
+2. Otherwise a member starts from what **everyone** may do (the Pond's `everyone`), and adds what each of their roles lets
+   them.
+3. In a channel, its **overrides** apply on top: what it denies everyone is taken away and what it allows everyone added;
+   then what it denies any of their roles is taken away and what it allows any of them added (between roles, an allow
+   wins over a deny).
+
+A member who may not `view_channels` in a channel does not see it at all: it is left out of `/info`, `channels` and the
+events about it, as a restricted channel always was. Sending needs `send_messages` there, a file `attach_files` (`409
+no_permission`, `409 no_files_here`); joining a voice channel needs `connect`, and the Pond forwards someone's voice only
+with `speak` and their camera or screen only with `video`, looked at again every second or two so a change applies to
+those already in it.
+
+| Question | Decision |
+|---|---|
+| Everyone's, by default | `view_channels`, `send_messages`, `attach_files`, `connect`, `speak`, `video`: what members could always do. |
+| What a channel may say | Only the channel permissions: `view_channels` to `move_members` in the table above. Neither list may name one twice; a permission is allowed, denied or (left out) as the roles say. |
+| Who sets them | Everyone's: whoever may `manage_roles`, adding only what they may do themselves. A channel's: whoever may `manage_channels`; without a rank, only for everyone and roles below their own highest, allowing only what they may do. |
+| Roles for channels (protocol 9) | Kept as overrides: a channel "only some roles see" denies everyone `view_channels` and allows it those roles. Its `roles` is still written for older Puddles: the roles allowed to view it, when everyone is denied. `POST .../roles` works as before and changes only `view_channels`. |
+
+| Route | Does |
+|---|---|
+| `POST /pond/v1/admin/everyone` | `{permissions: [names]}`: what everyone may do |
+| `POST /pond/v1/admin/channels/{channel}/overrides` | `{overrides: [{role, allow: [names], deny: [names]}]}`, `role` 0 for everyone: all of them, at once |
+
+`pond` gains `everyone` (`{permissions: [names]}`), a channel `overrides` (`[{role, allow, deny}]`). A change of either
+sends `channels`, so each member's list is what they see now. Feature `overrides`.
+
 ## Role colours
 
 A role's colour shows on its chips. Whose *name* shows in it is up to each member: a member's `role_color` says they chose
@@ -504,10 +547,11 @@ guide is: rules, a list of servers, a guide. The apps show a page where a channe
 | Question | Decision |
 |---|---|
 | What a page is | A title (1 to 64 characters, one line), a **kind**, a body, and the files it carries; in an order the admins set (`position`). At most 50 in a Pond. |
-| Kinds | `markdown` only, for now: its body is markdown, at most 64 KiB of text. A kind is where the later pages come in, each a kind of its own with its own body: roles members pick for themselves, an events calendar, an entry form, a shop. A kind the Pond doesn't know is `400 unknown_kind`. |
+| Kinds | Every page's body is markdown, at most 64 KiB of text. Its kind (protocol 13, feature `page_kinds`) adds to it, with settings of its own in `data` (a JSON object, at most 64 KiB): `markdown` nothing; `roles` roles members take for themselves; `events` a calendar; `form` the entry form ("Entry form"); `shop` things to buy ("Shop"). A kind the Pond doesn't know is `400 unknown_kind`. |
+| Media in the markdown | A page's pictures show where its markdown names them: `![words](media:name.png)`, the name of one of its files. The Pond keeps the markdown as it is; the apps place the picture. Other files show under the page. |
 | `#channel-name` | Written as it is. The apps make it a link to that channel when it is one the member sees; the Pond does nothing with it, so a rename doesn't rewrite pages. |
 | Files | Sent to the Pond first, as a message's are (`POST /pond/v1/files/...`), then named in the page's `files` (at most 10, as a message). Any member may fetch a file a page carries. A file no page or message carries any more goes in the hourly sweep. |
-| Who sees them | Every member sees every page. Pages for some roles only may come later. |
+| Who sees them | Everyone, or (protocol 13) some roles: `roles` null, or ids. A page for some roles is seen by operators, administrators, those who may `manage_pages`, and members holding one of them. Others don't get it in `/info` or `pages`, and `GET` answers `404`. |
 | Who manages them | Operators, administrators, and members whose roles have the permission `manage_pages` ("Permissions"). |
 | The banner | A picture over the Pond's name in the channel list: a setting, `banner`, as the icon is, sent first as a picture (at most 1 MiB). Whoever may `manage_pond` sets it. `pond` gains `banner` (`{hash, mime, size}` or null). |
 
@@ -526,6 +570,70 @@ guide is: rules, a list of servers, a guide. The apps show a page where a channe
 (`{pages: [ids]}`). The banner comes in the `pond` event, as the icon does. Each change goes in `admin_log`.
 
 Protocol 11, feature `pages`.
+
+### The kinds (protocol 13)
+
+| Kind | `data` | What a member does | What `GET` adds |
+|---|---|---|---|
+| `roles` | `{roles: [{role, description}], multiple}`: up to 50 | `POST /pond/v1/pages/{page}/roles {roles: [ids]}`: of those offered, the ones they hold now; `409 not_offered`, `409 one_only` when `multiple` is false | `mine`: those of them they hold |
+| `events` | none | `POST /pond/v1/pages/{page}/events/{event}/going {going}`: answers `{going, count}` | `events`: `[{id, title, description, place, starts, ends, going, me}]`, those not over a month ago, soonest first |
+| `form` | `{questions: [{id, label, kind, choices, required}], required_to_join}` | Applies to join ("Entry form") | |
+| `shop` | `{currency}`: three letters, as Stripe names it | Buys ("Shop") | `items`, `payments` |
+
+A roles page may offer only roles below the highest of whoever saves it, giving nothing they can't do themselves (else
+`409 outranked`): otherwise managing pages would let someone take more than they have. Taking a role sends the member
+`channels` and `pages`, so what they see changes at once. Events are added by whoever may `manage_events`:
+`POST /pond/v1/admin/pages/{page}/events/create {title, starts, ends?, place?, description?}` (times in ms),
+`.../events/{event}/edit` and `.../delete`; at most 500 on a page. A change of a page's events or items makes the page
+newer (`updated`), so those reading it read it again.
+
+New: `pages` (`{pages: [...]}`, written for each member: the pages they see now) follows each change of a page and of who
+holds which roles. `page` is sent only for a page everyone sees, for Puddles of protocol 11.
+
+## Entry form
+
+Built 2026-11-23 (protocol 13, feature `applications`). A Pond whose `form` page says `required_to_join` asks those
+joining to answer it first, as Discord's membership screening does.
+
+| Step | What happens |
+|---|---|
+| Joining | With a good invite and no accepted application, `POST /pond/v1/join` answers `409 application_required` with `form` (`{page, intro, questions}`: the page's markdown and its questions). A bad invite is `404`, as ever. |
+| Applying | `POST /pond/v1/apply {invite, chain, profile, answers}`, as a stranger, as a join is (sealed to the invite's key, signed by the chain). The answers are checked against the questions (needed ones answered, choices from those given). It spends one use of the invite. Answers `{status: "pending"}`; `409 application_pending` while one waits. |
+| Waiting | Joining answers `409 application_pending`. |
+| Deciding | Whoever may `manage_applications`: `GET /pond/v1/admin/applications` (`[{member, profile, answers, status, reason, created, decided_by, decided}]`), `POST .../applications/{member}/accept` (they are a member at once, with the chain and profile they applied with) or `/decline {reason?}`. |
+| After | Accepted: joining works as for anyone. Declined: joining answers `409 application_declined` with the reason and the form, and they may apply again. |
+
+An `applications` event (`{}`) tells those who may manage them that something changed; nobody else gets it.
+
+## Shop
+
+Built 2026-11-23 (protocol 13, feature `shop`). A shop page sells things, or takes donations, and the Pond takes the
+payment through Stripe. The aim is that as much as possible happens in the Pond: Stripe handles the card, the checks on
+the buyer (its own compliance and KYC) and paying out, and nothing of the Pond need be public.
+
+| Question | Decision |
+|---|---|
+| Stripe | Whoever may `manage_pond` gives the Pond a Stripe secret or restricted key (`POST /pond/v1/admin/shop/stripe {key}`, or `{key: null}` to stop). The Pond tries it once (`409 stripe_refused` with Stripe's words if Stripe says no). It is kept in `settings` and never sent anywhere but Stripe: `pond` says only `shop: {payments, test}`. A restricted key needs write access to Prices and Payment Links and read access to Checkout Sessions. |
+| Items | On a shop page, by whoever may `manage_shop`: `POST /pond/v1/admin/pages/{page}/items/create {title, price, description?, image?, custom?, stock?, active?}`, `.../items/{item}/edit`, `.../delete`. `price` is in the currency's smallest unit (cents). `custom`: the buyer says how much, at least the price (a donation). `stock`: how many are left, or null for no limit. `image`: the name of one of the page's media. An item taken off sale shows only to those who keep the shop. |
+| Buying | `POST /pond/v1/pages/{page}/items/{item}/buy {quantity?, amount?}`. The Pond records the order, makes a Stripe Price and a Payment Link for that order alone (one payment, `restrictions.completed_sessions.limit` 1, Stripe's own confirmation page, the order's id in `metadata.pond_order`), and answers `{order, url}`. The app opens the link. `409 no_payments`, `409 sold_out`, `409 too_little {least}`; `502 stripe_failed` with Stripe's words. |
+| Seeing it paid | The Pond asks Stripe every few seconds about the orders still open (`GET /v1/checkout/sessions?payment_link=`): a session with `payment_status` `paid` for the order marks it paid, takes the quantity off the stock, and closes the link. An order not paid in a day lapses, and its link is closed. No webhook: that would need a public address. |
+| Orders | `GET /pond/v1/orders`: the member's own (with `url` while open); `GET /pond/v1/admin/orders`: everyone's, for whoever may `manage_shop`. `order` (`{id, status}`, to the buyer alone) and `orders` (`{}`, to those who keep the shop) follow a change. |
+
+`pond.yaml` may say `shop: {stripe_api: ...}`, where the Pond reaches Stripe; only the tests change it.
+
+## Voice moderation
+
+Built 2026-11-23 (protocol 13, feature `voice_moderation`). Whoever may there mutes someone in a voice channel for
+everyone, or disconnects them, as Discord's server mute and disconnect.
+
+| Route | Does |
+|---|---|
+| `POST /pond/v1/voice/members/{member}/mute` | `{muted}`: nothing of theirs is forwarded until unmuted. Needs `voice_mute` in their channel. |
+| `POST /pond/v1/voice/members/{member}/disconnect` | `{}`: out of the channel; `voice_left` says `by`. Needs `move_members` in their channel. |
+
+Both only on someone below them, as kick is (`409 outranked`, `409 not_yourself`); `404 no_session` if they aren't in
+voice. In voice, someone's state (`voice` event, `/info`) gains `server_muted`, and `speak` and `video`: whether the
+channel lets them. A Puddle disconnected by a moderator doesn't join again by itself. Each goes in `admin_log`.
 
 ## What the database holds
 
@@ -684,8 +792,10 @@ to report.
 
 ## Not yet
 
-- Permissions for one channel: who may post where (a channel others may read but not write in). `pondctl` can't manage
-  roles yet.
+- `pondctl` can't manage roles, permissions, pages or the shop yet: a whole command-line API, for automations, is to come.
+- Permissions for one member alone in a channel (Discord's member overrides): only everyone and roles today.
+- Stripe webhooks, refunds from the app, and subscriptions: the shop takes one-off payments and finds them by asking.
+- Zero-decimal currencies (yen, won) are shown by the apps as if they had cents.
 - Editing, deleting and replying to messages, reactions, mentions, unread counts and typing indicators.
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.

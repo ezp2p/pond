@@ -38,6 +38,8 @@ Answer Voice::state(const std::string &, const std::string &, std::optional<bool
 }
 Answer Voice::watch(const std::string &, const std::string &, const std::map<int, std::string> &) { return fail(404, "no_session"); }
 Answer Voice::leave(const std::string &, const std::string &) { return fail(404, "no_session"); }
+int64_t Voice::channel_of(const std::string &) { return 0; }
+Task<Answer> Voice::moderate(std::string, std::string, std::optional<bool>) { co_return fail(404, "no_session"); }
 std::string Voice::now_json(const std::set<int64_t> &) { return "[]"; }
 
 #else
@@ -173,6 +175,8 @@ struct Session {
     std::string watching[VOICE_TRACKS + 1]; /* whose camera (a member's id), or screen ("<id>/screen") */
     bool dc_open = false, connected = false, announced = false, gone = false;
     bool muted = false, deafened = false, camera = false, screen = false;
+    bool server_muted = false;  /* by a moderator, for everyone (docs/voice.md, "Moderation") */
+    int64_t rights = 0;          /* what they may do in this channel (docs/design.md, "Permissions"): speak, video */
     int64_t started = 0, lost_since = 0;
     Bucket audio_limit{20, 16};             /* about 60 frames a second */
     Bucket video_limit{30, 33};             /* about 30 a second */
@@ -205,7 +209,9 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
     {
         return "{\"channel\":" + std::to_string(s.channel) + ",\"member\":" + jstr(s.member) + ",\"slot\":" + std::to_string(s.slot) +
                ",\"muted\":" + (s.muted ? "true" : "false") + ",\"deafened\":" + (s.deafened ? "true" : "false") +
-               ",\"camera\":" + (s.camera ? "true" : "false") + ",\"screen\":" + (s.screen ? "true" : "false") + "}";
+               ",\"camera\":" + (s.camera ? "true" : "false") + ",\"screen\":" + (s.screen ? "true" : "false") +
+               ",\"server_muted\":" + (s.server_muted ? "true" : "false") + ",\"speak\":" + ((s.rights & SPEAK) ? "true" : "false") +
+               ",\"video\":" + ((s.rights & VIDEO) ? "true" : "false") + "}";
     }
 
     /* lock held */
@@ -248,7 +254,7 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
     }
 
     /* lock held. Let `s` go: out of the channel, its connection closed; the others told if they had been told it came. */
-    void drop(const SessionPtr &s, const char *why)
+    void drop(const SessionPtr &s, const char *why, const std::string &by = "")
     {
         if (s->gone)
             return;
@@ -257,8 +263,9 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
         if (auto it = of_member.find(s->member); it != of_member.end() && it->second == s)
             of_member.erase(it);
         index();
-        if (s->announced)
-            announce("voice_left", "{\"channel\":" + std::to_string(s->channel) + ",\"member\":" + jstr(s->member) + "}");
+        if (s->announced) /* `by`: the moderator who disconnected them */
+            announce("voice_left", "{\"channel\":" + std::to_string(s->channel) + ",\"member\":" + jstr(s->member) +
+                                       (by.empty() ? std::string() : ",\"by\":" + jstr(by)) + "}");
         LOG_INFO << "voice: " << s->member.substr(0, 12) << "... out of channel " << s->channel << " (" << why << ")";
         close(s);
     }
@@ -295,7 +302,8 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
         {
             std::lock_guard<std::mutex> g(mu);
             SessionPtr s = weak.lock();
-            if (!s || s->gone || s->muted || svc.muted_until(s->member) >= 0 || !s->audio_limit.take(steady_ms())) /* muted by themselves, or by an admin */
+            if (!s || s->gone || s->muted || s->server_muted || !(s->rights & SPEAK) || svc.muted_until(s->member) >= 0 ||
+                !s->audio_limit.take(steady_ms())) /* muted by themselves, by a moderator or an admin, or not let speak here */
                 return;
             auto it = in_channel.find(s->channel);
             if (it == in_channel.end())
@@ -328,7 +336,7 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
         {
             std::lock_guard<std::mutex> g(mu);
             SessionPtr s = weak.lock();
-            if (!s || s->gone || !(screen ? s->screen : s->camera))
+            if (!s || s->gone || !(screen ? s->screen : s->camera) || !(s->rights & VIDEO))
                 return;
             int64_t now = steady_ms();
             int64_t &window = screen ? s->screen_window : s->video_window, &bytes = screen ? s->screen_bytes : s->video_bytes;
@@ -384,12 +392,13 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
     }
 
     /* The connection for a join: answers the Puddle's offer. On its own thread (OffLoop). */
-    Answer connect(std::string member, int64_t channel, std::string offer, int udp, std::string peer_ip)
+    Answer connect(std::string member, int64_t channel, std::string offer, int udp, std::string peer_ip, int64_t rights)
     {
         auto s = std::make_shared<Session>();
         s->id = new_token();
         s->member = member;
         s->channel = channel;
+        s->rights = rights;
         s->started = steady_ms();
         for (auto &b : s->base)
             b = random32();
@@ -401,6 +410,7 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
             if (old && old->channel == channel) { /* again, in the same channel: a new connection, the same place */
                 s->slot = old->slot;
                 s->muted = old->muted, s->deafened = old->deafened, s->camera = old->camera, s->screen = old->screen;
+                s->server_muted = old->server_muted;
             } else {
                 size_t in = in_channel.count(channel) ? in_channel[channel].size() : 0;
                 if (set.max_in_channel && in >= set.max_in_channel)
@@ -608,14 +618,26 @@ struct Voice::Impl : std::enable_shared_from_this<Voice::Impl> {
                 here.emplace_back(s->member, s->channel);
         }
         try {
-            auto gone = co_await svc.voice_gone(here);
+            auto rights = co_await svc.voice_rights(here);
             std::lock_guard<std::mutex> g(mu);
             std::vector<SessionPtr> out;
-            for (auto &[id, s] : sessions)
-                if (std::find(gone.begin(), gone.end(), std::make_pair(s->member, s->channel)) != gone.end())
+            for (size_t i = 0; i < here.size(); i++) {
+                auto it = of_member.find(here[i].first);
+                if (it == of_member.end() || it->second->channel != here[i].second)
+                    continue;
+                SessionPtr s = it->second;
+                if (!rights[i]) {
                     out.push_back(s);
+                } else if ((rights[i] & (SPEAK | VIDEO)) != (s->rights & (SPEAK | VIDEO))) { /* a role or the channel changed */
+                    s->rights = rights[i];
+                    if (s->announced)
+                        announce("voice", json_of(*s));
+                } else {
+                    s->rights = rights[i];
+                }
+            }
             for (auto &s : out)
-                drop(s, "no longer a member, the channel went, or they may no longer see it");
+                drop(s, "no longer a member, the channel went, or they may no longer connect to it");
         } catch (const std::exception &e) {
             LOG_ERROR << "voice: " << e.what();
         }
@@ -682,9 +704,10 @@ Task<Answer> Voice::join(std::string member, int64_t channel, std::string sdp, i
     const bool voice = co_await impl_->svc.is_voice_channel(channel, member);
     if (!voice)
         co_return fail(404, "no_channel");
+    const int64_t rights = co_await impl_->svc.permissions_in(member, channel);
     auto impl = impl_;
     /* a named awaiter: its thread writes the answer back through `this`, so it must stay put until then (docs/design.md) */
-    OffLoop off{[impl, member, channel, sdp, udp, peer_ip] { return impl->connect(member, channel, sdp, udp, peer_ip); }, {}};
+    OffLoop off{[impl, member, channel, sdp, udp, peer_ip, rights] { return impl->connect(member, channel, sdp, udp, peer_ip, rights); }, {}};
     Answer a = co_await off;
     co_return a;
 }
@@ -730,6 +753,39 @@ Answer Voice::leave(const std::string &member, const std::string &session)
         return fail(404, "no_session");
     impl_->drop(s, "left");
     return Answer{204, ""};
+}
+
+int64_t Voice::channel_of(const std::string &member)
+{
+    std::lock_guard<std::mutex> g(impl_->mu);
+    auto it = impl_->of_member.find(member);
+    return it == impl_->of_member.end() ? 0 : it->second->channel;
+}
+
+Task<Answer> Voice::moderate(std::string by, std::string target, std::optional<bool> muted)
+{
+    std::string action, where;
+    {
+        std::lock_guard<std::mutex> g(impl_->mu);
+        auto it = impl_->of_member.find(target);
+        if (it == impl_->of_member.end())
+            co_return fail(404, "no_session");
+        SessionPtr s = it->second;
+        where = std::to_string(s->channel);
+        if (muted) {
+            action = *muted ? "voice_mute" : "voice_unmute";
+            if (s->server_muted != *muted) {
+                s->server_muted = *muted;
+                if (s->announced)
+                    impl_->announce("voice", impl_->json_of(*s));
+            }
+        } else {
+            action = "voice_disconnect";
+            impl_->drop(s, "disconnected by a moderator", by);
+        }
+    }
+    co_await impl_->svc.log_admin(by, action, target, "channel " + where);
+    co_return Answer{204, ""};
 }
 
 std::string Voice::now_json(const std::set<int64_t> &hidden)

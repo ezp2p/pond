@@ -73,11 +73,13 @@ Task<Powers> Service::powers(std::string member)
 {
     Powers p;
     p.rank = co_await role(member);
+    const int64_t everyone = co_await everyone_permissions();
     Result r = co_await db_->execSqlCoro("SELECT COALESCE(BIT_OR(r.permissions), 0), MIN(r.position) FROM member_roles mr"
                                          " JOIN roles r ON r.id = mr.role WHERE mr.member = ?",
                                          member);
+    p.permissions = everyone;
     if (!r.empty()) {
-        p.permissions = num(r[0][0]);
+        p.permissions |= num(r[0][0]);
         if (!r[0][1].isNull())
             p.top = num(r[0][1]);
     }
@@ -224,10 +226,12 @@ Task<Answer> Service::admin_role_delete(std::string by, int64_t role)
         }
         was = text(r[0][0]);
         co_await tx->execSqlCoro("DELETE FROM member_roles WHERE role = ?", role);
-        co_await tx->execSqlCoro("DELETE FROM channel_roles WHERE role = ?", role);
+        co_await tx->execSqlCoro("DELETE FROM channel_overrides WHERE role = ?", role);
         co_await tx->execSqlCoro("DELETE FROM roles WHERE id = ?", role);
         co_await add_event(tx, "role_deleted", "{\"id\":" + std::to_string(role) + "}");
-        int64_t ev = co_await add_event(tx, "channels", "{}"); /* who sees what may have changed */
+        co_await add_event(tx, "channels", "{}"); /* who sees what may have changed */
+        co_await tx->execSqlCoro("DELETE FROM page_roles WHERE role = ?", role);
+        int64_t ev = co_await add_event(tx, "pages", "{}");
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
         bump(ev);
@@ -279,7 +283,8 @@ Task<Answer> Service::admin_member_roles(std::string by, std::string member, std
             co_await tx->execSqlCoro("INSERT INTO member_roles (member, role) VALUES (?, ?)", member, r);
         std::string mj = co_await member_json_of(tx, member);
         co_await add_event(tx, "member", mj);
-        int64_t ev = co_await add_event(tx, "channels", "{}", member); /* what they see now */
+        co_await add_event(tx, "channels", "{}", member); /* what they see now */
+        int64_t ev = co_await add_event(tx, "pages", "{}", member);
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
         bump(ev);
@@ -289,49 +294,6 @@ Task<Answer> Service::admin_member_roles(std::string by, std::string member, std
         co_return server_error(e);
     }
     co_await log_admin(by, "member_roles", member, ids_text(roles));
-    co_return Answer{204, ""};
-}
-
-Task<Answer> Service::admin_channel_roles(std::string by, int64_t channel, std::optional<std::vector<int64_t>> roles)
-{
-    if (roles)
-        roles = tidy(std::move(*roles));
-    if (roles && (int64_t)roles->size() > ROLES_MAX)
-        co_return fail(400, "bad_request");
-    TxPtr tx;
-    std::string name;
-    try {
-        tx = co_await db_->newTransactionCoro();
-        Result c = co_await tx->execSqlCoro("SELECT name FROM channels WHERE id = ? AND deleted = 0 FOR UPDATE", channel);
-        if (c.empty()) {
-            tx->rollback();
-            co_return fail(404, "no_channel");
-        }
-        name = text(c[0][0]);
-        const std::vector<int64_t> want = roles.value_or(std::vector<int64_t>{});
-        const bool known = co_await roles_exist(tx, want);
-        if (!known) {
-            tx->rollback();
-            co_return fail(404, "unknown_role");
-        }
-        const int64_t restricted = roles ? 1 : 0;
-        co_await tx->execSqlCoro("UPDATE channels SET restricted = ? WHERE id = ?", restricted, channel);
-        co_await tx->execSqlCoro("DELETE FROM channel_roles WHERE channel = ?", channel);
-        for (int64_t r : want)
-            co_await tx->execSqlCoro("INSERT INTO channel_roles (channel, role) VALUES (?, ?)", channel, r);
-        int64_t ev = co_await add_event(tx, "channels", "{}");
-        if (!co_await Committed(std::move(tx)))
-            co_return fail(500, "database");
-        bump(ev);
-    } catch (const DrogonDbException &e) {
-        if (tx)
-            tx->rollback();
-        co_return server_error(e);
-    }
-    std::string detail = "everyone";
-    if (roles)
-        detail = roles->empty() ? std::string("operators and administrators") : "roles " + ids_text(*roles);
-    co_await log_admin(by, "channel_roles", name, detail);
     co_return Answer{204, ""};
 }
 

@@ -378,6 +378,7 @@ struct PondProc {
     std::string id; /* the Pond's */
     unsigned char seal_pub[32] = {}; /* its sealing key: what members seal their requests to (spec/09) */
     bool sealed = true;              /* call() seals what it sends, as a member's Puddle does; false to send it plain */
+    std::string extra;               /* more of pond.yaml */
 
     explicit PondProc(TestDb &d) : db(d) {}
 
@@ -389,7 +390,7 @@ struct PondProc {
         port = free_port();
         std::ofstream f(conf);
         f << "listen: 127.0.0.1\nports:\n  chat: " << port << "\ndata_dir: " << dir << "\nevents_wait_ms: " << events_wait_ms
-          << "\ndatabase:\n  host: 127.0.0.1\n  port: " << db.port << "\n  user: root\n  name: pond\n";
+          << "\ndatabase:\n  host: 127.0.0.1\n  port: " << db.port << "\n  user: root\n  name: pond\n" << extra;
         f.close();
         std::string out;
         if (ctl("init '" + name + "'", &out) != 0) {

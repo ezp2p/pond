@@ -110,6 +110,29 @@ static bool ports(const YAML::Node &n, unsigned &chat, unsigned &voice, std::str
     return true;
 }
 
+/* shop: {stripe_api: "https://..."} */
+static bool shop(const YAML::Node &n, std::string &api, std::string &err)
+{
+    if (!n.IsMap()) {
+        err = "shop is a map";
+        return false;
+    }
+    for (auto it : n) {
+        const std::string k = it.first.as<std::string>();
+        if (k != "stripe_api") {
+            err = "unknown setting shop." + k + " (there is one: stripe_api)";
+            return false;
+        }
+        if (!scalar(it.second, "shop.stripe_api", api, err))
+            return false;
+        if (api.rfind("https://", 0) != 0 && api.rfind("http://127.0.0.1:", 0) != 0) {
+            err = "shop.stripe_api is an https:// address";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool load_config(const std::string &path, Config &out, std::string &err)
 {
     /* given in the file, new names and old: 0 when not */
@@ -139,6 +162,7 @@ bool load_config(const std::string &path, Config &out, std::string &err)
              : k == "events_wait_ms" ? number(v, "events_wait_ms", 100, 60000, wait, err) && (out.events_wait_ms = (int)wait, true)
              : k == "database"       ? database(v, out.db, err)
              : k == "voice"          ? voice(v, out.voice, voice_old, err)
+             : k == "shop"           ? shop(v, out.stripe_api, err)
                                      : (err = "unknown setting " + k, false);
     }
     /* the older names: port (now ports.chat) and voice.port (now ports.voice). An older pond.yaml set only port, and voice
