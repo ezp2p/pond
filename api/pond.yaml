@@ -287,6 +287,13 @@ paths:
         "404": { description: "`no_member`: either is not a member now" }
         "409": { description: "`not_accepted` (they take no direct messages here), `dms_off` (the Pond relays none)" }
         "429": { description: "`slow_down`, `too_many_new` (20 new people a day)" }
+  /pond/v1/role_color:
+    post:
+      summary: Whether this member's name shows in their highest coloured role's colour (protocol 12, feature `role_colors`)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [use], properties: { use: { type: boolean } } } } } }
+      responses:
+        "200": { description: "`{use}`; a `member` event tells everyone (a member's `role_color`)" }
+        "400": { description: "`bad_request`" }
   /pond/v1/dms/settings:
     post:
       summary: Whether this member takes direct messages here
@@ -519,6 +526,12 @@ paths:
       description: As the icon is set; for whoever may `manage_pond`. Every member hears of it in a `pond` event, whose `banner` changes.
       requestBody: { content: { application/json: { schema: { type: object, required: [hash], properties: { hash: { oneOf: [{ type: string, pattern: "^[0-9a-f]{64}$" }, { type: "null" }] } } } } } }
       responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" } }
+  /pond/v1/admin/role_colors:
+    post:
+      summary: Make everyone's name show in their role's colour, or leave it to each member (protocol 12, feature `role_colors`)
+      description: For whoever may `manage_pond`. Every member hears of it in a `pond` event, whose `role_colors` changes.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [enforced], properties: { enforced: { type: boolean } } } } } }
+      responses: { "204": { description: Done }, "400": { description: "`bad_request`" } }
   /pond/v1/admin/icon:
     post:
       summary: Set the Pond's icon, or take it away
@@ -752,7 +765,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). `role_colors`: names in a role's colour, as each member chooses or the Pond enforces (protocol 12, "Role colours"). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -814,6 +827,10 @@ components:
           oneOf:
             - { $ref: "#/components/schemas/PictureRef" }
             - type: "null"
+        role_colors:
+          type: string
+          enum: [choice, enforced]
+          description: "Names in a role's colour (protocol 12): `choice`, as each member says (their `role_color`), or `enforced`, everyone's"
         files:
           type: object
           description: What members may send, with `files` in `features`
@@ -851,6 +868,7 @@ components:
             - type: "null"
         dms: { type: boolean, description: "Takes direct messages here (protocol 8; docs/dms.md)" }
         roles: { type: array, items: { type: integer }, description: "The roles for channels they hold (protocol 9)" }
+        role_color: { type: boolean, description: "Their name shows in their highest coloured role's colour, as they chose (protocol 12)" }
     ChannelRole:
       type: object
       description: 'A role (docs/design.md, "Roles for channels" and "Permissions"); not a rank (`Role`)'

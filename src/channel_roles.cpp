@@ -405,4 +405,59 @@ Task<Answer> Service::admin_role_order(std::string by, std::vector<int64_t> role
     co_return Answer{204, ""};
 }
 
+
+/* ------------------------------------------------------------------ role colours (docs/design.md, "Role colours") */
+
+/* A member chooses whether their name shows in their highest coloured role's colour, rather than their profile's. */
+Task<Answer> Service::role_color(std::string member, bool use)
+{
+    TxPtr tx;
+    try {
+        tx = co_await db_->newTransactionCoro();
+        const int value = use ? 1 : 0;
+        Result r = co_await tx->execSqlCoro("UPDATE members SET role_color = ? WHERE id = ? AND left_ms IS NULL", value, member);
+        int64_t ev = 0;
+        if (r.affectedRows()) { /* everyone's app shows their name in the new colour */
+            const std::string mj = co_await member_json_of(tx, member);
+            ev = co_await add_event(tx, "member", mj);
+        }
+        if (!co_await Committed(std::move(tx)))
+            co_return fail(500, "database");
+        bump(ev);
+        const std::string said = use ? "true" : "false";
+        co_return Answer{200, "{\"use\":" + said + "}"};
+    } catch (const DrogonDbException &e) {
+        if (tx)
+            tx->rollback();
+        LOG_ERROR << "database: " << e.base().what();
+        co_return fail(500, "database");
+    }
+}
+
+/* The Pond makes everyone's name show in their role's colour (`enforced`), or leaves it to each member. */
+Task<Answer> Service::admin_role_colors(std::string by, bool enforced)
+{
+    TxPtr tx;
+    try {
+        tx = co_await db_->newTransactionCoro();
+        if (enforced)
+            co_await tx->execSqlCoro("REPLACE INTO settings (name, value) VALUES ('role_colors', 'enforced')");
+        else
+            co_await tx->execSqlCoro("DELETE FROM settings WHERE name = 'role_colors'");
+        const std::string pj = co_await pond_json(tx);
+        const int64_t ev = co_await add_event(tx, "pond", pj);
+        if (!co_await Committed(std::move(tx)))
+            co_return fail(500, "database");
+        bump(ev);
+    } catch (const DrogonDbException &e) {
+        if (tx)
+            tx->rollback();
+        LOG_ERROR << "database: " << e.base().what();
+        co_return fail(500, "database");
+    }
+    const std::string detail = enforced ? "enforced" : "choice";
+    co_await log_admin(by, "set_role_colors", "", detail);
+    co_return Answer{204, ""};
+}
+
 } // namespace pond

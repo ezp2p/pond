@@ -103,6 +103,12 @@ static const char *const STEPS[][8] = {
         " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         nullptr,
     },
+    {
+        /* role colours (docs/design.md, "Role colours"): whether a member's name shows in their role's colour; the Pond's
+         * choice to make everyone's do is a setting */
+        "ALTER TABLE members ADD COLUMN role_color TINYINT NOT NULL DEFAULT 0",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run

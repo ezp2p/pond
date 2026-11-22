@@ -127,7 +127,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 11 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 12 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -773,6 +773,25 @@ int main()
         }
         CHECK(pond.call(&dan, "POST", R + SC + "/delete").status == 204);
         CHECK(pond.ctl("log", &out) == 0 && has(out, "page_create") && has(out, "page_order") && has(out, "set_banner"));
+
+        /* role colours (docs/design.md, "Role colours"): each member's own choice, unless the Pond makes everyone's */
+        {
+            CHECK(has(pond.call(&ann, "GET", "/pond/v1/info").body, "\"role_colors\":\"choice\""));
+            int64_t c4 = num_of(pond.call(&ann, "GET", "/pond/v1/info").body, "cursor");
+            CHECK(pond.call(&fay, "POST", "/pond/v1/role_color", "{\"use\":1}").status == 400);
+            a = pond.call(&fay, "POST", "/pond/v1/role_color", "{\"use\":true}");
+            CHECK(a.status == 200 && has(a.body, "\"use\":true"));
+            a = pond.call(&ann, "GET", "/pond/v1/events?after=" + std::to_string(c4));
+            CHECK(has(a.body, "\"kind\":\"member\"") && has(a.body, "\"id\":\"" + fay.id) && has(a.body, "\"role_color\":true"));
+            CHECK(pond.call(&fay, "POST", "/pond/v1/admin/role_colors", "{\"enforced\":true}").status == 404); /* not hers to say */
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/role_colors", "{\"enforced\":true}").status == 204);
+            CHECK(has(pond.call(&ann, "GET", "/pond/v1/info").body, "\"role_colors\":\"enforced\""));
+            CHECK(has(pond.call(&ann, "GET", "/pond/v1/events?after=" + std::to_string(c4)).body, "\"kind\":\"pond\""));
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/role_colors", "{\"enforced\":false}").status == 204);
+            CHECK(has(pond.call(&ann, "GET", "/pond/v1/info").body, "\"role_colors\":\"choice\""));
+            CHECK(pond.call(&fay, "POST", "/pond/v1/role_color", "{\"use\":false}").status == 200);
+            CHECK(pond.ctl("log", &out) == 0 && has(out, "set_role_colors"));
+        }
     }
 
     /* ---- what nobody may ask ---- */

@@ -32,11 +32,11 @@ static const Answer NOT_FOUND = {UNKNOWN, ""};
 enum Kind {
     JOIN, KEYS, INFO, HISTORY, SEND, EVENTS, MEMBERS, PROFILE, LEAVE, FILE_BEGIN, FILE_PUT, FILE_HASHES, FILE_GET, ROLE_ANSWER,
     VOICE_JOIN, VOICE_STATE, VOICE_WATCH, VOICE_LEAVE, PICTURE_PUT, PICTURE_GET, MEMBER_CHAIN, DM_SEND, DM_SETTINGS, DM_PIECE_GET,
-    DM_PIECE_PUT, PAGE_GET,
+    DM_PIECE_PUT, PAGE_GET, ROLE_COLOR,
     ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN,
     ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, ADMIN_MUTE, ADMIN_ROLE_CREATE, ADMIN_ROLE_EDIT, ADMIN_ROLE_DELETE,
     ADMIN_MEMBER_ROLES, ADMIN_CHANNEL_ROLES, ADMIN_CHANNEL_ORDER, ADMIN_ROLE_ORDER, ADMIN_BANNER, ADMIN_PAGE_CREATE,
-    ADMIN_PAGE_EDIT, ADMIN_PAGE_DELETE, ADMIN_PAGE_ORDER, ADMIN_UNMUTE, NONE
+    ADMIN_PAGE_EDIT, ADMIN_PAGE_DELETE, ADMIN_PAGE_ORDER, ADMIN_ROLE_COLORS, ADMIN_UNMUTE, NONE
 };
 
 /* The routes only an operator or administrator may use (docs/design.md, "Roles"), or a member whose roles let them. */
@@ -52,6 +52,7 @@ static int64_t permission_for(int k)
     case ADMIN_POND:
     case ADMIN_ICON:
     case ADMIN_BANNER:
+    case ADMIN_ROLE_COLORS:
         return MANAGE_POND;
     case ADMIN_PAGE_CREATE:
     case ADMIN_PAGE_EDIT:
@@ -117,6 +118,7 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
     if (post && p == "pond") return ADMIN_POND;
     if (post && p == "icon") return ADMIN_ICON;
     if (post && p == "banner") return ADMIN_BANNER;
+    if (post && p == "role_colors") return ADMIN_ROLE_COLORS;
     if (post && p == "pages/create") return ADMIN_PAGE_CREATE;
     if (post && p == "pages/order") return ADMIN_PAGE_ORDER;
     if (post && p == "channels/create") return ADMIN_CHANNEL_CREATE;
@@ -214,6 +216,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     if (p.substr(0, 6) == "files/")
         return file_route(get, post, p.substr(6), file, n);
     if (post && p == "roles/answer") return ROLE_ANSWER;
+    if (post && p == "role_color") return ROLE_COLOR;
     if (get && p.substr(0, 6) == "pages/" && (channel = number_of(p.substr(6), false)) > 0) return PAGE_GET; /* the page's id, in `channel` */
     if (get && p.substr(0, 8) == "members/" && p.size() == 8 + 52 + 6 && p.substr(8 + 52) == "/chain" && user_id_ok(p.substr(8, 52))) {
         member = std::string(p.substr(8, 52));
@@ -271,7 +274,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 static bool takes_body(Kind k)
 {
     return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == DM_SEND || k == DM_SETTINGS || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
-           k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER || k == ADMIN_ROLE_ORDER || k == ADMIN_BANNER || k == ADMIN_PAGE_CREATE || k == ADMIN_PAGE_EDIT || k == ADMIN_PAGE_ORDER ||
+           k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER || k == ADMIN_ROLE_ORDER || k == ADMIN_BANNER || k == ADMIN_PAGE_CREATE || k == ADMIN_PAGE_EDIT || k == ADMIN_PAGE_ORDER || k == ADMIN_ROLE_COLORS || k == ROLE_COLOR ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH;
 }
@@ -580,6 +583,14 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
             co_return co_await svc_.dm_piece_get(sender, other, file, (int)channel, member);
         co_return co_await svc_.dm_piece_put(sender, other, file, (int)channel, member, std::move(body));
     }
+    case ROLE_COLOR:
+        if (!json.isMember("use") || !json["use"].isBool())
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.role_color(sender, json["use"].asBool());
+    case ADMIN_ROLE_COLORS:
+        if (!json.isMember("enforced") || !json["enforced"].isBool())
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_role_colors(sender, json["enforced"].asBool());
     case ROLE_ANSWER:
         if (!json.isMember("offer") || !json["offer"].isInt64() || !json.isMember("accept") || !json["accept"].isBool())
             co_return fail(400, "bad_request");

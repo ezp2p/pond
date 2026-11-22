@@ -85,7 +85,8 @@ static std::optional<std::string> nullable(const std::string &s)
 
 /* each list of roles is from GROUP_CONCAT: ids, with commas, or NULL for none */
 static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until, dms,"
-                                  " (SELECT GROUP_CONCAT(mr.role ORDER BY mr.role) FROM member_roles mr WHERE mr.member = members.id)";
+                                  " (SELECT GROUP_CONCAT(mr.role ORDER BY mr.role) FROM member_roles mr WHERE mr.member = members.id),"
+                                  " role_color";
 static const char CHANNEL_COLS[] = "id, name, topic, position, kind, restricted,"
                                    " (SELECT GROUP_CONCAT(cr.role ORDER BY cr.role) FROM channel_roles cr WHERE cr.channel = channels.id)";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
@@ -108,7 +109,8 @@ static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
 {
     return "{\"id\":" + jstr(text(row[0])) + ",\"profile\":" + (row[1].isNull() ? std::string("null") : text(row[1])) +
            ",\"joined\":" + std::to_string(num(row[2])) + ",\"role\":" + jstr(text(row[3])) + ",\"muted\":" + muted_json(row[4]) +
-           ",\"dms\":" + (num(row[5]) ? "true" : "false") + ",\"roles\":" + id_list(row[6]) + "}";
+           ",\"dms\":" + (num(row[5]) ? "true" : "false") + ",\"roles\":" + id_list(row[6]) +
+           ",\"role_color\":" + (num(row[7]) ? "true" : "false") + "}";
 }
 
 static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
@@ -169,7 +171,7 @@ Task<std::string> Service::member_json_of(DbPtr db, std::string id)
 
 Task<std::string> Service::pond_json(DbPtr db)
 {
-    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon', 'banner', 'dms', 'dms.files_max')");
+    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon', 'banner', 'dms', 'dms.files_max', 'role_colors')");
     std::map<std::string, std::string> v;
     for (const auto &row : r)
         v[text(row[0])] = text(row[1]);
@@ -189,7 +191,9 @@ Task<std::string> Service::pond_json(DbPtr db)
     /* what members may send: "files" (docs/design.md, "Files"); max_size 0 is files turned off */
     co_return "{\"id\":" + jstr(key_.id) + ",\"key\":" + jstr(hex(key_.pub, 32)) + ",\"seal_key\":" + jstr(hex(key_.seal_pub, 32)) + ",\"name\":" + jstr(v["name"]) + ",\"description\":" + jstr(v["description"]) +
               ",\"icon\":" + icon + ",\"banner\":" + banner + ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
-              std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "},\"dms\":" + dms + "}";
+              std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "},\"dms\":" + dms +
+              /* role colours (protocol 12): "choice", each member's own, or "enforced", everyone's name in their role's colour */
+              ",\"role_colors\":" + jstr(v["role_colors"] == "enforced" ? "enforced" : "choice") + "}";
 }
 
 Task<std::string> Service::channels_json(std::string member)
