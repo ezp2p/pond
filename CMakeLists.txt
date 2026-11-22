@@ -110,6 +110,9 @@ add_library(pond_lib STATIC
   src/roles.cpp
   src/channel_roles.cpp
     src/pages.cpp
+    src/access.cpp
+    src/shop.cpp
+    src/applications.cpp
   src/pond.cpp
   src/reqsig.cpp
   src/routes.cpp

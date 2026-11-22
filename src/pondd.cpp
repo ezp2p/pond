@@ -49,6 +49,7 @@ int main(int argc, char **argv)
     Service svc(db, key, cfg.data_dir, app().getLoop());
     svc.wait_ms = cfg.events_wait_ms;
     svc.link_address = link_address(cfg); /* what the invites made from the app say */
+    svc.shop_settings.stripe_api = cfg.stripe_api;
     /* TLS only carries what members and the Pond say to each other, sealed (spec/09): any certificate will do, the Pond's own
      * or a reverse proxy's in front of it, and nothing depends on which. */
     std::string cert = cfg.data_dir + "/cert.pem";

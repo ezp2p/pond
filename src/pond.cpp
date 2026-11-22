@@ -87,8 +87,10 @@ static std::optional<std::string> nullable(const std::string &s)
 static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until, dms,"
                                   " (SELECT GROUP_CONCAT(mr.role ORDER BY mr.role) FROM member_roles mr WHERE mr.member = members.id),"
                                   " role_color";
-static const char CHANNEL_COLS[] = "id, name, topic, position, kind, restricted,"
-                                   " (SELECT GROUP_CONCAT(cr.role ORDER BY cr.role) FROM channel_roles cr WHERE cr.channel = channels.id)";
+/* the overrides as "role:allow:deny,..." (docs/design.md, "Permissions") */
+static const char CHANNEL_COLS[] = "id, name, topic, position, kind,"
+                                   " (SELECT GROUP_CONCAT(CONCAT(o.role, ':', o.allow, ':', o.deny) ORDER BY o.role) FROM channel_overrides o"
+                                   " WHERE o.channel = channels.id)";
 static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
 
 /* "muted": null, or {"until": ms, or null until they are unmuted} (docs/design.md, "Muting") */
@@ -113,11 +115,47 @@ static std::string member_json(const drogon::orm::Row &row) /* MEMBER_COLS */
            ",\"role_color\":" + (num(row[7]) ? "true" : "false") + "}";
 }
 
+std::vector<Override> parse_overrides(const std::string &concat)
+{
+    std::vector<Override> out;
+    size_t p = 0;
+    while (p < concat.size()) {
+        size_t end = concat.find(',', p);
+        if (end == std::string::npos)
+            end = concat.size();
+        Override o;
+        if (sscanf(concat.substr(p, end - p).c_str(), "%lld:%lld:%lld", (long long *)&o.role, (long long *)&o.allow, (long long *)&o.deny) == 3)
+            out.push_back(o);
+        p = end + 1;
+    }
+    return out;
+}
+
+std::string overrides_json(const std::vector<Override> &list)
+{
+    std::string out = "[";
+    for (const Override &o : list)
+        out += std::string(out.size() > 1 ? "," : "") + "{\"role\":" + std::to_string(o.role) + ",\"allow\":" + permissions_json(o.allow) +
+               ",\"deny\":" + permissions_json(o.deny) + "}";
+    return out + "]";
+}
+
 static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
 {
+    const std::vector<Override> list = parse_overrides(text(row[5]));
+    /* `roles`, as a Puddle of protocol 9 to 12 reads it: a channel that denies everyone the view is one only the roles allowed
+     * it see (null: open to everyone) */
+    bool restricted = false;
+    std::string roles;
+    for (const Override &o : list) {
+        if (o.role == 0 && (o.deny & VIEW_CHANNELS))
+            restricted = true;
+        if (o.role != 0 && (o.allow & VIEW_CHANNELS))
+            roles += (roles.empty() ? "" : ",") + std::to_string(o.role);
+    }
     return "{\"id\":" + std::to_string(num(row[0])) + ",\"name\":" + jstr(text(row[1])) + ",\"topic\":" + jstr(text(row[2])) +
            ",\"position\":" + std::to_string(num(row[3])) + ",\"kind\":" + jstr(text(row[4])) +
-           ",\"roles\":" + (num(row[5]) ? id_list(row[6]) : std::string("null")) + "}"; /* null: open to everyone */
+           ",\"roles\":" + (restricted ? "[" + roles + "]" : std::string("null")) + ",\"overrides\":" + overrides_json(list) + "}";
 }
 
 /* `files` is the message's "files" array, or "" for a message without any */
@@ -171,7 +209,7 @@ Task<std::string> Service::member_json_of(DbPtr db, std::string id)
 
 Task<std::string> Service::pond_json(DbPtr db)
 {
-    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon', 'banner', 'dms', 'dms.files_max', 'role_colors')");
+    Result r = co_await db->execSqlCoro("SELECT name, value FROM settings WHERE name IN ('name', 'description', 'files.max_size', 'icon', 'banner', 'dms', 'dms.files_max', 'role_colors', 'everyone', 'stripe_key')");
     std::map<std::string, std::string> v;
     for (const auto &row : r)
         v[text(row[0])] = text(row[1]);
@@ -193,7 +231,12 @@ Task<std::string> Service::pond_json(DbPtr db)
               ",\"icon\":" + icon + ",\"banner\":" + banner + ",\"files\":{\"max_size\":" + std::to_string(strtoll(max.c_str(), nullptr, 10)) + ",\"chunk_size\":" +
               std::to_string(FILE_CHUNK) + ",\"per_message\":" + std::to_string(FILES_PER_MESSAGE) + "},\"dms\":" + dms +
               /* role colours (protocol 12): "choice", each member's own, or "enforced", everyone's name in their role's colour */
-              ",\"role_colors\":" + jstr(v["role_colors"] == "enforced" ? "enforced" : "choice") + "}";
+              ",\"role_colors\":" + jstr(v["role_colors"] == "enforced" ? "enforced" : "choice") +
+              /* what everyone may do (protocol 13, "Permissions") */
+              ",\"everyone\":{\"permissions\":" + permissions_json(v["everyone"].empty() ? EVERYONE_DEFAULT : strtoll(v["everyone"].c_str(), nullptr, 10) & ALL_PERMISSIONS) + "}" +
+              /* whether the shop takes payments, and whether they are only tests (protocol 13, "Shop"); the key itself never goes */
+              ",\"shop\":{\"payments\":" + (v["stripe_key"].empty() ? "false" : "true") +
+              ",\"test\":" + (v["stripe_key"].rfind("sk_live_", 0) == 0 || v["stripe_key"].rfind("rk_live_", 0) == 0 ? "false" : "true") + "}}";
 }
 
 Task<std::string> Service::channels_json(std::string member)
@@ -216,27 +259,6 @@ Task<std::string> Service::roles_json()
     co_return out + "]";
 }
 
-/* Who may see a channel (docs/design.md, "Roles for channels"): everyone, unless it is restricted; then operators,
- * administrators, and members holding one of its roles. */
-Task<std::set<int64_t>> Service::hidden_channels(std::string member)
-{
-    std::set<int64_t> hidden;
-    Role rank = co_await role(member);
-    if (rank != Role::MEMBER)
-        co_return hidden;
-    Result r = co_await db_->execSqlCoro("SELECT c.id FROM channels c WHERE c.restricted = 1 AND NOT EXISTS (SELECT 1 FROM channel_roles cr"
-                                         " JOIN member_roles mr ON mr.role = cr.role WHERE cr.channel = c.id AND mr.member = ?)",
-                                         member);
-    for (const auto &row : r)
-        hidden.insert(num(row[0]));
-    co_return hidden;
-}
-
-Task<bool> Service::may_see(std::string member, int64_t channel)
-{
-    const std::set<int64_t> hidden = co_await hidden_channels(member);
-    co_return !hidden.count(channel);
-}
 
 Task<std::string> Service::setting(std::string name)
 {
@@ -309,6 +331,25 @@ Task<Answer> Service::enter_once(Chain chain, std::string invite, std::string pr
             co_return fail(404, "not_found");
         }
         if (!member) {
+            /* a Pond with an entry form: those not accepted yet apply first (applications.cpp) */
+            const std::string form = co_await entry_form();
+            if (!form.empty()) {
+                Result a = co_await tx->execSqlCoro("SELECT status, reason FROM applications WHERE member = ?", chain.id);
+                const std::string status = a.empty() ? "" : text(a[0][0]);
+                if (status != "accepted") {
+                    Result ok = co_await tx->execSqlCoro("SELECT 1 FROM invites WHERE token = ? AND revoked = 0 AND (max_uses IS NULL OR uses < max_uses)"
+                                                         " AND (expires_ms IS NULL OR expires_ms > ?)",
+                                                         invite, now);
+                    tx->rollback();
+                    if (status == "pending")
+                        co_return fail(409, "application_pending");
+                    if (status == "declined")
+                        co_return Answer{409, "{\"error\":\"application_declined\",\"reason\":" + jstr(text(a[0][1])) + ",\"form\":" + form + "}"};
+                    if (ok.empty())
+                        co_return fail(404, "not_found");
+                    co_return Answer{409, "{\"error\":\"application_required\",\"form\":" + form + "}"};
+                }
+            }
             /* spend one use, in the same statement that checks the invite may still be used, so two joins can't share the last */
             Result u = co_await tx->execSqlCoro("UPDATE invites SET uses = uses + 1 WHERE token = ? AND revoked = 0"
                                                 " AND (max_uses IS NULL OR uses < max_uses) AND (expires_ms IS NULL OR expires_ms > ?)",
@@ -375,7 +416,7 @@ Task<Answer> Service::info(std::string member)
         const std::string offer = co_await offer_json(member);
         const std::string channels = co_await channels_json(member);
         const std::string roles = co_await roles_json();
-        const std::string pages = co_await pages_json();
+        const std::string pages = co_await pages_json_for(member);
         const std::set<int64_t> hidden = co_await hidden_channels(member);
         const std::string voice = voice_now ? voice_now(hidden) : "[]";
         std::string body = "{\"protocol\":" + std::to_string(PROTOCOL) + ",\"features\":" + features + "],\"pond\":" + pond +
@@ -450,9 +491,14 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
     TxPtr tx;
     try {
         Result live = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0", channel);
-        const bool seen = co_await may_see(member, channel);
-        if (live.empty() || !seen)
+        const int64_t may = co_await permissions_in(member, channel);
+        if (live.empty() || !(may & VIEW_CHANNELS))
             co_return fail(404, "no_channel");
+        /* what they may do there (docs/design.md, "Permissions") */
+        if (!(may & SEND_MESSAGES))
+            co_return fail(409, "no_permission");
+        if (!files.empty() && !(may & ATTACH_FILES))
+            co_return fail(409, "no_files_here");
         if (!files.empty() && co_await files_max() == 0)
             co_return fail(409, "files_off");
         tx = co_await db_->newTransactionCoro();
@@ -605,16 +651,28 @@ Task<> Service::voice_event(std::string kind, std::string data)
 
 Task<std::vector<std::pair<std::string, int64_t>>> Service::voice_gone(std::vector<std::pair<std::string, int64_t>> in)
 {
+    const std::vector<int64_t> rights = co_await voice_rights(in);
     std::vector<std::pair<std::string, int64_t>> gone;
+    for (size_t i = 0; i < in.size(); i++)
+        if (!rights[i])
+            gone.push_back(in[i]);
+    co_return gone;
+}
+
+Task<std::vector<int64_t>> Service::voice_rights(std::vector<std::pair<std::string, int64_t>> in)
+{
+    std::vector<int64_t> out;
     for (auto &[m, c] : in) {
         const bool member = co_await is_member(m);
-        bool still = false;
-        if (member)
-            still = co_await is_voice_channel(c, m);
-        if (!still)
-            gone.emplace_back(m, c);
+        int64_t may = 0;
+        if (member) {
+            Result r = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0 AND kind = 'voice'", c);
+            if (!r.empty())
+                may = co_await permissions_in(m, c);
+        }
+        out.push_back((may & VIEW_CHANNELS) && (may & CONNECT) ? may : 0);
     }
-    co_return gone;
+    co_return out;
 }
 
 Task<bool> Service::is_voice_channel(int64_t channel, std::string member)
@@ -622,8 +680,18 @@ Task<bool> Service::is_voice_channel(int64_t channel, std::string member)
     Result r = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0 AND kind = 'voice'", channel);
     if (r.empty())
         co_return false;
-    const bool seen = co_await may_see(member, channel);
-    co_return seen;
+    const int64_t may = co_await permissions_in(member, channel);
+    co_return (may & VIEW_CHANNELS) && (may & CONNECT);
+}
+
+/* Moderating voice (docs/voice.md, "Moderation"): with the permission in that channel, and only on someone below them */
+Task<std::string> Service::may_moderate(std::string by, std::string target, int64_t channel, int64_t need)
+{
+    const int64_t may = co_await permissions_in(by, channel);
+    if (!(may & need) || !(may & VIEW_CHANNELS))
+        co_return "no_permission";
+    const std::string why = co_await may_act(by, target);
+    co_return why;
 }
 
 /* ---- the event log ---- */
@@ -726,14 +794,25 @@ Task<Answer> Service::events(int64_t after, std::string member)
                  * (docs/design.md, "Roles for channels"); the cursor still moves past it. `channels` is written for each member:
                  * the channels they see now, in order. */
                 std::set<int64_t> hidden;
-                std::string mine_now;
-                bool asked = false;
-                for (size_t i = 0; i < r.size(); i++)
+                std::string mine_now, pages_now;
+                bool asked = false, asked_pages = false, asked_powers = false, manages_applications = false, manages_shop = false;
+                for (size_t i = 0; i < r.size(); i++) {
                     if (!asked && (!r[i][4].isNull() || text(r[i][1]) == "channels")) {
                         hidden = co_await hidden_channels(member);
                         mine_now = co_await channels_json(member);
                         asked = true;
                     }
+                    if (!asked_pages && text(r[i][1]) == "pages") { /* the pages this member sees now (protocol 13) */
+                        pages_now = co_await pages_json_for(member);
+                        asked_pages = true;
+                    }
+                    if (!asked_powers && (text(r[i][1]) == "applications" || text(r[i][1]) == "orders")) { /* only for those who see them */
+                        const Powers pw = co_await powers(member);
+                        manages_applications = pw.has(MANAGE_APPLICATIONS);
+                        manages_shop = pw.has(MANAGE_SHOP);
+                        asked_powers = true;
+                    }
+                }
                 std::string out = "{\"events\":[";
                 bool first = true;
                 for (size_t i = 0; i < r.size(); i++) {
@@ -742,7 +821,13 @@ Task<Answer> Service::events(int64_t after, std::string member)
                     if (!r[i][4].isNull() && hidden.count(num(r[i][4])))
                         continue;
                     const std::string kind = text(r[i][1]);
-                    const std::string data = kind == "channels" ? "{\"channels\":" + mine_now + "}" : text(r[i][2]);
+                    if ((kind == "applications" && !manages_applications) || (kind == "orders" && !manages_shop))
+                        continue;
+                    std::string data = text(r[i][2]);
+                    if (kind == "channels")
+                        data = "{\"channels\":" + mine_now + "}";
+                    else if (kind == "pages")
+                        data = "{\"pages\":" + pages_now + "}";
                     out += std::string(first ? "" : ",") + "{\"id\":" + std::to_string(num(r[i][0])) + ",\"kind\":" + jstr(kind) +
                            ",\"data\":" + data + "}";
                     first = false;
@@ -775,6 +860,13 @@ Task<> Service::tick()
             co_await db_->execSqlCoro("DELETE FROM events WHERE ts_ms < ?", now_ms() - EVENTS_KEEP_MS);
             co_await sweep_files();
             co_await sweep_pictures();
+        }
+        if (now_ms() >= next_orders_ && !checking_orders_.exchange(true)) { /* orders waiting on Stripe (shop.cpp), apart from this */
+            next_orders_ = now_ms() + 5000;
+            drogon::async_run([this]() -> Task<> {
+                co_await check_orders();
+                checking_orders_ = false;
+            });
         }
         if (now_ms() >= next_mutes_) { /* who is muted, from the app or pondctl: what sends and voice look at */
             next_mutes_ = now_ms() + 2000;

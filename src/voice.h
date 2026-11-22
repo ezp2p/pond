@@ -58,6 +58,11 @@ public:
     Answer watch(const std::string &member, const std::string &session, const std::map<int, std::string> &tracks);
     Answer leave(const std::string &member, const std::string &session);
 
+    /* The voice channel `member` is in; 0 for none */
+    int64_t channel_of(const std::string &member);
+    /* Moderation (docs/voice.md, "Moderation"), checked by the caller: mute `target` for everyone (or unmute), or, with
+     * `muted` nullopt, disconnect them */
+    Task<Answer> moderate(std::string by, std::string target, std::optional<bool> muted);
     /* Who is in which voice channel now, as /info says it, leaving out the channels in `hidden` */
     std::string now_json(const std::set<int64_t> &hidden);
 

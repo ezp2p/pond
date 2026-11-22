@@ -34,6 +34,8 @@ struct Config {
     int events_wait_ms = 25000; /* how long a request for events is held open */
     DbConfig db;
     VoiceConfig voice;
+    /* shop: {stripe_api}: where the shop asks Stripe (docs/design.md, "Shop"); only tests change it */
+    std::string stripe_api = "https://api.stripe.com";
     std::vector<std::string> notes; /* settings under an older name, still read: pondd logs these so they get renamed */
 };
 

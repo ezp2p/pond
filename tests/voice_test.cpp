@@ -281,7 +281,7 @@ int main()
     /* ---- a channel's kind; protocol 4, with voice ---- */
     Reply a = pond.call(&ann.id, "GET", "/pond/v1/info");
     Json::Value info = parse(a.body);
-    CHECK(info["protocol"].asInt() == 12 && has(a.body, "\"receipts\",\"sealed\",\"pictures\",\"channel_roles\",\"role_permissions\",\"pages\",\"role_colors\",\"voice\",\"dms\",\"dm_files\"]") && has(a.body, "\"voice\":[]"));
+    CHECK(info["protocol"].asInt() == 13 && has(a.body, "\"receipts\",\"sealed\",\"pictures\",\"channel_roles\",\"role_permissions\",\"pages\",\"role_colors\",\"overrides\",\"page_kinds\",\"applications\",\"shop\",\"voice_moderation\",\"voice\",\"dms\",\"dm_files\"]") && has(a.body, "\"voice\":[]"));
     int64_t talk = 0, general = 0;
     for (const auto &c : info["channels"])
         (c["name"].asString() == "talk" ? talk : general) = c["id"].asInt64();
@@ -387,6 +387,38 @@ int main()
     }
     CHECK(state(ann, "{\"screen\":false}") == 204);
 
+    /* ---- moderation (docs/voice.md, "Moderation"): muting someone for everyone, by whoever may; a channel that doesn't let
+     * everyone speak ---- */
+    {
+        const std::string T = std::to_string(talk), MOD = "/pond/v1/voice/members/";
+        CHECK(pond.call(&ben.id, "POST", MOD + cat.id.id + "/mute", "{\"muted\":true}").status == 404); /* not his to do */
+        CHECK(pond.ctl("member offer " + ann.id.id + " administrator --yes", &out) == 0);
+        int64_t offer = parse(pond.call(&ann.id, "GET", "/pond/v1/info").body)["offer"]["id"].asInt64();
+        CHECK(pond.call(&ann.id, "POST", "/pond/v1/roles/answer", "{\"offer\":" + std::to_string(offer) + ",\"accept\":true}").status == 200);
+        CHECK(pond.call(&ann.id, "POST", MOD + ben.id.id + "/mute", "{\"muted\":true}").status == 204);
+        CHECK(event_with(pond, cat.id, cursor, "\"server_muted\":true"));
+        cat.forget();
+        for (int k = 0; k < 5; k++)
+            ben.say("ben-server-muted");
+        until([] { return false; }, 400);
+        CHECK(cat.from(2).empty());
+        CHECK(pond.call(&ann.id, "POST", MOD + ben.id.id + "/mute", "{\"muted\":false}").status == 204);
+        ben.say("ben-free");
+        CHECK(until([&] { return !cat.from(2).empty(); }));
+        CHECK(pond.call(&ann.id, "POST", MOD + ann.id.id + "/mute", "{\"muted\":true}").status == 409); /* not herself */
+        /* the channel denies everyone `speak`: the Pond notices within a second or two */
+        CHECK(pond.call(&ann.id, "POST", "/pond/v1/admin/channels/" + T + "/overrides",
+                        "{\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"speak\"]}]}").status == 204);
+        CHECK(event_with(pond, cat.id, cursor, "\"member\":\"" + ben.id.id + "\",\"slot\":2,\"muted\":false,\"deafened\":false,\"camera\":false,\"screen\":false,\"server_muted\":false,\"speak\":false"));
+        cat.forget();
+        for (int k = 0; k < 5; k++)
+            ben.say("ben-no-speak");
+        until([] { return false; }, 400);
+        CHECK(cat.from(2).empty());
+        CHECK(pond.call(&ann.id, "POST", "/pond/v1/admin/channels/" + T + "/overrides", "{\"overrides\":[]}").status == 204);
+        CHECK(until([&] { ben.say("ben-speaks"); return !cat.from(2).empty(); }, 5000));
+    }
+
     /* ---- a voice channel takes text too ---- */
     CHECK(pond.call(&ann.id, "POST", "/pond/v1/channels/" + std::to_string(talk) + "/send", "{\"text\":\"a link\"}").status == 200);
 
@@ -406,6 +438,13 @@ int main()
     ann.forget(), ben.forget();
     ann.say("ann-back");
     CHECK(until([&] { return !ben.from(1).empty(); }));
+
+    /* ---- disconnected by a moderator: out, and everyone told who did it ---- */
+    CHECK(cat.join(pond, talk).status == 200 && cat.up());
+    CHECK(pond.call(&ben.id, "POST", "/pond/v1/voice/members/" + cat.id.id + "/disconnect", "{}").status == 404);
+    CHECK(pond.call(&ann.id, "POST", "/pond/v1/voice/members/" + cat.id.id + "/disconnect", "{}").status == 204);
+    CHECK(event_with(pond, ben.id, cursor, "\"member\":\"" + cat.id.id + "\",\"by\":\"" + ann.id.id + "\""));
+    CHECK(pond.call(&cat.id, "POST", "/pond/v1/voice/" + cat.session + "/state", "{\"muted\":true}").status == 404);
 
     /* ---- someone removed is out of voice too (pondctl, another process: the Pond notices) ---- */
     CHECK(pond.ctl("member remove " + ben.id.id, &out) == 0);
