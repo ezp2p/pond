@@ -42,15 +42,17 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 9; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 10; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
                              * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
                              * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures");
                              * 7: muting, and a member's `muted` ("Muting");
                              * 8: direct messages, relayed (docs/dms.md), where `features` says `dms`; a member's `dms`;
                              * 9: roles for channels, and the channels' order from the app ("Roles for channels"): `roles` in
-                             *    /info, a member's and a channel's `roles`, and the events `role`, `role_deleted` and `channels` */
-constexpr std::array<const char *, 6> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles"}; /* and "voice", when voice is on */
+                             *    /info, a member's and a channel's `roles`, and the events `role`, `role_deleted` and `channels`;
+                             * 10: what roles let their members do, their colour, order, and whether they are shown apart ("Permissions"):
+                             *    a role's `color`, `hoist` and `permissions`, the order of `roles` in /info, and the event `role_order` */
+constexpr std::array<const char *, 7> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles", "role_permissions"}; /* and "voice", when voice is on */
 
 /* Direct messages (docs/dms.md, dms.cpp): relayed, never stored. */
 constexpr size_t DM_SEALED_MAX = 128 * 1024;           /* a sealed letter, as base64: a message with ten files' previews fits */
@@ -75,6 +77,40 @@ constexpr int64_t OFFER_KEEP_MS = 7LL * 24 * 3600 * 1000;
 constexpr size_t BAN_REASON_MAX = 500;
 constexpr size_t ROLE_NAME_MAX = 32;   /* characters in the name of a role for channels */
 constexpr int64_t ROLES_MAX = 200;     /* roles for channels in one Pond */
+
+/* What a role lets the members who hold it do (docs/design.md, "Permissions"): bits in `roles.permissions`, names on the wire.
+ * An operator or administrator may do all of it. */
+enum Permission : int64_t {
+    MANAGE_POND = 1, MANAGE_CHANNELS = 2, MANAGE_ROLES = 4, MANAGE_INVITES = 8, KICK_MEMBERS = 16, BAN_MEMBERS = 32, MUTE_MEMBERS = 64
+};
+struct PermissionName {
+    int64_t bit;
+    const char *name;
+};
+constexpr std::array<PermissionName, 7> PERMISSIONS{{{MANAGE_POND, "manage_pond"}, {MANAGE_CHANNELS, "manage_channels"},
+                                                     {MANAGE_ROLES, "manage_roles"}, {MANAGE_INVITES, "manage_invites"},
+                                                     {KICK_MEMBERS, "kick_members"}, {BAN_MEMBERS, "ban_members"},
+                                                     {MUTE_MEMBERS, "mute_members"}}};
+std::string permissions_json(int64_t bits);
+/* A role on the wire: {id, name, color (null or "#rrggbb"), hoist, permissions} */
+std::string role_json(int64_t id, const std::string &name, const std::string &color, bool hoist, int64_t permissions);
+
+/* What a member may do: their rank, what the roles they hold let them do, and the highest of those roles (its `position`:
+ * the lower, the higher; INT64_MAX for none). */
+struct Powers {
+    Role rank = Role::MEMBER;
+    int64_t permissions = 0;
+    int64_t top = INT64_MAX;
+    bool ranked() const { return rank != Role::MEMBER; }
+    bool has(int64_t p) const { return ranked() || (permissions & p) == p; }
+};
+
+/* A role made or changed from the app: what is to be set. `color` "" for none. */
+struct RoleEdit {
+    std::optional<std::string> name, color;
+    std::optional<bool> hoist;
+    std::optional<int64_t> permissions;
+};
 constexpr int INVITE_USES_MAX = 1000000;
 constexpr int64_t INVITE_EXPIRY_MAX_MS = 10LL * 366 * 24 * 3600 * 1000; /* made from the app: at most ten years ahead */
 
@@ -168,7 +204,10 @@ public:
     Task<Answer> answer_offer(std::string member, int64_t offer, bool accept);
     /* `member`'s role; MEMBER for someone who is not one. */
     Task<Role> role(std::string member);
-    /* What an operator or administrator does from the app; `by` is checked to hold a role first (the routes). */
+    /* What `member` may do (channel_roles.cpp). */
+    Task<Powers> powers(std::string member);
+    /* What an operator or administrator, or a member whose roles allow it, does from the app; `by` is checked to have the
+     * permission first (the routes), and rank and the order of roles here. */
     Task<Answer> admin_pond(std::string by, std::optional<std::string> name, std::optional<std::string> description);
     Task<Answer> admin_channel_create(std::string by, std::string name, std::string topic, std::string kind = "text");
     Task<Answer> admin_channel_edit(std::string by, int64_t channel, std::optional<std::string> name, std::optional<std::string> topic);
@@ -188,8 +227,10 @@ public:
     Task<Answer> admin_unban(std::string by, std::string member);
     /* Roles for channels (channel_roles.cpp; docs/design.md, "Roles for channels"): named by operators and administrators,
      * given to members, and asked for by channels that are not open to everyone. */
-    Task<Answer> admin_role_create(std::string by, std::string name);
-    Task<Answer> admin_role_edit(std::string by, int64_t role, std::string name);
+    Task<Answer> admin_role_create(std::string by, RoleEdit e);
+    Task<Answer> admin_role_edit(std::string by, int64_t role, RoleEdit e);
+    /* the order of the roles: every role's id, highest first */
+    Task<Answer> admin_role_order(std::string by, std::vector<int64_t> roles);
     Task<Answer> admin_role_delete(std::string by, int64_t role);
     /* the roles `member` holds now: these, and no others */
     Task<Answer> admin_member_roles(std::string by, std::string member, std::vector<int64_t> roles);

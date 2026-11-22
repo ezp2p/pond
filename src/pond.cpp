@@ -201,10 +201,10 @@ Task<std::string> Service::channels_json(std::string member)
 
 Task<std::string> Service::roles_json()
 {
-    Result r = co_await db_->execSqlCoro("SELECT id, name FROM roles ORDER BY id");
+    Result r = co_await db_->execSqlCoro("SELECT id, name, color, hoist, permissions FROM roles ORDER BY position, id");
     std::string out = "[";
     for (size_t i = 0; i < r.size(); i++)
-        out += std::string(i ? "," : "") + "{\"id\":" + std::to_string(num(r[i][0])) + ",\"name\":" + jstr(text(r[i][1])) + "}";
+        out += std::string(i ? "," : "") + role_json(num(r[i][0]), text(r[i][1]), text(r[i][2]), num(r[i][3]) != 0, num(r[i][4]));
     co_return out + "]";
 }
 

@@ -34,13 +34,49 @@ enum Kind {
     DM_PIECE_PUT,
     ADMIN_POND, ADMIN_ICON, ADMIN_CHANNEL_CREATE, ADMIN_CHANNEL_EDIT, ADMIN_CHANNEL_DELETE, ADMIN_REMOVE, ADMIN_BAN, ADMIN_BANS, ADMIN_UNBAN,
     ADMIN_INVITES, ADMIN_INVITE_CREATE, ADMIN_INVITE_REVOKE, ADMIN_MUTE, ADMIN_ROLE_CREATE, ADMIN_ROLE_EDIT, ADMIN_ROLE_DELETE,
-    ADMIN_MEMBER_ROLES, ADMIN_CHANNEL_ROLES, ADMIN_CHANNEL_ORDER, ADMIN_UNMUTE, NONE
+    ADMIN_MEMBER_ROLES, ADMIN_CHANNEL_ROLES, ADMIN_CHANNEL_ORDER, ADMIN_ROLE_ORDER, ADMIN_UNMUTE, NONE
 };
 
-/* The routes only an operator or administrator may use (docs/design.md, "Roles"). */
+/* The routes only an operator or administrator may use (docs/design.md, "Roles"), or a member whose roles let them. */
 static bool is_admin(int k)
 {
     return k >= ADMIN_POND && k <= ADMIN_UNMUTE;
+}
+
+/* The permission an admin route needs (docs/design.md, "Permissions") */
+static int64_t permission_for(int k)
+{
+    switch (k) {
+    case ADMIN_POND:
+    case ADMIN_ICON:
+        return MANAGE_POND;
+    case ADMIN_CHANNEL_CREATE:
+    case ADMIN_CHANNEL_EDIT:
+    case ADMIN_CHANNEL_DELETE:
+    case ADMIN_CHANNEL_ROLES:
+    case ADMIN_CHANNEL_ORDER:
+        return MANAGE_CHANNELS;
+    case ADMIN_ROLE_CREATE:
+    case ADMIN_ROLE_EDIT:
+    case ADMIN_ROLE_DELETE:
+    case ADMIN_ROLE_ORDER:
+    case ADMIN_MEMBER_ROLES:
+        return MANAGE_ROLES;
+    case ADMIN_INVITES:
+    case ADMIN_INVITE_CREATE:
+    case ADMIN_INVITE_REVOKE:
+        return MANAGE_INVITES;
+    case ADMIN_REMOVE:
+        return KICK_MEMBERS;
+    case ADMIN_BAN:
+    case ADMIN_BANS:
+    case ADMIN_UNBAN:
+        return BAN_MEMBERS;
+    case ADMIN_MUTE:
+    case ADMIN_UNMUTE:
+        return MUTE_MEMBERS;
+    }
+    return -1; /* none has every bit: only a rank */
 }
 
 /* A user id: 52 of base32. */
@@ -75,6 +111,7 @@ static Kind admin_route(bool get, bool post, std::string_view p, int64_t &channe
     if (post && p == "channels/create") return ADMIN_CHANNEL_CREATE;
     if (post && p == "channels/order") return ADMIN_CHANNEL_ORDER;
     if (post && p == "roles/create") return ADMIN_ROLE_CREATE;
+    if (post && p == "roles/order") return ADMIN_ROLE_ORDER;
     if (get && p == "bans") return ADMIN_BANS;
     if (get && p == "invites") return ADMIN_INVITES;
     if (post && p == "invites/create") return ADMIN_INVITE_CREATE;
@@ -218,7 +255,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 static bool takes_body(Kind k)
 {
     return k == JOIN || k == KEYS || k == SEND || k == PROFILE || k == DM_SEND || k == DM_SETTINGS || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
-           k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER ||
+           k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER || k == ADMIN_ROLE_ORDER ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH;
 }
@@ -408,8 +445,11 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
     const std::string &sender = sig.id;
     if (takes_body(k) && !json_ok)
         co_return fail(400, "bad_request");
-    if (is_admin(k) && co_await svc_.role(sender) == Role::MEMBER)
-        co_return NOT_FOUND; /* to a member without a role, these do not exist */
+    if (is_admin(k)) {
+        const Powers powers = co_await svc_.powers(sender);
+        if (!powers.has(permission_for(k)))
+            co_return NOT_FOUND; /* to a member not let use them, these do not exist */
+    }
 
     /* an optional string member: false if it is there and not a string */
     auto opt_string = [&](const char *key, std::optional<std::string> &out) {
@@ -619,12 +659,49 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         co_return co_await svc_.admin_unmute(sender, member);
     case ADMIN_ROLE_CREATE:
     case ADMIN_ROLE_EDIT: {
-        std::string name;
-        if (!get_string(json, "name", name))
+        /* {name?, color?: "#rrggbb" or null, hoist?, permissions?: [names]}; a new role needs its name */
+        RoleEdit e;
+        if (!opt_string("name", e.name))
             co_return fail(400, "bad_request");
+        if (json.isMember("color")) {
+            if (json["color"].isNull())
+                e.color = "";
+            else if (!opt_string("color", e.color) || e.color->empty())
+                co_return fail(400, "bad_request");
+            for (char &c : *e.color)
+                c = (char)tolower((unsigned char)c);
+        }
+        if (json.isMember("hoist")) {
+            if (!json["hoist"].isBool())
+                co_return fail(400, "bad_request");
+            e.hoist = json["hoist"].asBool();
+        }
+        if (json.isMember("permissions")) {
+            const Json::Value &a = json["permissions"];
+            if (!a.isArray() || a.size() > PERMISSIONS.size())
+                co_return fail(400, "bad_request");
+            int64_t bits = 0;
+            for (const auto &v : a) {
+                int64_t bit = 0;
+                for (const auto &p : PERMISSIONS)
+                    if (v.isString() && v.asString() == p.name)
+                        bit = p.bit;
+                if (!bit)
+                    co_return fail(400, "unknown_permission");
+                bits |= bit;
+            }
+            e.permissions = bits;
+        }
         if (k == ADMIN_ROLE_CREATE)
-            co_return co_await svc_.admin_role_create(sender, name);
-        co_return co_await svc_.admin_role_edit(sender, channel, name);
+            co_return co_await svc_.admin_role_create(sender, std::move(e));
+        co_return co_await svc_.admin_role_edit(sender, channel, std::move(e));
+    }
+    case ADMIN_ROLE_ORDER: {
+        /* {roles: [ids]}: every role, highest first */
+        std::vector<int64_t> roles;
+        if (!body_ids(json, "roles", (size_t)ROLES_MAX, roles))
+            co_return fail(400, "bad_request");
+        co_return co_await svc_.admin_role_order(sender, std::move(roles));
     }
     case ADMIN_ROLE_DELETE:
         co_return co_await svc_.admin_role_delete(sender, channel);

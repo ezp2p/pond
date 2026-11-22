@@ -208,9 +208,13 @@ Task<std::string> Service::may_act(std::string by, std::string target)
 {
     if (by == target)
         co_return "not_yourself";
-    Role b = co_await role(by), t = co_await role(target);
+    const Powers b = co_await powers(by);
+    const Powers t = co_await powers(target);
     /* nobody acts on an operator from the app, and only on a lower rank */
-    if (t == Role::OPERATOR || b <= t)
+    if (t.rank == Role::OPERATOR || (b.ranked() && b.rank <= t.rank))
+        co_return "outranked";
+    /* a member whose roles let them, only on a member whose highest role is below theirs (docs/design.md, "Permissions") */
+    if (!b.ranked() && (t.ranked() || b.top >= t.top))
         co_return "outranked";
     co_return "";
 }

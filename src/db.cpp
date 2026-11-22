@@ -84,6 +84,14 @@ static const char *const STEPS[][8] = {
         "ALTER TABLE events ADD COLUMN channel BIGINT NULL",
         nullptr,
     },
+    {
+        /* what roles let their members do, their colour, their order, and whether they are shown apart (docs/design.md,
+         * "Permissions"): `permissions` is bits, `color` "#rrggbb" or "" for none, and the lower the `position` the higher */
+        "ALTER TABLE roles ADD COLUMN permissions BIGINT NOT NULL DEFAULT 0, ADD COLUMN color VARCHAR(7) NOT NULL DEFAULT '',"
+        " ADD COLUMN hoist TINYINT NOT NULL DEFAULT 0, ADD COLUMN position BIGINT NOT NULL DEFAULT 0",
+        "UPDATE roles SET position = id",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run

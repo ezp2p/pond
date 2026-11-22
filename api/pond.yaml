@@ -523,32 +523,46 @@ paths:
       responses: { "204": { description: Done }, "409": { description: "`channels_changed`: not every live channel once (one was made or deleted meanwhile)" } }
   /pond/v1/admin/roles/create:
     post:
-      summary: Make a role for channels (protocol 9)
-      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string, maxLength: 32 } } } } } }
+      summary: Make a role (protocol 9; colour, shown apart and permissions from protocol 10), at the bottom of the order
+      description: 'A member who is not an operator or administrator may give it only permissions they have (docs/design.md, "Permissions").'
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/RoleChange", required: [name] } } } }
       responses:
-        "200": { description: "The role: `{id, name}`" }
-        "400": { $ref: "#/components/responses/AdminRefused" }
+        "200": { description: The role, content: { application/json: { schema: { $ref: "#/components/schemas/ChannelRole" } } } }
+        "400": { description: "In words an app may show; or `unknown_permission`" }
+        "409": { description: "`outranked`: a permission they don't have" }
   /pond/v1/admin/roles/{role}/edit:
     post:
-      summary: Rename a role for channels
+      summary: Change a role; what is given changes
+      description: A member who is not an operator or administrator may change only a role below their highest, and add only permissions they have.
       parameters: [{ name: role, in: path, required: true, schema: { type: integer, minimum: 1 } }]
-      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string, maxLength: 32 } } } } } }
-      responses: { "204": { description: Done }, "400": { $ref: "#/components/responses/AdminRefused" }, "404": { description: "`unknown_role`" } }
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/RoleChange" } } } }
+      responses:
+        "204": { description: Done }
+        "400": { description: "In words an app may show; or `unknown_permission`" }
+        "404": { description: "`unknown_role`" }
+        "409": { description: "`outranked`" }
   /pond/v1/admin/roles/{role}/delete:
     post:
-      summary: Delete a role for channels; a channel that asked for it alone is left to operators and administrators
+      summary: Delete a role; a channel that asked for it alone is left to operators and administrators
       parameters: [{ name: role, in: path, required: true, schema: { type: integer, minimum: 1 } }]
-      responses: { "204": { description: Deleted }, "404": { description: "`unknown_role`" } }
+      responses: { "204": { description: Deleted }, "404": { description: "`unknown_role`" }, "409": { description: "`outranked`: not below their highest role" } }
+  /pond/v1/admin/roles/order:
+    post:
+      summary: The order of the roles, highest first (protocol 10)
+      description: A member who is not an operator or administrator may move only roles below their highest; the rest stay where they are.
+      requestBody: { content: { application/json: { schema: { type: object, required: [roles], properties: { roles: { type: array, items: { type: integer }, description: "Every role's id, each once, highest first" } } } } } }
+      responses: { "204": { description: Done }, "409": { description: "`roles_changed`: not every role once (one was made or deleted meanwhile); `outranked`" } }
   /pond/v1/admin/members/{member}/roles:
     post:
-      summary: The roles for channels a member holds, these and no others (protocol 9)
+      summary: The roles a member holds, these and no others (protocol 9)
+      description: A member who is not an operator or administrator may give or take only roles below their highest.
       parameters: [{ $ref: "#/components/parameters/Member" }]
       requestBody: { content: { application/json: { schema: { type: object, required: [roles], properties: { roles: { type: array, items: { type: integer } } } } } } }
-      responses: { "204": { description: Done }, "404": { description: "`no_member`, `unknown_role`" } }
+      responses: { "204": { description: Done }, "404": { description: "`no_member`, `unknown_role`" }, "409": { description: "`outranked`" } }
   /pond/v1/admin/members/{member}/remove:
     post:
       summary: Remove a member (they may come back with an invite)
-      description: Only on a lower rank, never an operator, never oneself.
+      description: 'Only on a lower rank, never an operator, never oneself. A member let by their roles: only on a member whose highest role is below theirs (docs/design.md, "Permissions").'
       parameters: [{ $ref: "#/components/parameters/Member" }]
       responses:
         "204": { description: Removed }
@@ -697,7 +711,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -706,7 +720,7 @@ components:
                   - { type: object, properties: { id: { type: integer }, role: { $ref: "#/components/schemas/Role" } } }
                   - { type: "null" }
               channels: { type: array, items: { $ref: "#/components/schemas/Channel" }, description: "The channels this member may see, in order" }
-              roles: { type: array, items: { $ref: "#/components/schemas/ChannelRole" }, description: "Every role for channels (protocol 9)" }
+              roles: { type: array, items: { $ref: "#/components/schemas/ChannelRole" }, description: "Every role (protocol 9), highest first (protocol 10)" }
               voice: { type: array, items: { $ref: "#/components/schemas/InVoice" }, description: "Who is in a voice channel now (protocol 4)" }
               cursor: { type: integer, description: The newest event; follow /pond/v1/events from here }
     AdminRefused:
@@ -792,10 +806,22 @@ components:
         roles: { type: array, items: { type: integer }, description: "The roles for channels they hold (protocol 9)" }
     ChannelRole:
       type: object
-      description: 'A role for channels (docs/design.md, "Roles for channels"); not a rank (`Role`)'
+      description: 'A role (docs/design.md, "Roles for channels" and "Permissions"); not a rank (`Role`)'
       properties:
         id: { type: integer }
         name: { type: string, maxLength: 32 }
+        color: { oneOf: [{ type: string, pattern: "^#[0-9a-f]{6}$" }, { type: "null" }], description: "Protocol 10" }
+        hoist: { type: boolean, description: "Shown apart in the member list (protocol 10)" }
+        permissions: { type: array, items: { $ref: "#/components/schemas/Permission" }, description: "What it lets its members do (protocol 10)" }
+    RoleChange:
+      type: object
+      properties:
+        name: { type: string, maxLength: 32 }
+        color: { oneOf: [{ type: string, pattern: "^#[0-9a-fA-F]{6}$" }, { type: "null" }] }
+        hoist: { type: boolean }
+        permissions: { type: array, items: { $ref: "#/components/schemas/Permission" } }
+    Permission:
+      enum: [manage_pond, manage_channels, manage_roles, manage_invites, kick_members, ban_members, mute_members]
     Role:
       enum: [operator, administrator, member]
       description: "docs/design.md, \"Roles\". Missing (protocol 1) means member."
@@ -853,7 +879,7 @@ components:
       required: [id, kind, data]
       properties:
         id: { type: integer }
-        kind: { enum: [message, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, voice, voice_left] }
+        kind: { enum: [message, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, role_order, voice, voice_left] }
         data:
           description: |
             message: a Message. channel: a Channel (made or changed). channel_deleted: {id}. member: a Member (joined, or a
@@ -862,4 +888,5 @@ components:
             or camera changed). voice_left: {channel, member}. Protocol 9 (docs/design.md, "Roles for channels"): channels:
             {channels: [Channel]}, every channel this member may see now, in order, replacing what they had. role: a
             ChannelRole (made or renamed). role_deleted: {id}, taken out of every member and channel. An event about a
-            channel the member may not see is not given to them.
+            channel the member may not see is not given to them. Protocol 10: role carries the whole ChannelRole (made or
+            changed; a new one is at the bottom), and role_order: {roles: [ids]}, every role, highest first.

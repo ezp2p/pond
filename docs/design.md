@@ -446,6 +446,45 @@ Protocol 9, feature `channel_roles`. An older Puddle ignores the new events and 
 gives it, so it never shows one it may not see, but it learns of a change only at its next `/info` (a reset, or starting
 again).
 
+## Permissions
+
+Built 2026-11-22, on top of roles for channels, to make roles work as they do on Discord: a role can let its members do
+some of what an administrator does, has a colour and a place in an order, and can be shown apart in the member list.
+
+| Permission | Lets a member |
+|---|---|
+| `manage_pond` | Change the Pond's name, description and icon |
+| `manage_channels` | Make, edit, delete and order channels, and choose who sees each one |
+| `manage_roles` | Make, edit, delete and order roles, and give and take them (below their own highest role) |
+| `manage_invites` | See, make and revoke invites |
+| `kick_members` | Remove a member, who may come back with an invite |
+| `ban_members` | Ban a member, see the bans, and unban |
+| `mute_members` | Mute and unmute a member |
+
+| Question | Decision |
+|---|---|
+| Ranks | An operator or administrator has every permission, whatever roles they hold, and rank works as before. Roles never make anyone an operator or administrator, and nobody acts on a rank by way of a role. |
+| What a member may do | What any of their roles lets them. An admin route a member isn't let use answers `404`, as it did for anyone without a rank. |
+| The order | Roles are in an order, highest first (`roles.position`, the lower the higher). A new role goes at the bottom. `/info` gives `roles` in that order. |
+| Acting on someone (kick, ban, mute) | A member with the permission may act only on a member whose highest role is below their own highest. A member with no roles is below everyone. Otherwise `409 outranked`, as for ranks. |
+| Managing roles | A member with `manage_roles` works below their own highest role: they may edit, delete, give or take only roles below it, may move only those, and may give a role only permissions they have. Otherwise `409 outranked`. |
+| Colour | `#rrggbb`, or null for none. The apps show it on the role wherever it appears; a member's name keeps the colour from their profile. |
+| Shown apart (`hoist`) | The member list groups members under their highest role that is shown apart, in the roles' order, before everyone else. |
+
+| Route | Does |
+|---|---|
+| `POST /pond/v1/admin/roles/create` | `{name, color?, hoist?, permissions?}`: answers the role |
+| `POST /pond/v1/admin/roles/{role}/edit` | `{name?, color?, hoist?, permissions?}`: what is given changes |
+| `POST /pond/v1/admin/roles/order` | `{roles: [ids]}`: every role, highest first; `409 roles_changed` if one was made or deleted meanwhile |
+
+A permission it doesn't know is `400 unknown_permission`. A role on the wire is `{id, name, color, hoist, permissions}`
+(the names, in the order of the table above). The `role` event carries all of it, and a new event, `role_order`
+(`{roles: [ids]}`, highest first), follows a change of order.
+
+Protocol 10, feature `role_permissions`. A Puddle of protocol 9 sees roles as before and ignores the new fields; it shows
+admin screens only for ranks, so a member with permissions needs a newer Puddle to use them (the routes work for them
+either way).
+
 ## What the database holds
 
 | Table | Columns |
@@ -462,7 +501,7 @@ again).
 | `bans` | `member`, `by` (a member id, or `pondctl`), `reason`, `ts_ms` |
 | `admin_log` | `id`, `by`, `action`, `target`, `detail`, `ts_ms` |
 | `events` (more) | `only_for`: a member id, for an event only they receive; `channel`: the channel it is about, given only to those who may see it |
-| `roles` | `id`, `name` (unique), `created_ms`: roles for channels |
+| `roles` | `id`, `name` (unique), `created_ms`: roles for channels; `permissions` (bits), `color` (`#rrggbb` or empty), `hoist`, `position` (the lower, the higher) |
 | `member_roles` | `member`, `role` |
 | `channel_roles` | `channel`, `role` |
 | `channels` (more) | `restricted`: 1 when only some roles (and operators and administrators) see it |
@@ -550,7 +589,7 @@ the protocol, not the version of either program.
 - Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
   it does not know, so an older Puddle keeps working with a newer Pond.
 - `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
-  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `voice`, `dms`, `dm_files`). A Puddle checks these before using an addition, rather than guessing from
+  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `role_permissions`, `voice`, `dms`, `dm_files`). A Puddle checks these before using an addition, rather than guessing from
   a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
 
 A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.
@@ -601,8 +640,8 @@ to report.
 
 ## Not yet
 
-- Permissions finer than seeing a channel: who may post where (a channel others may read but not write in), or a role
-  that may do some of what an administrator does. Roles have no colour or order yet, and `pondctl` can't manage them.
+- Permissions for one channel: who may post where (a channel others may read but not write in). `pondctl` can't manage
+  roles yet.
 - Editing, deleting and replying to messages, reactions, mentions, unread counts and typing indicators.
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.
