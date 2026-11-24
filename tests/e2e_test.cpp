@@ -122,7 +122,7 @@ int main()
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + k + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + k + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":14,\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":15,\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
 
     std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";
@@ -237,6 +237,52 @@ int main()
         CHECK(!has(ben.get(P + "/channels/" + ch + "/log"), "teh frogs"));
         CHECK(pond.ctl("member role Ben member --yes") == 0);
         CHECK(until([&] { return !has(ben.get(P), "\"role\":\"administrator\""); }));
+    }
+
+    /* ---- replies, reactions and mentions (protocol 15, docs/design.md, "Replies, reactions and mentions"): each Puddle keeps a
+     * reply's quote, the reactions and the mentions as the Pond says them, and counts the messages that mention its owner ---- */
+    {
+        auto id_of = [](const std::string &page, const std::string &text) {
+            long long id = 0;
+            size_t at = page.find(text);
+            if (at != std::string::npos)
+                sscanf(page.c_str() + page.rfind("{\"id\":", at), "{\"id\":%lld", &id);
+            return std::to_string(id);
+        };
+        const std::string ann_id = str_of(ann.get(P), "me"), ben_id = str_of(ben.get(P), "me");
+        CHECK(ann_id.size() == 52 && ben_id.size() == 52);
+        CHECK(ann.post(msgs + "/send", "{\"body\":\"who likes frogs?\"}") == 200);
+        CHECK(until([&] { return has(ben.get(msgs), "who likes frogs?"); }));
+        const std::string Q = id_of(ann.get(msgs), "who likes frogs?");
+        /* Ben replies, naming Ann: her Puddle keeps the quote and counts the mention */
+        CHECK(ben.post(msgs + "/send", "{\"body\":\"me! <@" + ann_id + ">\",\"reply_to\":" + Q + "}") == 200);
+        CHECK(ben.post(msgs + "/send", "{\"body\":\"x\",\"reply_to\":999999}", &out) == 400 && has(out, "bad_reply"));
+        CHECK(until([&] { return has(ann.get(msgs), "\"reply\":{\"id\":" + Q + ",\"author\":\"" + ann_id + "\",\"text\":\"who likes frogs?\"}"); }));
+        CHECK(has(ann.get(msgs), "\"mentions\":{\"members\":[\"" + ann_id + "\"]}"));
+        CHECK(until([&] { return has(ann.get(P), "\"mentions\":1"); }));
+        CHECK(!has(ben.get(P), "\"mentions\":1")); /* his own */
+        CHECK(ann.post(P + "/channels/" + ch + "/seen", "") == 204);
+        CHECK(has(ann.get(P), "\"mentions\":0") && !has(ann.get(P), "\"mentions\":1"));
+        /* Ann edits what was replied to: Ben's Puddle keeps the reply quoting it as it reads now */
+        CHECK(ann.post(msgs + "/" + Q + "/edit", "{\"body\":\"who loves frogs?\"}") == 200);
+        CHECK(until([&] { return has(ben.get(msgs), "\"text\":\"who loves frogs?\"}") && !has(ben.get(msgs), "likes"); }));
+        /* reactions: both Puddles keep them as they are now */
+        const std::string FROG = "\xF0\x9F\x90\xB8";
+        CHECK(ben.post(msgs + "/" + Q + "/react", "{\"emoji\":\"" + FROG + "\"}", &out) == 200 && has(out, "\"count\":1"));
+        CHECK(ben.post(msgs + "/" + Q + "/react", "{\"emoji\":\"frog\"}", &out) == 400);
+        CHECK(has(ben.get(msgs), "\"reactions\":[{\"emoji\":\"" + FROG + "\",\"count\":1,\"members\":[\"" + ben_id + "\"]}]"));
+        CHECK(until([&] { return has(ann.get(msgs), "\"emoji\":\"" + FROG + "\",\"count\":1"); }));
+        CHECK(ann.post(msgs + "/" + Q + "/react", "{\"emoji\":\"" + FROG + "\"}") == 200);
+        CHECK(until([&] { return has(ben.get(msgs), "\"count\":2,\"members\":[\"" + ben_id + "\",\"" + ann_id + "\"]"); }));
+        CHECK(ben.post(msgs + "/" + Q + "/unreact", "{\"emoji\":\"" + FROG + "\"}") == 200);
+        CHECK(until([&] { return has(ann.get(msgs), "\"count\":1,\"members\":[\"" + ann_id + "\"]"); }));
+        /* Ann deletes it: Ben's reply says only that it is gone */
+        CHECK(ann.post(msgs + "/" + Q + "/delete", "") == 204);
+        CHECK(until([&] { return has(ben.get(msgs), "\"reply\":{\"id\":" + Q + ",\"deleted\":true}") && !has(ben.get(msgs), "loves frogs"); }));
+        /* @everyone, only from whoever may: from Ben it tells nobody */
+        CHECK(ben.post(msgs + "/send", "{\"body\":\"@everyone look\"}") == 200);
+        CHECK(until([&] { return has(ann.get(msgs), "@everyone look"); }));
+        CHECK(has(ann.get(P), "\"mentions\":0"));
     }
 
     /* ---- direct messages through the Pond (docs/dms.md): sealed from one Puddle to the other, relayed, never kept ---- */
