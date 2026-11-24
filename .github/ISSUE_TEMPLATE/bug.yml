@@ -1,0 +1,20 @@
+name: Bug
+description: Something doesn't work as it should.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release or commit, and how you run it (desktop app, Docker, phone).

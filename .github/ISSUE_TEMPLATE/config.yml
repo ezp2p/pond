@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Wiki
+    url: https://www.ezp2p.org/wiki/
+    about: How to install, run and use each part of ezp2p.
