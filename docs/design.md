@@ -5,8 +5,8 @@ an invite link. It is not a Puddle. Its members are Puddles, and each one connec
 everywhere else. The routes are in `api/pond.yaml`.
 
 This first cut does text channels, and files in messages (see "Files"). Voice channels have a page of their own,
-[voice.md](voice.md). Editing and deleting messages, and moderation beyond removing and banning members, come later (see
-"Not yet" at the end).
+[voice.md](voice.md). Messages can be edited and deleted, with a log for moderators (see "Editing and deleting messages").
+Replies, reactions and the rest come later (see "Not yet" at the end).
 
 ## What runs
 
@@ -125,6 +125,7 @@ one held.
 | `GET /pond/v1/info` | The Pond, the member, the channels and the cursor (the same answer as joining) |
 | `GET /pond/v1/channels/{channel}/messages?before=<id>&limit=<n>` | History, newest first: 50 by default, 100 at most |
 | `POST /pond/v1/channels/{channel}/send` | `{text, nonce}`: posts a message and answers with it |
+| `POST /pond/v1/channels/{channel}/messages/{message}/edit`, `/delete` | Edit one's own message, delete one (see "Editing and deleting messages") |
 | `GET /pond/v1/events?after=<n>` | What happened after event `n`, waiting up to 25 seconds for something to happen |
 | `GET /pond/v1/members` | Everyone in the Pond, with the profile each one chose for it |
 | `POST /pond/v1/profile` | `{profile}`: change how the member appears here (`null` shows nothing) |
@@ -146,6 +147,8 @@ so a Puddle that lost an answer can safely send again.
 Every change the members need to hear about is a row in the `events` table, with an increasing number. The kinds are:
 
 - `message`: a new message, which is the message itself.
+- `message_edited`, `message_deleted`: a message as it reads now, or `{id, channel}` for one gone (protocol 14, "Editing and
+  deleting messages").
 - `channel`: a channel was made or changed, which is the channel itself.
 - `channel_deleted`: a channel was deleted (`{id}`).
 - `member`: someone joined or changed their profile, which is the member.
@@ -241,8 +244,9 @@ The database knows the rest: which chunks are here (`files.have`), and which mes
 
 Once an hour, files that no message carries and that were begun over a day ago are thrown away: uploads never sent,
 or never finished. A send holds a shared lock on each file it carries until it commits, so a file is never taken away
-under a message being posted. Files a message carries are kept for as long as the Pond is; messages cannot be deleted
-yet, and a deleted channel keeps its messages (and so their files) in the database.
+under a message being posted. Files a message carries are kept for as long as the Pond is: a deleted message, and a file an
+edit dropped, stay in the message log (and so on disk) until the message is purged, and a deleted channel keeps its messages
+(and so their files) in the database.
 
 ### Why it is built this way
 
@@ -273,7 +277,8 @@ first, and anything larger, or in older messages, when the owner asks. This is d
   limit. A total, with the oldest files let go first (their messages kept, saying the file is gone), would bound it.
 - **Who may send files.** Every member may. Once roles exist, this should be a permission, per channel.
 - **Kinds of file.** Anything is accepted. An admin might want only pictures, or to refuse some types.
-- **Deleting.** When messages can be deleted, a file goes with the last message carrying it, as in a Puddle.
+- **Deleting.** A deleted message keeps its files, for the message log; purging it lets them go at once, unless another
+  message or a page carries them ("Editing and deleting messages").
 - **Thumbnails.** A member scrolling a channel full of large photos fetches each whole. A smaller copy made by the
   sender (as the preview is now, but larger) would save bandwidth.
 - **Fetching through a link.** A file is only reachable through a signed request by a member. Sharing a file outside
@@ -472,6 +477,8 @@ some of what an administrator does, has a colour and a place in an order, and ca
 | `manage_events` | Add, change and delete events on events pages ("Pages") |
 | `manage_applications` | Read applications to join, and accept or decline them ("Entry form") |
 | `manage_shop` | Add, change and take off items on shop pages, and see every order ("Shop") |
+| `manage_messages` | Delete anyone's messages in a channel, and with `view_message_log` purge them (protocol 14, "Editing and deleting messages") |
+| `view_message_log` | Read a channel's message log: what messages said before they were edited or deleted, and their files (protocol 14) |
 
 | Question | Decision |
 |---|---|
@@ -517,7 +524,7 @@ those already in it.
 | Question | Decision |
 |---|---|
 | Everyone's, by default | `view_channels`, `send_messages`, `attach_files`, `connect`, `speak`, `video`: what members could always do. |
-| What a channel may say | Only the channel permissions: `view_channels` to `move_members` in the table above. Neither list may name one twice; a permission is allowed, denied or (left out) as the roles say. |
+| What a channel may say | Only the channel permissions: `view_channels` to `move_members` in the table above, and (protocol 14) `manage_messages` and `view_message_log`. Neither list may name one twice; a permission is allowed, denied or (left out) as the roles say. |
 | Who sets them | Everyone's: whoever may `manage_roles`, adding only what they may do themselves. A channel's: whoever may `manage_channels`; without a rank, only for everyone and roles below their own highest, allowing only what they may do. |
 | Roles for channels (protocol 9) | Kept as overrides: a channel "only some roles see" denies everyone `view_channels` and allows it those roles. Its `roles` is still written for older Puddles: the roles allowed to view it, when everyone is denied. `POST .../roles` works as before and changes only `view_channels`. |
 
@@ -635,6 +642,41 @@ Both only on someone below them, as kick is (`409 outranked`, `409 not_yourself`
 voice. In voice, someone's state (`voice` event, `/info`) gains `server_muted`, and `speak` and `video`: whether the
 channel lets them. A Puddle disconnected by a moderator doesn't join again by itself. Each goes in `admin_log`.
 
+## Editing and deleting messages
+
+Built 2026-11-24 (protocol 14, feature `message_edits`). A member edits and deletes their own messages, as on Discord, and
+moderators delete anyone's. What was said is not simply lost: the Pond keeps a **message log** of every message that was
+edited or deleted, with every text it had and its files, for those trusted to read it, until someone erases it for good.
+That is for disputes ("they said it, then edited it"), and for what must be handed on: someone posts something illegal
+(abuse images, say), a moderator takes it out of everyone's sight at once, gives the file to the authorities from the log, then
+erases it from the Pond.
+
+| Question | Decision |
+|---|---|
+| Who edits | Only the author, while they may see the channel and are not muted. An edit changes the words, and may drop some of the files; it never adds one (send another message). Empty words are allowed while a file is kept. Edits count against the rate for sends. |
+| Who deletes | The author, their own; anyone where they may `manage_messages`. Operators and administrators everywhere. No order of ranks or roles between them, as on Discord: whoever may manage messages in a channel deletes anyone's there. A deletion by someone else goes in `admin_log`. |
+| What members see of an edit | The message as it reads now, with `edited` (when, ms), in its place. Not the earlier text. |
+| What members see of a deletion | Nothing: it is gone from the channel, its history and its events, and its files are no longer served to them. |
+| What the Pond keeps | Every earlier text of an edited message (`message_versions`: the text, when it was written, when it was replaced), a file an edit dropped (marked `removed_ms`), and a deleted message whole (`deleted_ms`, `deleted_by`), with its files on disk. No time limit: until it is purged. |
+| Who reads the log | Whoever may `view_message_log` in that channel (a channel permission, so a channel's overrides can give or take it). They may fetch the log's files too, to save them. |
+| Purging | Whoever may both `manage_messages` and `view_message_log` there, of a deleted message only (`409 not_deleted`): the message, its versions and its file records go, and each file is erased from disk at once unless another message or a page carries it. In `admin_log`. Also `pondctl message purge`, which deletes it first. |
+| Events | `message_edited` (the message as it reads now) and `message_deleted` (`{id, channel}`), about the channel, so only those who see it get them. The events that said a message before are rewritten: after an edit they say it as it reads now; after a deletion they become `message_deleted`. So a Puddle catching up within the 7 days never reads what was taken back. (`events.message` says which message an event is about.) |
+
+| Route | Does |
+|---|---|
+| `POST /pond/v1/channels/{channel}/messages/{message}/edit` | `{text?, files?}`: `files`, the ids it keeps. Answers the message as it now reads. `404 no_message` (not there, deleted, or not theirs), `400 bad_text`, `400 bad_file`, `409 muted` |
+| `POST /pond/v1/channels/{channel}/messages/{message}/delete` | `204`. `404 no_message`, `409 no_permission` |
+| `GET /pond/v1/channels/{channel}/log?before=&limit=` | The channel's edited and deleted messages, newest first: `{messages: [...]}` |
+| `GET /pond/v1/channels/{channel}/messages/{message}/versions` | One message, edited or not, as the log gives it |
+| `POST /pond/v1/channels/{channel}/messages/{message}/purge` | `204`. `409 not_deleted` |
+
+A message in the log is a message with `deleted` (`{ts, by}`, `by` a member's id or `pondctl`) when it is deleted, `versions`
+(`[{text, ts, until, files: [ids]}]`, oldest first: what it said before, and the files it carried then), and every file it
+carried, one an edit dropped with `removed` (ms). Without the permissions the log's routes answer `404 no_channel`.
+
+Not done: a time after which the log forgets on its own (an operator's choice, later), editing someone else's message, and
+an edit history members can see (Discord shows none either).
+
 ## What the database holds
 
 | Table | Columns |
@@ -644,13 +686,14 @@ channel lets them. A Puddle disconnected by a moderator doesn't join again by it
 | `channels` | `id`, `name`, `topic`, `position`, `created_ms`, `deleted`, `kind` (`text` or `voice`) |
 | `members` | `id` (user id), `sign_pub`, `kid`, `chain`, `profile` (JSON), `joined_ms`, `left_ms` |
 | `invites` | `token`, `max_uses` (NULL = unlimited), `uses`, `expires_ms` (NULL = never), `created_ms`, `revoked` |
-| `messages` | `id`, `channel`, `author`, `text`, `nonce`, `ts_ms`; one index on `(channel, id)`, and a unique one on `(author, nonce)` |
+| `messages` | `id`, `channel`, `author`, `text`, `nonce`, `ts_ms`; one index on `(channel, id)`, and a unique one on `(author, nonce)`; `edited_ms`, `deleted_ms`, `deleted_by` (protocol 14) |
+| `message_versions` | `id`, `message`, `text`, `ts_ms` (when it was written), `until_ms` (when an edit replaced it): the message log |
 | `events` | `id`, `kind`, `data` (JSON), `ts_ms` |
 | `members` (more) | `role`: `operator`, `administrator` or `member`; `muted_until`: NULL, 0 (until unmuted) or when (ms) |
 | `role_offers` | `id`, `member`, `role`, `created_ms`; open until answered or 7 days old |
 | `bans` | `member`, `by` (a member id, or `pondctl`), `reason`, `ts_ms` |
 | `admin_log` | `id`, `by`, `action`, `target`, `detail`, `ts_ms` |
-| `events` (more) | `only_for`: a member id, for an event only they receive; `channel`: the channel it is about, given only to those who may see it |
+| `events` (more) | `only_for`: a member id, for an event only they receive; `channel`: the channel it is about, given only to those who may see it; `message`: the message it is about, so an edit or a deletion can rewrite it |
 | `roles` | `id`, `name` (unique), `created_ms`: roles for channels; `permissions` (bits), `color` (`#rrggbb` or empty), `hoist`, `position` (the lower, the higher) |
 | `member_roles` | `member`, `role` |
 | `channel_roles` | `channel`, `role` |
@@ -658,7 +701,7 @@ channel lets them. A Puddle disconnected by a moderator doesn't join again by it
 | `pages` | `id`, `title`, `kind`, `body`, `position`, `created_ms`, `updated_ms`, `updated_by` |
 | `page_files` | `page`, `position`, `file`, `name`, `mime`, `size`, `w`, `h` |
 | `files` | `id`, `size`, `chunks` (the hashes, 32 bytes each), `have` (a `0` or `1` per chunk), `whole`, `uploader`, `created_ms` |
-| `message_files` | `message`, `position`, `file`, and what the sender said of it: `name`, `mime`, `size`, `w`, `h`, `duration_ms`, `preview` |
+| `message_files` | `message`, `position`, `file`, and what the sender said of it: `name`, `mime`, `size`, `w`, `h`, `duration_ms`, `preview`; `removed_ms` when an edit dropped it |
 
 Channel names are what a Discord channel name is: 1 to 32 characters of lowercase letters, digits and `-`. Each one
 is unique among channels that have not been deleted. A deleted channel keeps its messages in the database, but nothing
@@ -686,6 +729,9 @@ pondctl member ban <member> [--reason <text>]
 pondctl member unban <user id>
 pondctl member bans
 pondctl log [N]                                 the last N admin actions, from the app and from pondctl
+pondctl message show <id>                       a message, with every text it had and where its files are on disk
+pondctl message delete <id>                     out of the channel, into the message log
+pondctl message purge <id> [--yes]              erased for good, with its files that nothing else carries (asks first)
 pondctl files                                   the largest file members may send, and the room files take
 pondctl files max-size <size>|off               25M, 1G, 500K...; off stops members sending files
 pondctl info                                    the Pond's id, address, certificate fingerprint and counts
@@ -741,7 +787,7 @@ the protocol, not the version of either program.
 - Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
   it does not know, so an older Puddle keeps working with a newer Pond.
 - `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
-  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `role_permissions`, `pages`, `voice`, `dms`, `dm_files`). A Puddle checks these before using an addition, rather than guessing from
+  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `role_permissions`, `pages`, `voice`, `dms`, `dm_files`, `message_edits`). A Puddle checks these before using an addition, rather than guessing from
   a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
 
 A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.
@@ -796,7 +842,8 @@ to report.
 - Permissions for one member alone in a channel (Discord's member overrides): only everyone and roles today.
 - Stripe webhooks, refunds from the app, and subscriptions: the shop takes one-off payments and finds them by asking.
 - Zero-decimal currencies (yen, won) are shown by the apps as if they had cents.
-- Editing, deleting and replying to messages, reactions, mentions, unread counts and typing indicators.
+- Replying to messages, reactions, mentions, unread counts and typing indicators.
+- The message log forgetting by itself after a time, and `pondctl` reading the log (it can show, delete and purge one message).
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.
 - Redis, and several `pondd` processes. The client for Redis is already built in; nothing uses it yet.
