@@ -1,0 +1,28 @@
+name: Task
+description: A piece of work someone can pick up and finish.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: What to build or change, and why. Name the files, docs or routes it touches if you know them.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: How anyone can tell it is finished, such as a test that passes or something the app now does.
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Source
+      description: Links to the design doc, roadmap step or protocol part this comes from.
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      options: ["S: a day or so", "M: a few days", "L: a week or more"]
