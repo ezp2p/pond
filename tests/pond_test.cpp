@@ -258,7 +258,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 13 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 14 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -968,6 +968,114 @@ int main()
         CHECK(pond.call(&lee, "GET", "/pond/v1/admin/invites").status == 200);
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/everyone",
                         "{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\"]}").status == 204);
+
+        /* ---- editing and deleting messages, and the message log (protocol 14, docs/design.md, "Editing and deleting messages") ---- */
+        {
+            a = pond.call(&kim, "GET", "/pond/v1/info");
+            CHECK(has(a.body, "\"protocol\":14") && has(a.body, "\"message_edits\""));
+            const int64_t gen = channel_id(kim, "general");
+            const std::string GC = "/pond/v1/channels/" + std::to_string(gen);
+            /* a small file, sent whole, for a message to carry */
+            const std::string fbytes = "the frog's own picture";
+            unsigned char fh[32];
+            sha256(fbytes.data(), fbytes.size(), fh);
+            const std::string fhashes((const char *)fh, 32), fid = sha256_hex(fhashes), FF = "/pond/v1/files/" + fid;
+            CHECK(pond.call(&kim, "POST", FF, "{\"size\":" + std::to_string(fbytes.size()) + ",\"chunks\":\"" + base64(fh, 32) + "\"}").status == 200);
+            CHECK(pond.call(&kim, "POST", FF + "/chunks/0", fbytes).status == 204);
+            const int64_t e0 = num_of(pond.call(&lee, "GET", "/pond/v1/info").body, "cursor");
+            a = pond.call(&kim, "POST", GC + "/send", "{\"text\":\"frist\",\"files\":[{\"id\":\"" + fid + "\",\"name\":\"frog.png\",\"mime\":\"image/png\"}]}");
+            CHECK(a.status == 200);
+            const std::string M = std::to_string(num_of(a.body, "id")), GM = GC + "/messages/" + M;
+            CHECK(pond.call(&lee, "GET", FF + "/chunks").status == 200); /* a message carries it: every member may fetch it */
+
+            /* only its author edits it; the text is cleaned as a send's is */
+            CHECK(pond.call(&lee, "POST", GM + "/edit", "{\"text\":\"mine now\"}").status == 404);
+            CHECK(pond.call(&dan, "POST", GM + "/edit", "{\"text\":\"mine now\"}").status == 404); /* not even a rank */
+            CHECK(pond.call(&kim, "POST", GM + "/edit", "{\"text\":\"" + std::string(4001, 'x') + "\"}").status == 400);
+            CHECK(pond.call(&kim, "POST", GM + "/edit", "{\"text\":42}").status == 400);
+            CHECK(pond.call(&kim, "POST", GC + "/messages/999999/edit", "{\"text\":\"x\"}").status == 404);
+            CHECK(pond.call(&kim, "POST", "/pond/v1/channels/" + std::to_string(news) + "/messages/" + M + "/edit", "{\"text\":\"x\"}").status == 404);
+            a = pond.call(&kim, "POST", GM + "/edit", "{\"text\":\"  first  \"}");
+            CHECK(a.status == 200 && has(a.body, "\"text\":\"first\"") && has(a.body, "\"edited\":") && has(a.body, "frog.png"));
+            CHECK(pond.call(&kim, "POST", GM + "/edit", "{\"text\":\"first\"}").body == a.body); /* the same: nothing changes */
+            a = pond.call(&lee, "GET", GC + "/messages?limit=5");
+            CHECK(has(a.body, "\"text\":\"first\"") && has(a.body, "\"edited\":") && !has(a.body, "frist"));
+            /* the events: an edit, and what was said of it before now says it as it reads */
+            a = pond.call(&lee, "GET", "/pond/v1/events?after=" + std::to_string(e0));
+            CHECK(has(a.body, "\"kind\":\"message\"") && has(a.body, "\"kind\":\"message_edited\"") && !has(a.body, "frist"));
+            const int64_t e1 = num_of(a.body, "cursor");
+
+            /* dropping its file: the text may then not be empty, and an edit never adds one */
+            CHECK(pond.call(&kim, "POST", GM + "/edit", "{\"text\":\"\",\"files\":[]}").status == 400);
+            CHECK(pond.call(&kim, "POST", GM + "/edit", "{\"files\":[\"" + std::string(64, 'b') + "\"]}").status == 400);
+            CHECK(pond.call(&kim, "POST", GM + "/edit", "{\"files\":\"no\"}").status == 400);
+            a = pond.call(&kim, "POST", GM + "/edit", "{\"text\":\"first, no frog\",\"files\":[]}");
+            CHECK(a.status == 200 && !has(a.body, "frog.png") && has(a.body, "first, no frog"));
+            CHECK(pond.call(&lee, "GET", FF + "/chunks").status == 404); /* nothing live carries it now */
+            CHECK(pond.call(&kim, "GET", FF + "/chunks").status == 200);  /* its sender still may */
+
+            /* the log: for whoever may view it there, with every text it had and the files then */
+            CHECK(pond.call(&lee, "GET", GC + "/log").status == 404);
+            CHECK(pond.call(&lee, "GET", GM + "/versions").status == 404);
+            const std::string MOD = made(dan, "{\"name\":\"Moderators\",\"permissions\":[\"manage_messages\",\"view_message_log\"]}");
+            CHECK(has(pond.call(&lee, "GET", "/pond/v1/info").body, "\"manage_messages\",\"view_message_log\"]"));
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + lee.id + "/roles", "{\"roles\":[" + MOD + "]}").status == 204);
+            a = pond.call(&lee, "GET", GM + "/versions");
+            CHECK(a.status == 200 && has(a.body, "\"text\":\"first, no frog\""));
+            {
+                Json::Value v = parse(a.body);
+                CHECK(v["versions"].size() == 2 && v["versions"][0]["text"].asString() == "frist" && v["versions"][1]["text"].asString() == "first");
+                CHECK(v["versions"][0]["files"].size() == 1 && v["versions"][1]["files"].size() == 1 && v["versions"][0]["files"][0].asString() == fid);
+                CHECK(v["files"].size() == 1 && v["files"][0].isMember("removed") && !v.isMember("deleted"));
+                CHECK(v["versions"][0]["until"].asInt64() == v["versions"][1]["ts"].asInt64() && v["versions"][1]["until"].asInt64() == v["edited"].asInt64());
+            }
+            CHECK(pond.call(&lee, "GET", FF + "/chunks").status == 200); /* the log's files, to those who read it */
+            a = pond.call(&lee, "GET", GC + "/log");
+            CHECK(a.status == 200 && has(a.body, "frist"));
+            /* a channel that denies it to their roles: not there */
+            CHECK(pond.call(&dan, "POST", NEWS, "{\"overrides\":[{\"role\":" + MOD + ",\"allow\":[],\"deny\":[\"view_message_log\"]}]}").status == 204);
+            CHECK(channel_id(lee, "news") == news && pond.call(&lee, "GET", "/pond/v1/channels/" + std::to_string(news) + "/log").status == 404);
+            CHECK(pond.call(&dan, "GET", "/pond/v1/channels/" + std::to_string(news) + "/log").status == 200); /* a rank may everywhere */
+
+            /* deleting: one's own, or anyone's where one may manage messages; gone for every member, kept in the log */
+            a = pond.call(&lee, "POST", GC + "/send", "{\"text\":\"lee was here\"}");
+            const std::string L = std::to_string(num_of(a.body, "id")), GL = GC + "/messages/" + L;
+            a = pond.call(&kim, "POST", GL + "/delete");
+            CHECK(a.status == 409 && has(a.body, "no_permission")); /* not his, and he may not */
+            CHECK(pond.call(&lee, "POST", GL + "/delete").status == 204); /* her own */
+            CHECK(pond.call(&lee, "POST", GL + "/delete").status == 404); /* once */
+            CHECK(pond.call(&lee, "POST", GL + "/edit", "{\"text\":\"back\"}").status == 404);
+            CHECK(pond.call(&lee, "POST", GM + "/delete").status == 204); /* Kim's, as a moderator */
+            a = pond.call(&kim, "GET", GC + "/messages?limit=10");
+            CHECK(!has(a.body, "lee was here") && !has(a.body, "first, no frog"));
+            a = pond.call(&kim, "GET", "/pond/v1/events?after=" + std::to_string(e1));
+            CHECK(has(a.body, "\"kind\":\"message_deleted\",\"data\":{\"id\":" + M + ",\"channel\":" + std::to_string(gen) + "}") &&
+                  !has(a.body, "lee was here") && !has(a.body, "no frog")); /* what was said of them before is taken back too */
+            a = pond.call(&kim, "GET", "/pond/v1/events?after=" + std::to_string(e0));
+            CHECK(!has(a.body, "\"kind\":\"message\",\"data\":{\"id\":" + M) && !has(a.body, "first"));
+            CHECK(pond.call(&kim, "GET", FF + "/chunks").status == 200); /* still his own upload */
+            CHECK(pond.ctl("log", &out) == 0 && has(out, "message_delete"));
+            a = pond.call(&lee, "GET", GC + "/log");
+            CHECK(has(a.body, "lee was here") && has(a.body, "\"deleted\":{\"ts\":") && has(a.body, "\"by\":\"" + lee.id + "\""));
+
+            /* purging: only a deleted message, by whoever may both manage messages and view the log there */
+            a = pond.call(&kim, "POST", GC + "/send", "{\"text\":\"still here\"}");
+            const std::string K = std::to_string(num_of(a.body, "id"));
+            CHECK(has(pond.call(&lee, "POST", GC + "/messages/" + K + "/purge").body, "not_deleted"));
+            CHECK(pond.call(&kim, "POST", GM + "/purge").status == 404);
+            CHECK(pond.ctl("message show " + M, &out) == 0 && has(out, "frist") && has(out, "frog.png") && has(out, "dropped by an edit"));
+            CHECK(pond.call(&lee, "POST", GM + "/purge").status == 204);
+            CHECK(pond.call(&lee, "GET", GM + "/versions").status == 404);
+            CHECK(pond.call(&kim, "GET", FF + "/chunks").status == 404); /* the file went with it: nothing else carried it */
+            CHECK(access((pond.dir + "/files/" + fid).c_str(), F_OK) != 0);
+            CHECK(pond.ctl("message show " + M, &out) != 0);
+            CHECK(pond.ctl("message purge " + K + " --yes") == 0); /* pondctl deletes it first */
+            CHECK(!has(pond.call(&kim, "GET", GC + "/messages?limit=10").body, "still here"));
+            CHECK(pond.ctl("log", &out) == 0 && has(out, "message_purge"));
+            CHECK(pond.call(&dan, "POST", NEWS, "{\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"view_channels\"]},{\"role\":" + W +
+                                                    ",\"allow\":[\"view_channels\"],\"deny\":[]}]}").status == 204); /* as it was */
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + lee.id + "/roles", "{\"roles\":[]}").status == 204);
+        }
 
         /* ---- a page for some roles only ---- */
         a = pond.call(&dan, "POST", PG + "create", "{\"title\":\"Writers' room\",\"roles\":[" + W + "]}");

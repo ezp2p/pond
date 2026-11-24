@@ -177,6 +177,8 @@ Task<bool> Service::may_read(std::string member, std::string id)
     Result r = co_await db_->execSqlCoro(
         "SELECT 1 FROM files f WHERE f.id = ? AND f.whole = 1 AND (f.uploader = ? OR EXISTS (SELECT 1 FROM message_files mf"
         " JOIN messages m ON m.id = mf.message JOIN channels c ON c.id = m.channel WHERE mf.file = f.id AND c.deleted = 0"
+        /* a message that is still there, and still carries it (docs/design.md, "Editing and deleting messages") */
+        " AND m.deleted_ms IS NULL AND mf.removed_ms IS NULL"
         /* in a channel they may see (docs/design.md, "Roles for channels") */
         " AND (c.restricted = 0 OR EXISTS (SELECT 1 FROM channel_roles cr JOIN member_roles mr ON mr.role = cr.role"
         " WHERE cr.channel = c.id AND mr.member = ?) OR EXISTS (SELECT 1 FROM members a WHERE a.id = ? AND a.left_ms IS NULL"
@@ -184,7 +186,18 @@ Task<bool> Service::may_read(std::string member, std::string id)
         /* or a page carries it (docs/design.md, "Pages"): every member sees every page */
         " OR EXISTS (SELECT 1 FROM page_files pf WHERE pf.file = f.id))",
         id, member, member, member);
-    co_return !r.empty();
+    if (!r.empty())
+        co_return true;
+    /* one a deleted message carried, or an edit dropped: to those who may view the message log in its channel */
+    Result logged = co_await db_->execSqlCoro("SELECT DISTINCT m.channel FROM message_files mf JOIN messages m ON m.id = mf.message"
+                                              " JOIN files f ON f.id = mf.file WHERE mf.file = ? AND f.whole = 1",
+                                              id);
+    for (const auto &row : logged) {
+        const int64_t may = co_await permissions_in(member, num(row[0]));
+        if ((may & VIEW_CHANNELS) && (may & VIEW_MESSAGE_LOG))
+            co_return true;
+    }
+    co_return false;
 }
 
 Task<Answer> Service::file_chunks(std::string member, std::string id)

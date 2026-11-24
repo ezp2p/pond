@@ -114,6 +114,7 @@ add_library(pond_lib STATIC
     src/shop.cpp
     src/applications.cpp
   src/pond.cpp
+  src/messages.cpp
   src/reqsig.cpp
   src/routes.cpp
   src/text.cpp

@@ -48,6 +48,9 @@ static const char USAGE[] =
     "  member unban <user id>\n"
     "  member bans\n"
     "  log [N]                                                the last N admin actions (20)\n"
+    "  message show <id>                    a message, with every text it had, and where its files are\n"
+    "  message delete <id>                  take it out of the channel; it stays in the message log\n"
+    "  message purge <id> [--yes]           erase it for good, and its files that nothing else carries\n"
     "    <member> is a user id, or part of a member's display name\n"
     "  files                                the largest file members may send, and the room files take\n"
     "  files max-size <size>|off            e.g. 25M, 1G, 500K; off stops members sending files\n"
@@ -449,6 +452,32 @@ static int run(const Config &cfg, Service &svc, const DbPtr &db, const PondKey &
                 return done(o);
             }
             return done(sync_wait(svc.ban(w.id, reason, "pondctl")));
+        }
+        return usage();
+    }
+    if (cmd == "message") {
+        /* editing and deleting messages (docs/design.md, "Editing and deleting messages"): the id is the one in the app's
+         * message log, or in `message show` */
+        if (!args.empty())
+            args.erase(args.begin());
+        const bool flag_yes = std::erase(args, std::string("--yes")) > 0;
+        const int64_t id = args.size() == 1 ? strtoll(args[0].c_str(), nullptr, 10) : 0;
+        if (id <= 0)
+            return usage();
+        if (sub == "show") {
+            auto out = std::make_shared<std::string>();
+            Outcome o = sync_wait(svc.message_show(id, out));
+            if (!o.empty())
+                return die(o);
+            fputs(out->c_str(), stdout);
+            return 0;
+        }
+        if (sub == "delete")
+            return done(sync_wait(svc.message_delete_ctl(id)));
+        if (sub == "purge") {
+            if (!flag_yes && !confirm("Erase message " + args[0] + " and its files for good? Nothing can bring them back."))
+                return die("nothing changed");
+            return done(sync_wait(svc.message_purge_ctl(id)));
         }
         return usage();
     }

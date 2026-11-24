@@ -42,7 +42,7 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 13; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 14; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
                              * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
                              * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures");
@@ -59,9 +59,13 @@ constexpr int PROTOCOL = 13; /* 2: roles (docs/design.md, "Roles"); 3: receipts,
                              * 13: permissions for everyone and for each channel ("Permissions"): `everyone` in /info, a channel's
                              *    `overrides`, the permissions view_channels to manage_shop; pages for some roles, their media and their
                              *    kinds `roles`, `events`, `form` and `shop` ("Pages"); applying to join ("Entry form"); the shop and its
-                             *    payments ("Shop"); and moderating voice ("Voice moderation") */
-constexpr std::array<const char *, 14> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles", "role_permissions", "pages",
-                                                "role_colors", "overrides", "page_kinds", "applications", "shop", "voice_moderation"}; /* and "voice", when voice is on */
+                             *    payments ("Shop"); and moderating voice ("Voice moderation");
+                             * 14: editing and deleting messages, and the message log ("Editing and deleting messages"): a message's
+                             *    `edited`, the events `message_edited` and `message_deleted`, the permissions manage_messages and
+                             *    view_message_log, and the routes under /pond/v1/channels/{channel}/messages/{message} and .../log */
+constexpr std::array<const char *, 15> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles", "role_permissions", "pages",
+                                                "role_colors", "overrides", "page_kinds", "applications", "shop", "voice_moderation",
+                                                "message_edits"}; /* and "voice", when voice is on */
 
 /* Direct messages (docs/dms.md, dms.cpp): relayed, never stored. */
 constexpr size_t DM_SEALED_MAX = 128 * 1024;           /* a sealed letter, as base64: a message with ten files' previews fits */
@@ -94,18 +98,22 @@ enum Permission : int64_t {
     MANAGE_PAGES = 128,
     /* protocol 13: what everyone may do unless a channel says otherwise (docs/design.md, "Permissions") */
     VIEW_CHANNELS = 256, SEND_MESSAGES = 512, ATTACH_FILES = 1024, CONNECT = 2048, SPEAK = 4096, VIDEO = 8192,
-    MOVE_MEMBERS = 16384, VOICE_MUTE = 32768, MANAGE_EVENTS = 65536, MANAGE_APPLICATIONS = 131072, MANAGE_SHOP = 262144
+    MOVE_MEMBERS = 16384, VOICE_MUTE = 32768, MANAGE_EVENTS = 65536, MANAGE_APPLICATIONS = 131072, MANAGE_SHOP = 262144,
+    /* protocol 14: deleting others' messages, and reading what messages said before they were edited or deleted
+     * (docs/design.md, "Editing and deleting messages") */
+    MANAGE_MESSAGES = 524288, VIEW_MESSAGE_LOG = 1048576
 };
-constexpr int64_t ALL_PERMISSIONS = (1 << 19) - 1;
+constexpr int64_t ALL_PERMISSIONS = (1 << 21) - 1;
 /* those a channel may allow or deny a role (its `overrides`) */
-constexpr int64_t CHANNEL_PERMISSIONS = VIEW_CHANNELS | SEND_MESSAGES | ATTACH_FILES | CONNECT | SPEAK | VIDEO | MOVE_MEMBERS | VOICE_MUTE;
+constexpr int64_t CHANNEL_PERMISSIONS = VIEW_CHANNELS | SEND_MESSAGES | ATTACH_FILES | CONNECT | SPEAK | VIDEO | MOVE_MEMBERS | VOICE_MUTE |
+                                        MANAGE_MESSAGES | VIEW_MESSAGE_LOG;
 /* what everyone has in a Pond that has said nothing else: what members could always do */
 constexpr int64_t EVERYONE_DEFAULT = VIEW_CHANNELS | SEND_MESSAGES | ATTACH_FILES | CONNECT | SPEAK | VIDEO;
 struct PermissionName {
     int64_t bit;
     const char *name;
 };
-constexpr std::array<PermissionName, 19> PERMISSIONS{{{MANAGE_POND, "manage_pond"}, {MANAGE_CHANNELS, "manage_channels"},
+constexpr std::array<PermissionName, 21> PERMISSIONS{{{MANAGE_POND, "manage_pond"}, {MANAGE_CHANNELS, "manage_channels"},
                                                       {MANAGE_ROLES, "manage_roles"}, {MANAGE_INVITES, "manage_invites"},
                                                       {KICK_MEMBERS, "kick_members"}, {BAN_MEMBERS, "ban_members"},
                                                       {MUTE_MEMBERS, "mute_members"}, {MANAGE_PAGES, "manage_pages"},
@@ -113,7 +121,8 @@ constexpr std::array<PermissionName, 19> PERMISSIONS{{{MANAGE_POND, "manage_pond
                                                       {ATTACH_FILES, "attach_files"}, {CONNECT, "connect"}, {SPEAK, "speak"},
                                                       {VIDEO, "video"}, {MOVE_MEMBERS, "move_members"}, {VOICE_MUTE, "voice_mute"},
                                                       {MANAGE_EVENTS, "manage_events"}, {MANAGE_APPLICATIONS, "manage_applications"},
-                                                      {MANAGE_SHOP, "manage_shop"}}};
+                                                      {MANAGE_SHOP, "manage_shop"}, {MANAGE_MESSAGES, "manage_messages"},
+                                                      {VIEW_MESSAGE_LOG, "view_message_log"}}};
 /* A permission's bit from its name; 0 for none */
 int64_t permission_bit(const std::string &name);
 /* What a channel allows and denies one role (0: everyone) */
@@ -266,6 +275,19 @@ public:
     Task<Answer> info(std::string member);
     Task<Answer> history(std::string member, int64_t channel, int64_t before, int limit);
     Task<Answer> send(std::string member, int64_t channel, std::string text, std::string nonce, std::vector<FileRef> files = {});
+    /* Editing and deleting messages (messages.cpp; docs/design.md, "Editing and deleting messages"). Its author changes its text
+     * and drops some of its files (`keep`: the ids of those it keeps, in its order); its author, or whoever may manage messages in
+     * its channel, deletes it. */
+    Task<Answer> message_edit(std::string member, int64_t channel, int64_t message, std::optional<std::string> text,
+                              std::optional<std::vector<std::string>> keep);
+    Task<Answer> message_delete(std::string member, int64_t channel, int64_t message);
+    /* The message log, for whoever may view it in the channel: its messages that were edited or deleted, newest first, each with
+     * every text it had; or one message, edited or not. */
+    Task<Answer> message_log(std::string member, int64_t channel, int64_t before, int limit);
+    Task<Answer> message_versions(std::string member, int64_t channel, int64_t message);
+    /* Erase a deleted message for good, with its versions, and its files that nothing else carries: for whoever may both manage
+     * messages and view the log there. */
+    Task<Answer> message_purge(std::string member, int64_t channel, int64_t message);
     /* Answers when there is something after `after`, `wait_ms` pass, or stop(). */
     Task<Answer> events(int64_t after, std::string member);
     Task<Answer> members();
@@ -426,6 +448,11 @@ public:
     Task<Outcome> set_icon(std::optional<std::string> hash, std::string which = "icon");
     /* `bytes` 0 turns files off. */
     Task<Outcome> set_files_max(int64_t bytes);
+    /* pondctl message show|delete|purge: a message, with every text it had and where its files are on disk; deleted as a
+     * moderator would; or erased for good (deleted first if it was not) */
+    Task<Outcome> message_show(int64_t message, std::shared_ptr<std::string> out);
+    Task<Outcome> message_delete_ctl(int64_t message);
+    Task<Outcome> message_purge_ctl(int64_t message);
     /* How many files are kept, and the bytes they take. */
     Task<std::pair<int64_t, int64_t>> files_usage();
 
@@ -498,7 +525,13 @@ private:
     Task<Answer> enter(Chain chain, std::string invite, std::string profile);
     Task<Answer> enter_once(Chain chain, std::string invite, std::string profile); /* status 0: met another join, try again */
     /* `channel`: the event is about that channel, and only those who may see it are given it */
-    Task<int64_t> add_event(TxPtr tx, const char *kind, std::string data, std::string only_for = "", int64_t channel = 0);
+    Task<int64_t> add_event(TxPtr tx, const char *kind, std::string data, std::string only_for = "", int64_t channel = 0,
+                            int64_t message = 0);
+    /* messages.cpp: delete `message` (by `by`, a member or "pondctl"), rewriting its earlier events; erase it */
+    Task<Answer> delete_message(std::string by, int64_t message);
+    Task<Answer> purge_message(std::string by, int64_t message);
+    /* a message with its versions, as the log gives it: "" if there is none */
+    Task<std::string> logged_json(DbPtr db, drogon::orm::Result r);
     Task<std::string> offer_json(std::string member);
     /* the entry form, if the Pond asks one of those joining: its JSON ({intro, questions}), or "" */
     Task<std::string> entry_form();

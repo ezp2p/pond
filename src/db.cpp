@@ -141,6 +141,17 @@ static const char *const STEPS[][16] = {
         " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         nullptr,
     },
+    {
+        /* editing and deleting messages (docs/design.md, "Editing and deleting messages"): a deleted message stays, for the
+         * message log, until it is purged; each earlier text of an edited one is a version; a file an edit dropped stays with
+         * the message, marked; and the events about a message say which, so they can be rewritten when it changes */
+        "ALTER TABLE messages ADD COLUMN edited_ms BIGINT NULL, ADD COLUMN deleted_ms BIGINT NULL, ADD COLUMN deleted_by VARCHAR(52) NULL",
+        "ALTER TABLE message_files ADD COLUMN removed_ms BIGINT NULL",
+        "CREATE TABLE message_versions (id BIGINT AUTO_INCREMENT PRIMARY KEY, message BIGINT NOT NULL, text TEXT NOT NULL,"
+        " ts_ms BIGINT NOT NULL, until_ms BIGINT NOT NULL, KEY (message)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "ALTER TABLE events ADD COLUMN message BIGINT NULL, ADD KEY (message)",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run
