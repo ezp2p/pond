@@ -1,0 +1,17 @@
+name: PR source
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, reopened, synchronize, edited]
+jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only dev or hotpatch/* may merge into master
+        env:
+          HEAD: ${{ github.head_ref }}
+        run: |
+          case "$HEAD" in
+            dev|hotpatch/*) echo "OK: $HEAD -> master" ;;
+            *) echo "::error::Pull requests into master must come from dev or hotpatch/*, not '$HEAD'."; exit 1 ;;
+          esac
