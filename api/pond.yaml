@@ -112,13 +112,17 @@ paths:
                     Files the message carries (docs/design.md, "Files"), each one whole on the Pond already (sent with
                     /pond/v1/files/{file}). The size is the Pond's own; anything else in an entry is ignored.
                   items: { $ref: "#/components/schemas/FileRef" }
+                reply_to:
+                  type: integer
+                  minimum: 1
+                  description: 'Protocol 15 (feature `replies`): the message in this channel it answers, not deleted (docs/design.md, "Replies, reactions and mentions")'
       responses:
         "200":
           description: The message as posted
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Message" }
-        "400": { description: "`bad_text`, `bad_file` (a name with a folder in it, a preview that is not base64...), `too_many_files`" }
+        "400": { description: "`bad_text`, `bad_file` (a name with a folder in it, a preview that is not base64...), `too_many_files`, `bad_reply` (protocol 15: no such message here)" }
         "404": { description: "No such channel (`no_channel`)" }
         "409": { description: "`no_file`, with `file`: one of the files is not here whole; `files_off`: the Pond takes no files; `muted`, with `until` (ms, or null until unmuted): an operator or administrator muted the sender" }
         "429": { description: "Too many (`slow_down`)" }
@@ -168,6 +172,61 @@ paths:
         "204": { description: Deleted }
         "404": { description: "`no_channel`, `no_message` (none here, or deleted already)" }
         "409": { description: "`no_permission`: someone else's, and the member may not manage messages here" }
+  /pond/v1/channels/{channel}/messages/{message}/react:
+    post:
+      summary: React to a message (protocol 15, feature `reactions`; docs/design.md, "Replies, reactions and mentions")
+      description: |
+        For whoever may `add_reactions` in the channel. Each member once per emoji; reacting again changes nothing. At most 20
+        different emoji on a message; one already there may always be added. Every member hears of it in a `message_reactions`
+        event, and the earlier events about the message are rewritten to say its reactions as they are now. Counts against the
+        rate for sends; refused while muted.
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+        - { name: message, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [emoji]
+              properties:
+                emoji: { type: string, description: "1 to 32 bytes of UTF-8 with no ASCII and no control characters" }
+      responses:
+        "200":
+          description: The message's reactions now
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageReactions" }
+        "400": { description: "`bad_emoji`" }
+        "404": { description: "`no_channel`, `no_message` (none here, or deleted)" }
+        "409": { description: "`no_permission` (may not add reactions here), `too_many_reactions`, `muted` with `until`" }
+        "429": { description: "`slow_down`" }
+  /pond/v1/channels/{channel}/messages/{message}/unreact:
+    post:
+      summary: Take back one's reaction (protocol 15)
+      description: Taking back one not there changes nothing. Allowed while muted.
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+        - { name: message, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [emoji]
+              properties:
+                emoji: { type: string }
+      responses:
+        "200":
+          description: The message's reactions now
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageReactions" }
+        "400": { description: "`bad_emoji`" }
+        "404": { description: "`no_channel`, `no_message`" }
+        "429": { description: "`slow_down`" }
   /pond/v1/channels/{channel}/messages/{message}/versions:
     get:
       summary: One message with every text it had (protocol 14), for whoever may `view_message_log` in the channel
@@ -942,7 +1001,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). `role_colors`: names in a role's colour, as each member chooses or the Pond enforces (protocol 12, "Role colours"). `overrides`: what everyone may do, and each channel's permissions (protocol 13, "Permissions"). `page_kinds`: roles, events, form and shop pages and pages for some roles ("Pages"). `applications`: the entry form ("Entry form"). `shop`: the shop ("Shop"). `voice_moderation`: muting and disconnecting in voice ("Voice moderation"). `message_edits`: editing and deleting messages, and the message log (protocol 14, "Editing and deleting messages"). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). `role_colors`: names in a role's colour, as each member chooses or the Pond enforces (protocol 12, "Role colours"). `overrides`: what everyone may do, and each channel's permissions (protocol 13, "Permissions"). `page_kinds`: roles, events, form and shop pages and pages for some roles ("Pages"). `applications`: the entry form ("Entry form"). `shop`: the shop ("Shop"). `voice_moderation`: muting and disconnecting in voice ("Voice moderation"). `message_edits`: editing and deleting messages, and the message log (protocol 14, "Editing and deleting messages"). `replies`, `reactions`, `mentions`: replying to a message, reacting to one, and mentioning members, roles and everyone (protocol 15, "Replies, reactions and mentions"). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -1065,8 +1124,8 @@ components:
     Permission:
       enum: [manage_pond, manage_channels, manage_roles, manage_invites, kick_members, ban_members, mute_members, manage_pages,
              view_channels, send_messages, attach_files, connect, speak, video, move_members, voice_mute, manage_events,
-             manage_applications, manage_shop, manage_messages, view_message_log]
-      description: 'docs/design.md, "Permissions". From view_channels on, protocol 13; manage_messages and view_message_log, protocol 14. view_channels to voice_mute, manage_messages and view_message_log are those a channel may allow or deny.'
+             manage_applications, manage_shop, manage_messages, view_message_log, add_reactions, mention_everyone]
+      description: 'docs/design.md, "Permissions". From view_channels on, protocol 13; manage_messages and view_message_log, protocol 14; add_reactions and mention_everyone, protocol 15. view_channels to voice_mute, and manage_messages to mention_everyone, are those a channel may allow or deny.'
     Override:
       type: object
       description: 'What a channel allows and denies a role, or everyone (role 0) (protocol 13)'
@@ -1182,6 +1241,47 @@ components:
         ts: { type: integer, description: ms, by the Pond's clock }
         edited: { type: integer, description: "Protocol 14: when it was last edited (ms); left out when it never was" }
         files: { type: array, items: { $ref: "#/components/schemas/File" }, description: Left out when there are none }
+        reply:
+          type: object
+          description: |
+            Protocol 15: the message it replies to, as that reads now; left out on one that replies to nothing. `text` is its first
+            200 characters (then "…"), `files` how many files it carries (left out for none). Only `{id, deleted: true}` once
+            that message is deleted.
+          required: [id]
+          properties:
+            id: { type: integer }
+            author: { type: string }
+            text: { type: string }
+            files: { type: integer }
+            deleted: { type: boolean }
+        reactions:
+          type: array
+          description: Protocol 15. Each emoji in the order it was first used, with every member who used it; left out when there are none
+          items: { $ref: "#/components/schemas/Reaction" }
+        mentions:
+          type: object
+          description: |
+            Protocol 15: whom its text mentions (`<@member>`, `<@&role>`, `@everyone`), as the Pond worked out when it was sent or
+            last edited; left out when nobody. Everyone and roles only from a member who may `mention_everyone` there.
+          properties:
+            members: { type: array, items: { type: string } }
+            roles: { type: array, items: { type: integer } }
+            everyone: { type: boolean }
+    Reaction:
+      type: object
+      required: [emoji, count, members]
+      properties:
+        emoji: { type: string }
+        count: { type: integer }
+        members: { type: array, items: { type: string }, description: The members who used it, first first }
+    MessageReactions:
+      type: object
+      description: 'A message''s reactions as they are now (protocol 15): the answer to react and unreact, and the event message_reactions'
+      required: [id, channel, reactions]
+      properties:
+        id: { type: integer }
+        channel: { type: integer }
+        reactions: { type: array, items: { $ref: "#/components/schemas/Reaction" } }
     LoggedMessage:
       description: 'A message as the message log gives it (protocol 14; docs/design.md, "Editing and deleting messages")'
       allOf:
@@ -1221,7 +1321,7 @@ components:
       required: [id, kind, data]
       properties:
         id: { type: integer }
-        kind: { enum: [message, message_edited, message_deleted, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, role_order, page, page_deleted, page_order, voice, voice_left] }
+        kind: { enum: [message, message_edited, message_deleted, message_reactions, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, role_order, page, page_deleted, page_order, voice, voice_left] }
         data:
           description: |
             message: a Message. channel: a Channel (made or changed). channel_deleted: {id}. member: a Member (joined, or a
@@ -1235,4 +1335,7 @@ components:
             (docs/design.md, "Pages"): page: a PageHead (made or changed; a new one is last), page_deleted: {id}, page_order:
             {pages: [ids]}, first to last. Protocol 14 (docs/design.md, "Editing and deleting messages"): message_edited: a
             Message as it now reads, with `edited`; message_deleted: {id, channel}, no longer there. When a message is edited,
-            the events that said it before say it as it now reads; when it is deleted, they become message_deleted.
+            the events that said it before say it as it now reads; when it is deleted, they become message_deleted. Protocol 15
+            ("Replies, reactions and mentions"): message_reactions: a MessageReactions. When reactions change, every earlier event
+            about the message says them as they are now; when a message is edited or deleted, the events of the replies to it are
+            rewritten to quote it as it now reads.

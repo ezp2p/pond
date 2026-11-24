@@ -9,6 +9,7 @@
 #include <drogon/utils/coroutine.h>
 #include <trantor/utils/Logger.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <chrono>
@@ -91,7 +92,6 @@ static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until, dm
 static const char CHANNEL_COLS[] = "id, name, topic, position, kind,"
                                    " (SELECT GROUP_CONCAT(CONCAT(o.role, ':', o.allow, ':', o.deny) ORDER BY o.role) FROM channel_overrides o"
                                    " WHERE o.channel = channels.id)";
-static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms, edited_ms";
 
 /* "muted": null, or {"until": ms, or null until they are unmuted} (docs/design.md, "Muting") */
 static std::string muted_json(const drogon::orm::Field &f)
@@ -158,23 +158,41 @@ static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
            ",\"roles\":" + (restricted ? "[" + roles + "]" : std::string("null")) + ",\"overrides\":" + overrides_json(list) + "}";
 }
 
-/* `files` is the message's "files" array, or "" for a message without any */
-static std::string message_json(const drogon::orm::Row &row, const std::string &files = "") /* MESSAGE_COLS */
+/* `extra` is what follows `ts` and `edited`: the message's "files", "reply", "reactions" and "mentions", each with its comma */
+static std::string message_json(const drogon::orm::Row &row, const std::string &extra = "") /* MESSAGE_COLS */
 {
     /* `edited`: when it was last edited (protocol 14), only on one that was */
     const std::string edited = row[5].isNull() ? "" : ",\"edited\":" + std::to_string(num(row[5]));
     return "{\"id\":" + std::to_string(num(row[0])) + ",\"channel\":" + std::to_string(num(row[1])) + ",\"author\":" + jstr(text(row[2])) +
-           ",\"text\":" + jstr(text(row[3])) + ",\"ts\":" + std::to_string(num(row[4])) + edited + (files.empty() ? "" : ",\"files\":" + files) + "}";
+           ",\"text\":" + jstr(text(row[3])) + ",\"ts\":" + std::to_string(num(row[4])) + edited + extra + "}";
 }
 
-/* Rows of MESSAGE_COLS as a JSON array, each with the files it carries (not those an edit dropped). */
+/* The first `max` characters of UTF-8 text, with "…" when there were more */
+static std::string first_chars(const std::string &s, size_t max)
+{
+    size_t chars = 0;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (((unsigned char)s[i] & 0xC0) == 0x80)
+            continue;
+        if (chars++ == max)
+            return s.substr(0, i) + "\xE2\x80\xA6";
+    }
+    return s;
+}
+
+/* Rows of MESSAGE_COLS as a JSON array, each with the files it carries (not those an edit dropped), and (protocol 15) what it
+ * replies to, its reactions and its mentions. */
 Task<std::string> Service::messages_json(DbPtr db, Result r)
 {
-    std::map<int64_t, std::string> files;
+    std::map<int64_t, std::string> files, reactions;
+    std::map<int64_t, std::string> quotes; /* a message replied to: its `reply` */
     if (!r.empty()) {
-        std::string ids;
-        for (size_t i = 0; i < r.size(); i++)
+        std::string ids, replied;
+        for (size_t i = 0; i < r.size(); i++) {
             ids += (i ? "," : "") + std::to_string(num(r[i][0])); /* numbers from the database: safe to put in the statement */
+            if (!r[i][6].isNull())
+                replied += (replied.empty() ? "" : ",") + std::to_string(num(r[i][6]));
+        }
         Result f = co_await db->execSqlCoro("SELECT message, file, name, mime, size, w, h, duration_ms, preview FROM message_files"
                                             " WHERE message IN (" + ids + ") AND removed_ms IS NULL ORDER BY message, position");
         for (const auto &row : f) {
@@ -192,11 +210,58 @@ Task<std::string> Service::messages_json(DbPtr db, Result r)
         }
         for (auto &[id, a] : files)
             a += "]";
+        /* reactions: each emoji in the order it was first used, with who used it, in order */
+        Result re = co_await db->execSqlCoro("SELECT message, emoji, member FROM reactions WHERE message IN (" + ids + ") ORDER BY message, ts_ms, member");
+        std::map<int64_t, std::vector<std::pair<std::string, std::vector<std::string>>>> by;
+        for (const auto &row : re) {
+            auto &list = by[num(row[0])];
+            const std::string e = text(row[1]);
+            auto it = std::find_if(list.begin(), list.end(), [&](const auto &p) { return p.first == e; });
+            if (it == list.end())
+                it = list.insert(list.end(), {e, {}});
+            it->second.push_back(text(row[2]));
+        }
+        for (const auto &[id, list] : by) {
+            std::string out = "[";
+            for (const auto &[e, who] : list) {
+                std::string members;
+                for (const std::string &m : who)
+                    members += (members.empty() ? "" : ",") + jstr(m);
+                out += std::string(out.size() > 1 ? "," : "") + "{\"emoji\":" + jstr(e) + ",\"count\":" + std::to_string(who.size()) +
+                       ",\"members\":[" + members + "]}";
+            }
+            reactions[id] = out + "]";
+        }
+        /* what each reply quotes: the message as it reads now, or that it is gone */
+        if (!replied.empty()) {
+            Result q = co_await db->execSqlCoro("SELECT m.id, m.author, m.text, m.deleted_ms, (SELECT COUNT(*) FROM message_files f WHERE"
+                                                " f.message = m.id AND f.removed_ms IS NULL) FROM messages m WHERE m.id IN (" + replied + ")");
+            for (const auto &row : q) {
+                if (!row[3].isNull())
+                    continue;
+                std::string one = "{\"id\":" + std::to_string(num(row[0])) + ",\"author\":" + jstr(text(row[1])) +
+                                  ",\"text\":" + jstr(first_chars(text(row[2]), QUOTE_MAX));
+                if (num(row[4]) > 0)
+                    one += ",\"files\":" + std::to_string(num(row[4]));
+                quotes[num(row[0])] = one + "}";
+            }
+        }
     }
     std::string out = "[";
     for (size_t i = 0; i < r.size(); i++) {
-        auto it = files.find(num(r[i][0]));
-        out += (i ? "," : "") + message_json(r[i], it == files.end() ? "" : it->second);
+        const int64_t id = num(r[i][0]);
+        std::string extra;
+        if (auto it = files.find(id); it != files.end())
+            extra += ",\"files\":" + it->second;
+        if (!r[i][6].isNull()) {
+            auto q = quotes.find(num(r[i][6]));
+            extra += ",\"reply\":" + (q != quotes.end() ? q->second : "{\"id\":" + std::to_string(num(r[i][6])) + ",\"deleted\":true}");
+        }
+        if (auto it = reactions.find(id); it != reactions.end())
+            extra += ",\"reactions\":" + it->second;
+        if (!r[i][7].isNull() && !text(r[i][7]).empty())
+            extra += ",\"mentions\":" + text(r[i][7]);
+        out += (i ? "," : "") + message_json(r[i], extra);
     }
     co_return out + "]";
 }
@@ -476,7 +541,8 @@ bool clean_file(FileRef &f)
     return true;
 }
 
-Task<Answer> Service::send(std::string member, int64_t channel, std::string in, std::string nonce, std::vector<FileRef> files)
+Task<Answer> Service::send(std::string member, int64_t channel, std::string in, std::string nonce, std::vector<FileRef> files,
+                           int64_t reply_to)
 {
     std::string body;
     if (!clean_text(in, TEXT_MAX, true, body) || (body.empty() && files.empty()))
@@ -513,9 +579,21 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
             }
             sizes.push_back(num(w[0][0]));
         }
+        /* a reply answers a message in the same channel that is still there (protocol 15) */
+        std::optional<int64_t> answers;
+        if (reply_to > 0) {
+            Result q = co_await tx->execSqlCoro("SELECT 1 FROM messages WHERE id = ? AND channel = ? AND deleted_ms IS NULL", reply_to, channel);
+            if (q.empty()) {
+                tx->rollback();
+                co_return fail(400, "bad_reply");
+            }
+            answers = reply_to;
+        }
+        const std::string said = co_await mentions_json(tx, member, channel, body);
+        const std::optional<std::string> mentions = nullable(said);
         const std::optional<std::string> nonce_or_null = nullable(nonce);
-        Result ins = co_await tx->execSqlCoro("INSERT INTO messages (channel, author, text, nonce, ts_ms) VALUES (?, ?, ?, ?, ?)", channel,
-                                              member, body, nonce_or_null, now_ms());
+        Result ins = co_await tx->execSqlCoro("INSERT INTO messages (channel, author, text, nonce, ts_ms, reply_to, mentions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                              channel, member, body, nonce_or_null, now_ms(), answers, mentions);
         int64_t mid = (int64_t)ins.insertId();
         for (size_t i = 0; i < files.size(); i++) {
             const FileRef &f = files[i];

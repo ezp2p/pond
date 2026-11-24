@@ -42,7 +42,7 @@ constexpr int64_t EVENTS_KEEP_MS = 7LL * 24 * 3600 * 1000;
 
 /* What /pond/v1/info says this Pond speaks (docs/design.md, "Versions"). PROTOCOL counts additions within /pond/v1; a change
  * an older Puddle would misread gets a new path instead. FEATURES names the optional parts this Pond has. */
-constexpr int PROTOCOL = 14; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
+constexpr int PROTOCOL = 15; /* 2: roles (docs/design.md, "Roles"); 3: receipts, and the Pond's key in `pond` ("Receipts");
                              * 4: channels' `kind`, and voice channels (docs/voice.md) where `features` says `voice`;
                              * 5: sealed requests and answers, receipts v2, and `seal_key` in `pond` (the protocol's spec/09);
                              * 6: pictures, the Pond's `icon` and members' profile pictures ("Pictures");
@@ -62,10 +62,13 @@ constexpr int PROTOCOL = 14; /* 2: roles (docs/design.md, "Roles"); 3: receipts,
                              *    payments ("Shop"); and moderating voice ("Voice moderation");
                              * 14: editing and deleting messages, and the message log ("Editing and deleting messages"): a message's
                              *    `edited`, the events `message_edited` and `message_deleted`, the permissions manage_messages and
-                             *    view_message_log, and the routes under /pond/v1/channels/{channel}/messages/{message} and .../log */
-constexpr std::array<const char *, 15> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles", "role_permissions", "pages",
+                             *    view_message_log, and the routes under /pond/v1/channels/{channel}/messages/{message} and .../log;
+                             * 15: replies, reactions and mentions ("Replies, reactions and mentions"): a send's `reply_to`, a
+                             *    message's `reply`, `reactions` and `mentions`, .../react and .../unreact, the event
+                             *    `message_reactions`, and the permissions add_reactions and mention_everyone */
+constexpr std::array<const char *, 18> FEATURES{"files", "roles", "receipts", "sealed", "pictures", "channel_roles", "role_permissions", "pages",
                                                 "role_colors", "overrides", "page_kinds", "applications", "shop", "voice_moderation",
-                                                "message_edits"}; /* and "voice", when voice is on */
+                                                "message_edits", "replies", "reactions", "mentions"}; /* and "voice", when voice is on */
 
 /* Direct messages (docs/dms.md, dms.cpp): relayed, never stored. */
 constexpr size_t DM_SEALED_MAX = 128 * 1024;           /* a sealed letter, as base64: a message with ten files' previews fits */
@@ -101,19 +104,21 @@ enum Permission : int64_t {
     MOVE_MEMBERS = 16384, VOICE_MUTE = 32768, MANAGE_EVENTS = 65536, MANAGE_APPLICATIONS = 131072, MANAGE_SHOP = 262144,
     /* protocol 14: deleting others' messages, and reading what messages said before they were edited or deleted
      * (docs/design.md, "Editing and deleting messages") */
-    MANAGE_MESSAGES = 524288, VIEW_MESSAGE_LOG = 1048576
+    MANAGE_MESSAGES = 524288, VIEW_MESSAGE_LOG = 1048576,
+    /* protocol 15: reacting to messages, and mentioning everyone or a role (docs/design.md, "Replies, reactions and mentions") */
+    ADD_REACTIONS = 2097152, MENTION_EVERYONE = 4194304
 };
-constexpr int64_t ALL_PERMISSIONS = (1 << 21) - 1;
+constexpr int64_t ALL_PERMISSIONS = (1 << 23) - 1;
 /* those a channel may allow or deny a role (its `overrides`) */
 constexpr int64_t CHANNEL_PERMISSIONS = VIEW_CHANNELS | SEND_MESSAGES | ATTACH_FILES | CONNECT | SPEAK | VIDEO | MOVE_MEMBERS | VOICE_MUTE |
-                                        MANAGE_MESSAGES | VIEW_MESSAGE_LOG;
-/* what everyone has in a Pond that has said nothing else: what members could always do */
-constexpr int64_t EVERYONE_DEFAULT = VIEW_CHANNELS | SEND_MESSAGES | ATTACH_FILES | CONNECT | SPEAK | VIDEO;
+                                        MANAGE_MESSAGES | VIEW_MESSAGE_LOG | ADD_REACTIONS | MENTION_EVERYONE;
+/* what everyone has in a Pond that has said nothing else: what members could always do, and reacting */
+constexpr int64_t EVERYONE_DEFAULT = VIEW_CHANNELS | SEND_MESSAGES | ATTACH_FILES | CONNECT | SPEAK | VIDEO | ADD_REACTIONS;
 struct PermissionName {
     int64_t bit;
     const char *name;
 };
-constexpr std::array<PermissionName, 21> PERMISSIONS{{{MANAGE_POND, "manage_pond"}, {MANAGE_CHANNELS, "manage_channels"},
+constexpr std::array<PermissionName, 23> PERMISSIONS{{{MANAGE_POND, "manage_pond"}, {MANAGE_CHANNELS, "manage_channels"},
                                                       {MANAGE_ROLES, "manage_roles"}, {MANAGE_INVITES, "manage_invites"},
                                                       {KICK_MEMBERS, "kick_members"}, {BAN_MEMBERS, "ban_members"},
                                                       {MUTE_MEMBERS, "mute_members"}, {MANAGE_PAGES, "manage_pages"},
@@ -122,7 +127,8 @@ constexpr std::array<PermissionName, 21> PERMISSIONS{{{MANAGE_POND, "manage_pond
                                                       {VIDEO, "video"}, {MOVE_MEMBERS, "move_members"}, {VOICE_MUTE, "voice_mute"},
                                                       {MANAGE_EVENTS, "manage_events"}, {MANAGE_APPLICATIONS, "manage_applications"},
                                                       {MANAGE_SHOP, "manage_shop"}, {MANAGE_MESSAGES, "manage_messages"},
-                                                      {VIEW_MESSAGE_LOG, "view_message_log"}}};
+                                                      {VIEW_MESSAGE_LOG, "view_message_log"}, {ADD_REACTIONS, "add_reactions"},
+                                                      {MENTION_EVERYONE, "mention_everyone"}}};
 /* A permission's bit from its name; 0 for none */
 int64_t permission_bit(const std::string &name);
 /* What a channel allows and denies one role (0: everyone) */
@@ -180,6 +186,24 @@ constexpr int64_t FILE_CHUNK = 1 << 20;
 constexpr int64_t FILE_HARD_MAX = 4LL << 30;           /* 4096 chunks */
 constexpr int64_t FILES_DEFAULT_MAX = 25LL << 20;
 constexpr size_t FILES_PER_MESSAGE = 10;
+
+/* Replies, reactions and mentions (docs/design.md, "Replies, reactions and mentions"; messages.cpp) */
+/* what messages_json() reads: a message, what it replies to, and its mentions as JSON */
+inline constexpr char MESSAGE_COLS[] = "id, channel, author, text, ts_ms, edited_ms, reply_to, mentions";
+constexpr size_t QUOTE_MAX = 200;           /* characters of the message replied to, in a reply's `reply` */
+constexpr size_t EMOJI_MAX = 32;            /* bytes in one reaction */
+constexpr int64_t REACTIONS_PER_MESSAGE = 20; /* different emoji on one message */
+constexpr size_t MENTIONS_MAX = 20;         /* members and roles one message mentions; more are left as text */
+/* Is `s` one reaction: 1 to EMOJI_MAX bytes of UTF-8, with no letters, digits, spaces or other ASCII, and no control
+ * characters? (An emoji, with its joiners and variation selectors; checking that it is exactly one is left to the apps.) */
+bool emoji_ok(const std::string &s);
+/* What a message's text mentions, as written: `<@member id>`, `<@&role id>` and `@everyone`. */
+struct Mentions {
+    std::vector<std::string> members;
+    std::vector<int64_t> roles;
+    bool everyone = false;
+};
+Mentions find_mentions(const std::string &text);
 constexpr size_t FILE_NAME_MAX = 255;                  /* bytes */
 constexpr size_t FILE_MIME_MAX = 127;
 constexpr size_t FILE_PREVIEW_MAX = 1400;              /* characters of base64: a preview of at most 1 KiB */
@@ -274,7 +298,11 @@ public:
     Task<Answer> keys(std::string member, Chain chain);
     Task<Answer> info(std::string member);
     Task<Answer> history(std::string member, int64_t channel, int64_t before, int limit);
-    Task<Answer> send(std::string member, int64_t channel, std::string text, std::string nonce, std::vector<FileRef> files = {});
+    /* `reply_to`: the message in the same channel it answers (protocol 15), 0 for none */
+    Task<Answer> send(std::string member, int64_t channel, std::string text, std::string nonce, std::vector<FileRef> files = {},
+                      int64_t reply_to = 0);
+    /* Reactions (messages.cpp; protocol 15): `member` adds or takes back `emoji` on a message */
+    Task<Answer> react(std::string member, int64_t channel, int64_t message, std::string emoji, bool add);
     /* Editing and deleting messages (messages.cpp; docs/design.md, "Editing and deleting messages"). Its author changes its text
      * and drops some of its files (`keep`: the ids of those it keeps, in its order); its author, or whoever may manage messages in
      * its channel, deletes it. */
@@ -530,6 +558,12 @@ private:
     /* messages.cpp: delete `message` (by `by`, a member or "pondctl"), rewriting its earlier events; erase it */
     Task<Answer> delete_message(std::string by, int64_t message);
     Task<Answer> purge_message(std::string by, int64_t message);
+    /* Protocol 15. The events that said each reply to `message` say it again as it reads now, its quote of `message` with them
+     * (after `message` was edited, deleted or purged) */
+    Task<> rewrite_replies(TxPtr tx, int64_t message);
+    /* the `mentions` a message by `member` in `channel` keeps, as JSON ("" for none): those it may make, of members and roles
+     * that are there */
+    Task<std::string> mentions_json(DbPtr db, std::string member, int64_t channel, const std::string &text);
     /* a message with its versions, as the log gives it: "" if there is none */
     Task<std::string> logged_json(DbPtr db, drogon::orm::Result r);
     Task<std::string> offer_json(std::string member);

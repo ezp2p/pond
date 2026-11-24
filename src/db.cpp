@@ -152,6 +152,17 @@ static const char *const STEPS[][16] = {
         "ALTER TABLE events ADD COLUMN message BIGINT NULL, ADD KEY (message)",
         nullptr,
     },
+    {
+        /* replies, reactions and mentions (docs/design.md, "Replies, reactions and mentions"): the message a reply answers, what
+         * a message mentions (JSON, worked out when it is sent or edited), and who reacted with what. Emoji are compared byte for
+         * byte: utf8mb4's other collations take every emoji for the same. Everyone could always react, as there was nothing to
+         * stop them: a Pond that set what everyone may do lets them still. */
+        "ALTER TABLE messages ADD COLUMN reply_to BIGINT NULL, ADD COLUMN mentions TEXT NULL, ADD KEY (reply_to)",
+        "CREATE TABLE reactions (message BIGINT NOT NULL, emoji VARCHAR(32) NOT NULL, member CHAR(52) NOT NULL, ts_ms BIGINT NOT NULL,"
+        " PRIMARY KEY (message, emoji, member)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        "UPDATE settings SET value = CAST(CAST(value AS SIGNED) | 2097152 AS CHAR) WHERE name = 'everyone' AND value <> ''",
+        nullptr,
+    },
 };
 
 /* A password in a connection string: quoted, with backslashes and quotes escaped. Drogon's parser takes a quoted value to run

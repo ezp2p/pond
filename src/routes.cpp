@@ -40,7 +40,7 @@ enum Kind {
     ADMIN_EVENT_CREATE, ADMIN_EVENT_EDIT, ADMIN_EVENT_DELETE, ADMIN_ITEM_CREATE, ADMIN_ITEM_EDIT, ADMIN_ITEM_DELETE, ADMIN_ORDERS,
     ADMIN_STRIPE, ADMIN_APPLICATIONS, ADMIN_APPLICATION_ACCEPT, ADMIN_APPLICATION_DECLINE, ADMIN_UNMUTE,
     /* after the admin routes: these are checked by the channel's own permissions, in the Service */
-    MESSAGE_EDIT, MESSAGE_DELETE, MESSAGE_VERSIONS, MESSAGE_PURGE, MESSAGE_LOG, NONE
+    MESSAGE_EDIT, MESSAGE_DELETE, MESSAGE_VERSIONS, MESSAGE_PURGE, MESSAGE_LOG, MESSAGE_REACT, MESSAGE_UNREACT, NONE
 };
 
 /* The routes only an operator or administrator may use (docs/design.md, "Roles"), or a member whose roles let them. */
@@ -343,7 +343,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
     if (post && rest == "/send") return SEND;
     if (get && rest == "/log") return MESSAGE_LOG;
     if (rest.substr(0, 10) == "/messages/") {
-        /* /messages/{message}/edit, /delete, /purge, /versions (docs/design.md, "Editing and deleting messages") */
+        /* /messages/{message}/edit, /delete, /purge, /versions (docs/design.md, "Editing and deleting messages"), /react, /unreact */
         std::string_view m = rest.substr(10);
         size_t s2 = m.find('/');
         if (s2 == std::string_view::npos || (n = number_of(m.substr(0, s2), false)) < 1)
@@ -353,6 +353,9 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
         if (post && verb == "delete") return MESSAGE_DELETE;
         if (post && verb == "purge") return MESSAGE_PURGE;
         if (get && verb == "versions") return MESSAGE_VERSIONS;
+        /* protocol 15: reactions (docs/design.md, "Replies, reactions and mentions") */
+        if (post && verb == "react") return MESSAGE_REACT;
+        if (post && verb == "unreact") return MESSAGE_UNREACT;
     }
     if (post && rest == "/voice/join") return VOICE_JOIN;
     return NONE;
@@ -361,7 +364,7 @@ static Kind route_of(const std::string &method, std::string_view p, int64_t &cha
 /* Routes whose body is a JSON object. FILE_PUT's is a chunk's bytes, and PICTURE_PUT's a picture's. */
 static bool takes_body(Kind k)
 {
-    return k == JOIN || k == KEYS || k == SEND || k == MESSAGE_EDIT || k == PROFILE || k == DM_SEND || k == DM_SETTINGS || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
+    return k == JOIN || k == KEYS || k == SEND || k == MESSAGE_EDIT || k == MESSAGE_REACT || k == MESSAGE_UNREACT || k == PROFILE || k == DM_SEND || k == DM_SETTINGS || k == FILE_BEGIN || k == ROLE_ANSWER || k == ADMIN_POND || k == ADMIN_ICON || k == ADMIN_INVITE_CREATE || k == ADMIN_MUTE ||
            k == ADMIN_ROLE_CREATE || k == ADMIN_ROLE_EDIT || k == ADMIN_MEMBER_ROLES || k == ADMIN_CHANNEL_ROLES || k == ADMIN_CHANNEL_ORDER || k == ADMIN_ROLE_ORDER || k == ADMIN_BANNER || k == ADMIN_PAGE_CREATE || k == ADMIN_PAGE_EDIT || k == ADMIN_PAGE_ORDER || k == ADMIN_ROLE_COLORS || k == ROLE_COLOR ||
            k == ADMIN_CHANNEL_CREATE || k == ADMIN_CHANNEL_EDIT || k == ADMIN_BAN || k == VOICE_JOIN || k == VOICE_STATE ||
            k == VOICE_WATCH || k == APPLY || k == PAGE_PICK_ROLES || k == PAGE_EVENT_GOING || k == SHOP_BUY || k == VOICE_MODERATE ||
@@ -645,7 +648,14 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
         for (char c : nonce)
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'))
                 co_return fail(400, "bad_nonce");
-        co_return co_await svc_.send(sender, channel, text, nonce, std::move(files));
+        /* protocol 15: the message in this channel it answers */
+        int64_t reply_to = 0;
+        if (json.isMember("reply_to") && !json["reply_to"].isNull()) {
+            if (!json["reply_to"].isInt64() || json["reply_to"].asInt64() < 1)
+                co_return fail(400, "bad_reply");
+            reply_to = json["reply_to"].asInt64();
+        }
+        co_return co_await svc_.send(sender, channel, text, nonce, std::move(files), reply_to);
     }
     case MESSAGE_EDIT: {
         /* {text?, files?}: `files` the ids of those it keeps (docs/design.md, "Editing and deleting messages") */
@@ -668,6 +678,13 @@ Task<Answer> Routes::answer(HttpRequestPtr req, Signing &signing)
     }
     case MESSAGE_DELETE:
         co_return co_await svc_.message_delete(sender, channel, chunk);
+    case MESSAGE_REACT:
+    case MESSAGE_UNREACT: {
+        std::string emoji;
+        if (!get_string(json, "emoji", emoji))
+            co_return fail(400, "bad_emoji");
+        co_return co_await svc_.react(sender, channel, chunk, emoji, k == MESSAGE_REACT);
+    }
     case MESSAGE_PURGE:
         co_return co_await svc_.message_purge(sender, channel, chunk);
     case MESSAGE_VERSIONS:

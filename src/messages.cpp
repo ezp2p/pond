@@ -5,7 +5,12 @@
  *
  * The events about a message (`message`, `message_edited`) are rewritten when it changes, so a member catching up never reads
  * what was taken back: an edit makes them all say the message as it reads now, and a deletion turns them into
- * `message_deleted`. */
+ * `message_deleted`.
+ *
+ * Replies, reactions and mentions (protocol 15; docs/design.md, "Replies, reactions and mentions"): a reply quotes the message it
+ * answers as that reads now, so the events of the replies are rewritten too when it is edited or deleted; a reaction rewrites
+ * every event about its message, so catching up gives its reactions as they are now; mentions are worked out from the text
+ * when it is sent or edited. */
 
 #include "pond.h"
 
@@ -16,6 +21,8 @@
 #include <trantor/utils/Logger.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <unistd.h>
@@ -25,8 +32,7 @@ namespace pond {
 using drogon::orm::DrogonDbException;
 using drogon::orm::Result;
 
-/* as pond.cpp's MESSAGE_COLS, for messages_json(); and what the log adds */
-static const char COLS[] = "id, channel, author, text, ts_ms, edited_ms";
+/* what the log reads */
 static const char LOG_COLS[] = "id, channel, author, text, ts_ms, edited_ms, deleted_ms, deleted_by";
 
 static Answer server_error(const DrogonDbException &e)
@@ -105,12 +111,18 @@ Task<Answer> Service::message_edit(std::string member, int64_t channel, int64_t 
             /* what it said until now goes in the log, with the files it carried then (those not dropped before `now`) */
             co_await tx->execSqlCoro("INSERT INTO message_versions (message, text, ts_ms, until_ms) VALUES (?, ?, ?, ?)", message, was,
                                      since, now);
+            /* what it mentions is what it says now (protocol 15); nobody is told again */
+            if (now_text != was) {
+                const std::string said = co_await mentions_json(tx, member, channel, now_text);
+                const std::optional<std::string> mentions = said.empty() ? std::nullopt : std::optional<std::string>(said);
+                co_await tx->execSqlCoro("UPDATE messages SET mentions = ? WHERE id = ?", mentions, message);
+            }
             co_await tx->execSqlCoro("UPDATE messages SET text = ?, edited_ms = ? WHERE id = ?", now_text, now, message);
             for (const std::string &id : drop)
                 co_await tx->execSqlCoro("UPDATE message_files SET removed_ms = ? WHERE message = ? AND file = ? AND removed_ms IS NULL", now,
                                          message, id);
         }
-        Result r = co_await tx->execSqlCoro(std::string("SELECT ") + COLS + " FROM messages WHERE id = ?", message);
+        Result r = co_await tx->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS + " FROM messages WHERE id = ?", message);
         std::string list = co_await messages_json(tx, r);
         std::string msg = list.substr(1, list.size() - 2);
         if (!changed) { /* the same as it was: nothing to tell anyone */
@@ -119,6 +131,7 @@ Task<Answer> Service::message_edit(std::string member, int64_t channel, int64_t 
         }
         /* what was said of it before says it as it reads now, so nobody catching up reads what was taken back */
         co_await tx->execSqlCoro("UPDATE events SET data = ? WHERE message = ? AND kind IN ('message', 'message_edited')", msg, message);
+        co_await rewrite_replies(tx, message); /* and the replies to it quote it as it reads now */
         const int64_t ev = co_await add_event(tx, "message_edited", msg, "", channel, message);
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
@@ -146,6 +159,7 @@ Task<Answer> Service::delete_message(std::string by, int64_t message)
         co_await tx->execSqlCoro("UPDATE messages SET deleted_ms = ?, deleted_by = ? WHERE id = ?", now_ms(), by, message);
         /* what was said of it before is taken back too: its events say only that it is gone */
         co_await tx->execSqlCoro("UPDATE events SET kind = 'message_deleted', data = ? WHERE message = ?", gone, message);
+        co_await rewrite_replies(tx, message); /* the replies to it no longer quote it */
         const int64_t ev = co_await add_event(tx, "message_deleted", gone, "", channel, message);
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
@@ -180,6 +194,171 @@ Task<Answer> Service::message_delete(std::string member, int64_t channel, int64_
     if (a.status == 204 && author != member)
         co_await log_admin(member, "message_delete", author, "message " + std::to_string(message) + " in channel " + std::to_string(channel));
     co_return a;
+}
+
+/* ---- replies, reactions and mentions (protocol 15; docs/design.md, "Replies, reactions and mentions") ---- */
+
+Task<> Service::rewrite_replies(TxPtr tx, int64_t message)
+{
+    Result ids = co_await tx->execSqlCoro("SELECT id FROM messages WHERE reply_to = ? AND deleted_ms IS NULL", message);
+    for (const auto &row : ids) {
+        const int64_t id = num(row[0]);
+        Result r = co_await tx->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS + " FROM messages WHERE id = ?", id);
+        const std::string list = co_await messages_json(tx, r);
+        if (r.empty())
+            continue;
+        co_await tx->execSqlCoro("UPDATE events SET data = ? WHERE message = ? AND kind IN ('message', 'message_edited')",
+                                 list.substr(1, list.size() - 2), id);
+    }
+}
+
+bool emoji_ok(const std::string &s)
+{
+    if (s.empty() || s.size() > EMOJI_MAX)
+        return false;
+    std::string cleaned;
+    if (!clean_text(s, EMOJI_MAX, false, cleaned) || cleaned != s) /* valid UTF-8, nothing to trim, no control characters */
+        return false;
+    for (unsigned char c : s)
+        if (c < 0x80) /* letters, digits, spaces, punctuation: words, not a reaction */
+            return false;
+    return true;
+}
+
+static bool id_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= '2' && c <= '7');
+}
+
+Mentions find_mentions(const std::string &text)
+{
+    Mentions m;
+    std::set<std::string> members;
+    std::set<int64_t> roles;
+    for (size_t i = 0; i < text.size(); i++) {
+        if (text.compare(i, 9, "@everyone") == 0 && (i + 9 == text.size() || !isalnum((unsigned char)text[i + 9]))) {
+            m.everyone = true;
+            continue;
+        }
+        if (text.compare(i, 2, "<@") != 0)
+            continue;
+        size_t close = text.find('>', i + 2);
+        if (close == std::string::npos || close - i > 64)
+            continue;
+        const std::string inside = text.substr(i + 2, close - i - 2);
+        if (!inside.empty() && inside[0] == '&') {
+            const std::string n = inside.substr(1);
+            if (!n.empty() && n.size() <= 18 && n[0] != '0' && std::all_of(n.begin(), n.end(), [](char c) { return c >= '0' && c <= '9'; }) &&
+                roles.insert(strtoll(n.c_str(), nullptr, 10)).second)
+                m.roles.push_back(strtoll(n.c_str(), nullptr, 10));
+        } else if (inside.size() == 52 && std::all_of(inside.begin(), inside.end(), id_char) && members.insert(inside).second) {
+            m.members.push_back(inside);
+        }
+        if (m.members.size() + m.roles.size() >= MENTIONS_MAX)
+            break;
+    }
+    return m;
+}
+
+Task<std::string> Service::mentions_json(DbPtr db, std::string member, int64_t channel, const std::string &text)
+{
+    const Mentions m = find_mentions(text);
+    if (m.members.empty() && m.roles.empty() && !m.everyone)
+        co_return "";
+    /* everyone, and roles, only for whoever may (Discord's "mention @everyone"); members, whoever is one */
+    const bool wide = (m.everyone || !m.roles.empty()) && (co_await permissions_in(member, channel) & MENTION_EVERYONE);
+    std::string members, roles;
+    for (const std::string &id : m.members) {
+        Result r = co_await db->execSqlCoro("SELECT 1 FROM members WHERE id = ? AND left_ms IS NULL", id);
+        if (!r.empty())
+            members += (members.empty() ? "" : ",") + jstr(id);
+    }
+    if (wide)
+        for (int64_t id : m.roles) {
+            Result r = co_await db->execSqlCoro("SELECT 1 FROM roles WHERE id = ?", id);
+            if (!r.empty())
+                roles += (roles.empty() ? "" : ",") + std::to_string(id);
+        }
+    std::string out;
+    if (!members.empty())
+        out += "\"members\":[" + members + "]";
+    if (!roles.empty())
+        out += std::string(out.empty() ? "" : ",") + "\"roles\":[" + roles + "]";
+    if (wide && m.everyone)
+        out += std::string(out.empty() ? "" : ",") + "\"everyone\":true";
+    co_return out.empty() ? "" : "{" + out + "}";
+}
+
+/* {id, channel, reactions: [...]}: a message's reactions now, as `message_reactions` says them */
+static std::string reactions_of(const std::string &msg_json, int64_t id, int64_t channel)
+{
+    Json::Value v;
+    std::string_view list = "[]";
+    if (!parse_object(msg_json, v) || !raw_member(msg_json, "reactions", list))
+        list = "[]";
+    return "{\"id\":" + std::to_string(id) + ",\"channel\":" + std::to_string(channel) + ",\"reactions\":" + std::string(list) + "}";
+}
+
+Task<Answer> Service::react(std::string member, int64_t channel, int64_t message, std::string emoji, bool add)
+{
+    if (!emoji_ok(emoji))
+        co_return fail(400, "bad_emoji");
+    if (!send_limit_.take(member, now_ms()))
+        co_return fail(429, "slow_down");
+    if (int64_t until = muted_until(member); until >= 0 && add) /* muted: they may still take one back */
+        co_return muted_answer(until);
+    TxPtr tx;
+    try {
+        Result live = co_await db_->execSqlCoro("SELECT 1 FROM channels WHERE id = ? AND deleted = 0", channel);
+        const int64_t may = co_await permissions_in(member, channel);
+        if (live.empty() || !(may & VIEW_CHANNELS))
+            co_return fail(404, "no_channel");
+        if (add && !(may & ADD_REACTIONS))
+            co_return fail(409, "no_permission");
+        tx = co_await db_->newTransactionCoro();
+        Result m = co_await tx->execSqlCoro("SELECT 1 FROM messages WHERE id = ? AND channel = ? AND deleted_ms IS NULL FOR UPDATE", message, channel);
+        if (m.empty()) {
+            tx->rollback();
+            co_return fail(404, "no_message");
+        }
+        bool changed;
+        if (add) {
+            Result have = co_await tx->execSqlCoro("SELECT 1 FROM reactions WHERE message = ? AND emoji = ? LIMIT 1", message, emoji);
+            if (have.empty()) {
+                Result n = co_await tx->execSqlCoro("SELECT COUNT(DISTINCT emoji) FROM reactions WHERE message = ?", message);
+                if (num(n[0][0]) >= REACTIONS_PER_MESSAGE) {
+                    tx->rollback();
+                    co_return fail(409, "too_many_reactions");
+                }
+            }
+            Result ins = co_await tx->execSqlCoro("INSERT IGNORE INTO reactions (message, emoji, member, ts_ms) VALUES (?, ?, ?, ?)", message,
+                                                  emoji, member, now_ms());
+            changed = ins.affectedRows() == 1;
+        } else {
+            Result del = co_await tx->execSqlCoro("DELETE FROM reactions WHERE message = ? AND emoji = ? AND member = ?", message, emoji, member);
+            changed = del.affectedRows() == 1;
+        }
+        Result r = co_await tx->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS + " FROM messages WHERE id = ?", message);
+        std::string list = co_await messages_json(tx, r);
+        const std::string msg = list.substr(1, list.size() - 2);
+        const std::string now = reactions_of(msg, message, channel);
+        if (!changed) { /* already so: nothing to tell anyone */
+            tx->rollback();
+            co_return Answer{200, now};
+        }
+        /* everything said of the message before says its reactions as they are now, so catching up gives the last word */
+        co_await tx->execSqlCoro("UPDATE events SET data = ? WHERE message = ? AND kind IN ('message', 'message_edited')", msg, message);
+        co_await tx->execSqlCoro("UPDATE events SET data = ? WHERE message = ? AND kind = 'message_reactions'", now, message);
+        const int64_t ev = co_await add_event(tx, "message_reactions", now, "", channel, message);
+        if (!co_await Committed(std::move(tx)))
+            co_return fail(500, "database");
+        bump(ev);
+        co_return Answer{200, now};
+    } catch (const DrogonDbException &e) {
+        if (tx)
+            tx->rollback();
+        co_return server_error(e);
+    }
 }
 
 /* Rows of LOG_COLS, each with every text it had and every file it carried:
@@ -297,6 +476,7 @@ Task<Answer> Service::purge_message(std::string by, int64_t message)
             carried.push_back(text(row[0]));
         co_await tx->execSqlCoro("DELETE FROM message_versions WHERE message = ?", message);
         co_await tx->execSqlCoro("DELETE FROM message_files WHERE message = ?", message);
+        co_await tx->execSqlCoro("DELETE FROM reactions WHERE message = ?", message);
         co_await tx->execSqlCoro("DELETE FROM messages WHERE id = ?", message);
         co_await tx->execSqlCoro("UPDATE events SET kind = 'message_deleted', data = ? WHERE message = ?", gone, message);
         if (!co_await Committed(std::move(tx)))

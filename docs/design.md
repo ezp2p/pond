@@ -5,8 +5,9 @@ an invite link. It is not a Puddle. Its members are Puddles, and each one connec
 everywhere else. The routes are in `api/pond.yaml`.
 
 This first cut does text channels, and files in messages (see "Files"). Voice channels have a page of their own,
-[voice.md](voice.md). Messages can be edited and deleted, with a log for moderators (see "Editing and deleting messages").
-Replies, reactions and the rest come later (see "Not yet" at the end).
+[voice.md](voice.md). Messages can be edited and deleted, with a log for moderators (see "Editing and deleting messages"),
+replied to, reacted to, and can mention members (see "Replies, reactions and mentions"). The rest comes later (see "Not yet"
+at the end).
 
 ## What runs
 
@@ -124,8 +125,9 @@ one held.
 |---|---|
 | `GET /pond/v1/info` | The Pond, the member, the channels and the cursor (the same answer as joining) |
 | `GET /pond/v1/channels/{channel}/messages?before=<id>&limit=<n>` | History, newest first: 50 by default, 100 at most |
-| `POST /pond/v1/channels/{channel}/send` | `{text, nonce}`: posts a message and answers with it |
+| `POST /pond/v1/channels/{channel}/send` | `{text, nonce, reply_to?}`: posts a message and answers with it |
 | `POST /pond/v1/channels/{channel}/messages/{message}/edit`, `/delete` | Edit one's own message, delete one (see "Editing and deleting messages") |
+| `POST /pond/v1/channels/{channel}/messages/{message}/react`, `/unreact` | `{emoji}`: add or take back a reaction (see "Replies, reactions and mentions") |
 | `GET /pond/v1/events?after=<n>` | What happened after event `n`, waiting up to 25 seconds for something to happen |
 | `GET /pond/v1/members` | Everyone in the Pond, with the profile each one chose for it |
 | `POST /pond/v1/profile` | `{profile}`: change how the member appears here (`null` shows nothing) |
@@ -149,6 +151,8 @@ Every change the members need to hear about is a row in the `events` table, with
 - `message`: a new message, which is the message itself.
 - `message_edited`, `message_deleted`: a message as it reads now, or `{id, channel}` for one gone (protocol 14, "Editing and
   deleting messages").
+- `message_reactions`: a message's reactions as they are now, `{id, channel, reactions}` (protocol 15, "Replies, reactions
+  and mentions").
 - `channel`: a channel was made or changed, which is the channel itself.
 - `channel_deleted`: a channel was deleted (`{id}`).
 - `member`: someone joined or changed their profile, which is the member.
@@ -479,6 +483,8 @@ some of what an administrator does, has a colour and a place in an order, and ca
 | `manage_shop` | Add, change and take off items on shop pages, and see every order ("Shop") |
 | `manage_messages` | Delete anyone's messages in a channel, and with `view_message_log` purge them (protocol 14, "Editing and deleting messages") |
 | `view_message_log` | Read a channel's message log: what messages said before they were edited or deleted, and their files (protocol 14) |
+| `add_reactions` | React to messages (protocol 15, "Replies, reactions and mentions"); everyone's by default |
+| `mention_everyone` | Mention `@everyone` and roles, so they are told (protocol 15) |
 
 | Question | Decision |
 |---|---|
@@ -523,8 +529,8 @@ those already in it.
 
 | Question | Decision |
 |---|---|
-| Everyone's, by default | `view_channels`, `send_messages`, `attach_files`, `connect`, `speak`, `video`: what members could always do. |
-| What a channel may say | Only the channel permissions: `view_channels` to `move_members` in the table above, and (protocol 14) `manage_messages` and `view_message_log`. Neither list may name one twice; a permission is allowed, denied or (left out) as the roles say. |
+| Everyone's, by default | `view_channels`, `send_messages`, `attach_files`, `connect`, `speak`, `video`: what members could always do; and (protocol 15) `add_reactions`, which a Pond that had already set everyone's is given when it is upgraded, since nothing stopped anyone reacting before. |
+| What a channel may say | Only the channel permissions: `view_channels` to `move_members` in the table above, (protocol 14) `manage_messages` and `view_message_log`, and (protocol 15) `add_reactions` and `mention_everyone`. Neither list may name one twice; a permission is allowed, denied or (left out) as the roles say. |
 | Who sets them | Everyone's: whoever may `manage_roles`, adding only what they may do themselves. A channel's: whoever may `manage_channels`; without a rank, only for everyone and roles below their own highest, allowing only what they may do. |
 | Roles for channels (protocol 9) | Kept as overrides: a channel "only some roles see" denies everyone `view_channels` and allows it those roles. Its `roles` is still written for older Puddles: the roles allowed to view it, when everyone is denied. `POST .../roles` works as before and changes only `view_channels`. |
 
@@ -677,6 +683,41 @@ carried, one an edit dropped with `removed` (ms). Without the permissions the lo
 Not done: a time after which the log forgets on its own (an operator's choice, later), editing someone else's message, and
 an edit history members can see (Discord shows none either).
 
+## Replies, reactions and mentions
+
+Built 2026-11-25 (protocol 15, features `replies`, `reactions` and `mentions`), as on Discord.
+
+**Replies.** A send may say `reply_to`: a message in the same channel, not deleted (`400 bad_reply` otherwise). The reply then
+carries `reply`, a quote of that message as it reads *now*: `{id, author, text, files?}`, its text cut to 200 characters (with
+"…") and `files` the number it carries. Once it is deleted (or purged) the quote is only `{id, deleted: true}`. A reply's quote
+is worked out whenever the reply is read, and when the message it answers is edited or deleted the events that said each reply
+are rewritten as well, so nobody reads a quote of what was taken back.
+
+**Reactions.** `POST .../messages/{message}/react {emoji}` and `/unreact`, answered with the message's reactions as they are
+now, `{id, channel, reactions}`. A message has `reactions`, `[{emoji, count, members}]`: each emoji in the order it was first
+used, with every member who used it, in order; left out when there are none.
+
+| Question | Decision |
+|---|---|
+| What is an emoji | 1 to 32 bytes of UTF-8 with no ASCII in it at all (letters, digits, spaces, punctuation) and no control characters: one emoji, with its joiners, skin tones and variation selectors. Checking that it is exactly one is left to the apps. Custom emoji: not yet. Compared byte for byte. |
+| Who reacts | Whoever may `add_reactions` in the channel (everyone's by default; a channel's overrides may take it). A muted member adds none, but may take theirs back. Counts against the rate for sends. |
+| How many | 20 different emoji on one message (`409 too_many_reactions`); anyone may add one already there. Each member once per emoji: reacting twice changes nothing. |
+| Events | `message_reactions`, `{id, channel, reactions}`, about the channel. Every earlier event about the message (`message`, `message_edited`, `message_reactions`) is rewritten to say its reactions as they are now, so a Puddle catching up, whatever order it reads them in, ends with the last word. |
+| Deleted messages | Can't be reacted to (`404 no_message`); their reactions go when they are purged. |
+
+**Mentions.** Written in a message's text: `<@member id>` a member, `<@&role id>` a role, `@everyone` everyone who sees the
+channel. When a message is sent or edited the Pond works out what it mentions and keeps it with the message, as `mentions`:
+`{members?: [ids], roles?: [ids], everyone?: true}`, left out when it mentions nothing.
+
+| Question | Decision |
+|---|---|
+| Members | Anyone may mention a member, by id, who is in the Pond now; an id that is not a member's stays text. |
+| Everyone and roles | Only whoever may `mention_everyone` in the channel (no one's by default; operators and administrators everywhere); from anyone else `@everyone` and `<@&role>` stay text and tell nobody. A role must exist. |
+| How many | The first 20 members and roles a message names; more stay text. |
+| Who is told | The Pond tells nobody: a mention is in the message each member's Puddle receives, and the Puddle highlights it and tells its owner when it names them, a role they hold, or everyone. Only those who see the channel receive the message. |
+| Edits | An edit works out the mentions again; whether to tell anyone again is the Puddle's choice (Puddle tells its owner of new messages only). |
+| Names | The text keeps ids, never names, so a mention reads right after a member changes their name: the apps show `@name`. |
+
 ## What the database holds
 
 | Table | Columns |
@@ -686,7 +727,8 @@ an edit history members can see (Discord shows none either).
 | `channels` | `id`, `name`, `topic`, `position`, `created_ms`, `deleted`, `kind` (`text` or `voice`) |
 | `members` | `id` (user id), `sign_pub`, `kid`, `chain`, `profile` (JSON), `joined_ms`, `left_ms` |
 | `invites` | `token`, `max_uses` (NULL = unlimited), `uses`, `expires_ms` (NULL = never), `created_ms`, `revoked` |
-| `messages` | `id`, `channel`, `author`, `text`, `nonce`, `ts_ms`; one index on `(channel, id)`, and a unique one on `(author, nonce)`; `edited_ms`, `deleted_ms`, `deleted_by` (protocol 14) |
+| `messages` | `id`, `channel`, `author`, `text`, `nonce`, `ts_ms`; one index on `(channel, id)`, and a unique one on `(author, nonce)`; `edited_ms`, `deleted_ms`, `deleted_by` (protocol 14); `reply_to`, `mentions` (JSON) (protocol 15) |
+| `reactions` | `message`, `emoji` (compared byte for byte), `member`, `ts_ms` (protocol 15) |
 | `message_versions` | `id`, `message`, `text`, `ts_ms` (when it was written), `until_ms` (when an edit replaced it): the message log |
 | `events` | `id`, `kind`, `data` (JSON), `ts_ms` |
 | `members` (more) | `role`: `operator`, `administrator` or `member`; `muted_until`: NULL, 0 (until unmuted) or when (ms) |
@@ -787,7 +829,7 @@ the protocol, not the version of either program.
 - Within v1, things are only added: new fields, new routes, new event kinds. A Puddle ignores fields and event kinds
   it does not know, so an older Puddle keeps working with a newer Pond.
 - `/pond/v1/info` (and joining) says `protocol`, a number that goes up with each addition, and `features`, the names
-  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `role_permissions`, `pages`, `voice`, `dms`, `dm_files`, `message_edits`). A Puddle checks these before using an addition, rather than guessing from
+  of optional parts this Pond has (`files`, `roles`, `receipts`, `sealed`, `pictures`, `channel_roles`, `role_permissions`, `pages`, `voice`, `dms`, `dm_files`, `message_edits`, `replies`, `reactions`, `mentions`). A Puddle checks these before using an addition, rather than guessing from
   a `404`, which is also what a refusal looks like. An answer without them is protocol 1 with no features.
 
 A Puddle records what each Pond says on every `/info`, so it notices when a Pond is upgraded.
@@ -842,7 +884,10 @@ to report.
 - Permissions for one member alone in a channel (Discord's member overrides): only everyone and roles today.
 - Stripe webhooks, refunds from the app, and subscriptions: the shop takes one-off payments and finds them by asking.
 - Zero-decimal currencies (yen, won) are shown by the apps as if they had cents.
-- Replying to messages, reactions, mentions, unread counts and typing indicators.
+- Unread counts and typing indicators.
+- Custom emoji for reactions, `@here`, and roles any member may mention (Discord's "mentionable"): mentioning a role needs
+  `mention_everyone`.
+- A cap on how many members one reaction lists: every member who used it is given, which on a very large Pond is a long list.
 - The message log forgetting by itself after a time, and `pondctl` reading the log (it can show, delete and purge one message).
 - Messages signed by their authors, so a Pond could not forge one. Today members trust the Pond for what it shows,
   as they trust a Discord server.

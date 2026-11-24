@@ -258,7 +258,7 @@ int main()
 
     a = pond.call(&ann, "GET", "/pond/v1/info");
     CHECK(a.status == 200 && has(a.body, "Ann B"));
-    CHECK(num_of(a.body, "protocol") == 14 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(num_of(a.body, "protocol") == 15 && has(a.body, "\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
     CHECK(receipt(a, P) == Receipt::OK);
     Reply b;
     /* no receipt for what anyone may be told: a failed check, a join that did not work */
@@ -929,7 +929,7 @@ int main()
         CHECK(pond.call(&kim, "POST", "/pond/v1/join", join_body(kim, invite(pond, ""), "Kim"), "*").status == 200);
         CHECK(pond.call(&lee, "POST", "/pond/v1/join", join_body(lee, invite(pond, ""), "Lee"), "*").status == 200);
         CHECK(has(pond.call(&kim, "GET", "/pond/v1/info").body,
-                  "\"everyone\":{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\"]}"));
+                  "\"everyone\":{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\",\"add_reactions\"]}"));
         CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/create", "{\"name\":\"news\"}").status / 100 == 2);
         const int64_t news = channel_id(dan, "news");
         const std::string NEWS = "/pond/v1/admin/channels/" + std::to_string(news) + "/overrides";
@@ -972,7 +972,7 @@ int main()
         /* ---- editing and deleting messages, and the message log (protocol 14, docs/design.md, "Editing and deleting messages") ---- */
         {
             a = pond.call(&kim, "GET", "/pond/v1/info");
-            CHECK(has(a.body, "\"protocol\":14") && has(a.body, "\"message_edits\""));
+            CHECK(has(a.body, "\"protocol\":15") && has(a.body, "\"message_edits\""));
             const int64_t gen = channel_id(kim, "general");
             const std::string GC = "/pond/v1/channels/" + std::to_string(gen);
             /* a small file, sent whole, for a message to carry */
@@ -1075,6 +1075,125 @@ int main()
             CHECK(pond.call(&dan, "POST", NEWS, "{\"overrides\":[{\"role\":0,\"allow\":[],\"deny\":[\"view_channels\"]},{\"role\":" + W +
                                                     ",\"allow\":[\"view_channels\"],\"deny\":[]}]}").status == 204); /* as it was */
             CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + lee.id + "/roles", "{\"roles\":[]}").status == 204);
+        }
+
+        /* ---- replies, reactions and mentions (protocol 15, docs/design.md, "Replies, reactions and mentions") ---- */
+        {
+            a = pond.call(&kim, "GET", "/pond/v1/info");
+            CHECK(has(a.body, "\"message_edits\",\"replies\",\"reactions\",\"mentions\""));
+            const int64_t gen = channel_id(kim, "general");
+            const std::string GC = "/pond/v1/channels/" + std::to_string(gen);
+            const int64_t e0 = num_of(pond.call(&lee, "GET", "/pond/v1/info").body, "cursor");
+            a = pond.call(&kim, "POST", GC + "/send", "{\"text\":\"the pond is cold today\"}");
+            const std::string O = std::to_string(num_of(a.body, "id")), GO = GC + "/messages/" + O;
+            CHECK(a.status == 200 && !has(a.body, "\"reply\"") && !has(a.body, "\"reactions\"") && !has(a.body, "\"mentions\""));
+
+            /* a reply answers a message in the same channel that is still there */
+            CHECK(pond.call(&lee, "POST", GC + "/send", "{\"text\":\"brr\",\"reply_to\":999999}").status == 400);
+            CHECK(pond.call(&lee, "POST", GC + "/send", "{\"text\":\"brr\",\"reply_to\":\"" + O + "\"}").status == 400);
+            a = pond.call(&dan, "POST", "/pond/v1/channels/" + std::to_string(news) + "/send", "{\"text\":\"elsewhere\"}");
+            CHECK(pond.call(&dan, "POST", GC + "/send", "{\"text\":\"brr\",\"reply_to\":" + std::to_string(num_of(a.body, "id")) + "}").status == 400);
+            a = pond.call(&lee, "POST", GC + "/send", "{\"text\":\"brr\",\"reply_to\":" + O + "}");
+            CHECK(a.status == 200 && has(a.body, "\"reply\":{\"id\":" + O + ",\"author\":\"" + kim.id + "\",\"text\":\"the pond is cold today\"}"));
+            const std::string R = std::to_string(num_of(a.body, "id"));
+            CHECK(has(pond.call(&kim, "GET", GC + "/messages?limit=5").body, "\"reply\":{\"id\":" + O));
+            /* a long one is quoted in part */
+            a = pond.call(&kim, "POST", GC + "/send", "{\"text\":\"" + std::string(300, 'z') + "\"}");
+            a = pond.call(&lee, "POST", GC + "/send", "{\"text\":\"long\",\"reply_to\":" + std::to_string(num_of(a.body, "id")) + "}");
+            CHECK(has(a.body, "\"text\":\"" + std::string(200, 'z') + "\xE2\x80\xA6\"}"));
+            /* the message replied to, edited: the reply quotes it as it reads now, in the history and in what was said before */
+            CHECK(pond.call(&kim, "POST", GO + "/edit", "{\"text\":\"the pond is freezing\"}").status == 200);
+            a = pond.call(&kim, "GET", GC + "/messages?limit=5");
+            CHECK(has(a.body, "\"reply\":{\"id\":" + O + ",\"author\":\"" + kim.id + "\",\"text\":\"the pond is freezing\"}"));
+            a = pond.call(&lee, "GET", "/pond/v1/events?after=" + std::to_string(e0));
+            CHECK(!has(a.body, "cold today") && has(a.body, "\"text\":\"brr\""));
+
+            /* reactions: an emoji, not words; for whoever may add them in the channel */
+            const std::string FROG = "\xF0\x9F\x90\xB8", HEART = "\xE2\x9D\xA4\xEF\xB8\x8F";
+            for (const std::string bad : {std::string("\"x\""), std::string("\"\""), "\"" + FROG + " \"", std::string("\"\xF0\x9F\""),
+                                          "\"\\u0007" + FROG + "\"", "\"" + FROG + FROG + FROG + FROG + FROG + FROG + FROG + FROG + FROG + "\""})
+                CHECK(pond.call(&lee, "POST", GO + "/react", "{\"emoji\":" + bad + "}").status == 400);
+            CHECK(pond.call(&lee, "POST", GO + "/react", "{\"emoji\":42}").status == 400);
+            a = pond.call(&lee, "POST", GO + "/react", "{\"emoji\":\"" + FROG + "\"}");
+            CHECK(a.status == 409 && has(a.body, "no_permission")); /* everyone was set without it, above */
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/everyone",
+                            "{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\",\"add_reactions\"]}").status == 204);
+            const int64_t e1 = num_of(pond.call(&lee, "GET", "/pond/v1/info").body, "cursor");
+            a = pond.call(&lee, "POST", GO + "/react", "{\"emoji\":\"" + FROG + "\"}");
+            CHECK(a.status == 200 && a.body == "{\"id\":" + O + ",\"channel\":" + std::to_string(gen) + ",\"reactions\":[{\"emoji\":\"" + FROG +
+                                                   "\",\"count\":1,\"members\":[\"" + lee.id + "\"]}]}");
+            CHECK(pond.call(&lee, "POST", GO + "/react", "{\"emoji\":\"" + FROG + "\"}").body == a.body); /* once each */
+            CHECK(pond.call(&kim, "POST", GO + "/react", "{\"emoji\":\"" + FROG + "\"}").status == 200);
+            a = pond.call(&kim, "POST", GO + "/react", "{\"emoji\":\"" + HEART + "\"}");
+            CHECK(has(a.body, "{\"emoji\":\"" + FROG + "\",\"count\":2,\"members\":[\"" + lee.id + "\",\"" + kim.id + "\"]},{\"emoji\":\"" + HEART + "\",\"count\":1"));
+            CHECK(has(pond.call(&lee, "GET", GC + "/messages?limit=10").body, "\"reactions\":[{\"emoji\":\"" + FROG + "\",\"count\":2"));
+            a = pond.call(&lee, "POST", GO + "/unreact", "{\"emoji\":\"" + FROG + "\"}");
+            CHECK(a.status == 200 && has(a.body, "\"count\":1,\"members\":[\"" + kim.id + "\"]"));
+            CHECK(pond.call(&lee, "POST", GO + "/unreact", "{\"emoji\":\"" + FROG + "\"}").body == a.body);
+            /* the events: each change, and every one of them (and the message's own) says the reactions as they are now */
+            a = pond.call(&kim, "GET", "/pond/v1/events?after=" + std::to_string(e1));
+            {
+                Json::Value v = parse(a.body);
+                int seen = 0;
+                for (const auto &e : v["events"])
+                    if (e["kind"].asString() == "message_reactions") {
+                        seen++;
+                        CHECK(e["data"]["reactions"].size() == 2 && e["data"]["reactions"][0]["count"].asInt() == 1);
+                    }
+                CHECK(seen == 4);
+            }
+            a = pond.call(&kim, "GET", "/pond/v1/events?after=" + std::to_string(e0));
+            CHECK(has(a.body, "\"text\":\"the pond is freezing\",\"ts\":") && has(a.body, "\"edited\":"));
+            /* muted: none added, but one may be taken back */
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + kim.id + "/mute", "{}").status == 204);
+            CHECK(pond.call(&kim, "POST", GO + "/react", "{\"emoji\":\"" + FROG + "\"}").status == 409);
+            CHECK(pond.call(&kim, "POST", GO + "/unreact", "{\"emoji\":\"" + HEART + "\"}").status == 200);
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/members/" + kim.id + "/unmute").status == 204);
+            /* at most twenty different ones on a message */
+            a = pond.call(&kim, "POST", GC + "/send", "{\"text\":\"react away\"}");
+            const std::string GA = GC + "/messages/" + std::to_string(num_of(a.body, "id"));
+            for (int i = 0; i < 20; i++) {
+                const std::string e = std::string("\xF0\x9F\x98") + (char)(0x80 + i);
+                CHECK(pond.call(i % 2 ? &kim : &dan, "POST", GA + "/react", "{\"emoji\":\"" + e + "\"}").status == 200);
+                std::this_thread::sleep_for(std::chrono::milliseconds(220)); /* within the rate for sends */
+            }
+            a = pond.call(&lee, "POST", GA + "/react", "{\"emoji\":\"" + FROG + "\"}");
+            CHECK(a.status == 409 && has(a.body, "too_many_reactions"));
+            CHECK(pond.call(&lee, "POST", GA + "/react", "{\"emoji\":\"\xF0\x9F\x98\x80\"}").status == 200); /* one already there */
+
+            /* mentions: members by id, and everyone or a role only for whoever may */
+            a = pond.call(&kim, "POST", GC + "/send", "{\"text\":\"hi <@" + lee.id + "> and <@" + std::string(52, 'a') + "> @everyone <@&" + W + ">\"}");
+            CHECK(a.status == 200 && has(a.body, "\"mentions\":{\"members\":[\"" + lee.id + "\"]}"));
+            const std::string GK = GC + "/messages/" + std::to_string(num_of(a.body, "id"));
+            a = pond.call(&dan, "POST", GC + "/send", "{\"text\":\"@everyone, <@&" + W + "> and <@&99999>: <@" + kim.id + "> <@" + kim.id + ">\"}");
+            CHECK(a.status == 200 && has(a.body, "\"mentions\":{\"members\":[\"" + kim.id + "\"],\"roles\":[" + W + "],\"everyone\":true}"));
+            CHECK(!has(pond.call(&dan, "POST", GC + "/send", "{\"text\":\"mail me @everyoneelse\"}").body, "\"mentions\""));
+            /* an edit says them again */
+            a = pond.call(&kim, "POST", GK + "/edit", "{\"text\":\"hi all\"}");
+            CHECK(a.status == 200 && !has(a.body, "\"mentions\""));
+            a = pond.call(&kim, "POST", GK + "/edit", "{\"text\":\"hi <@" + dan.id + ">\"}");
+            CHECK(has(a.body, "\"mentions\":{\"members\":[\"" + dan.id + "\"]}"));
+            CHECK(has(pond.call(&lee, "GET", GC + "/messages?limit=10").body, "\"mentions\":{\"members\":[\"" + dan.id + "\"]}"));
+            /* a role may be given mention_everyone, here or by a channel */
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + std::to_string(gen) + "/overrides",
+                            "{\"overrides\":[{\"role\":0,\"allow\":[\"mention_everyone\"],\"deny\":[]}]}").status == 204);
+            CHECK(has(pond.call(&kim, "POST", GC + "/send", "{\"text\":\"@everyone\"}").body, "\"mentions\":{\"everyone\":true}"));
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/channels/" + std::to_string(gen) + "/overrides", "{\"overrides\":[]}").status == 204);
+
+            /* the message replied to, deleted: the reply says only that it is gone, and nothing reacts to it */
+            CHECK(pond.call(&kim, "POST", GO + "/delete").status == 204);
+            a = pond.call(&lee, "GET", GC + "/messages?limit=20");
+            CHECK(has(a.body, "\"reply\":{\"id\":" + O + ",\"deleted\":true}") && !has(a.body, "freezing"));
+            a = pond.call(&lee, "GET", "/pond/v1/events?after=" + std::to_string(e0));
+            CHECK(!has(a.body, "freezing") && has(a.body, "\"text\":\"brr\""));
+            CHECK(pond.call(&lee, "POST", GO + "/react", "{\"emoji\":\"" + FROG + "\"}").status == 404);
+            CHECK(pond.call(&lee, "POST", GC + "/send", "{\"text\":\"late\",\"reply_to\":" + O + "}").status == 400);
+            CHECK(pond.call(&dan, "POST", GO + "/purge").status == 204);
+            CHECK(has(pond.call(&lee, "GET", GC + "/messages?limit=20").body, "\"reply\":{\"id\":" + O + ",\"deleted\":true}"));
+            (void)R;
+            std::this_thread::sleep_for(std::chrono::seconds(4)); /* Kim's rate for sends filled again, for the shop */
+            CHECK(pond.call(&dan, "POST", "/pond/v1/admin/everyone",
+                            "{\"permissions\":[\"view_channels\",\"send_messages\",\"attach_files\",\"connect\",\"speak\",\"video\"]}").status == 204);
         }
 
         /* ---- a page for some roles only ---- */
