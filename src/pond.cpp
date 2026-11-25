@@ -91,7 +91,7 @@ static const char MEMBER_COLS[] = "id, profile, joined_ms, role, muted_until, dm
 static const char CHANNEL_COLS[] = "id, name, topic, position, kind,"
                                    " (SELECT GROUP_CONCAT(CONCAT(o.role, ':', o.allow, ':', o.deny) ORDER BY o.role) FROM channel_overrides o"
                                    " WHERE o.channel = channels.id)";
-static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms";
+static const char MESSAGE_COLS[] = "id, channel, author, text, ts_ms, edited_ms";
 
 /* "muted": null, or {"until": ms, or null until they are unmuted} (docs/design.md, "Muting") */
 static std::string muted_json(const drogon::orm::Field &f)
@@ -161,11 +161,13 @@ static std::string channel_json(const drogon::orm::Row &row) /* CHANNEL_COLS */
 /* `files` is the message's "files" array, or "" for a message without any */
 static std::string message_json(const drogon::orm::Row &row, const std::string &files = "") /* MESSAGE_COLS */
 {
+    /* `edited`: when it was last edited (protocol 14), only on one that was */
+    const std::string edited = row[5].isNull() ? "" : ",\"edited\":" + std::to_string(num(row[5]));
     return "{\"id\":" + std::to_string(num(row[0])) + ",\"channel\":" + std::to_string(num(row[1])) + ",\"author\":" + jstr(text(row[2])) +
-           ",\"text\":" + jstr(text(row[3])) + ",\"ts\":" + std::to_string(num(row[4])) + (files.empty() ? "" : ",\"files\":" + files) + "}";
+           ",\"text\":" + jstr(text(row[3])) + ",\"ts\":" + std::to_string(num(row[4])) + edited + (files.empty() ? "" : ",\"files\":" + files) + "}";
 }
 
-/* Rows of MESSAGE_COLS as a JSON array, each with the files it carries. */
+/* Rows of MESSAGE_COLS as a JSON array, each with the files it carries (not those an edit dropped). */
 Task<std::string> Service::messages_json(DbPtr db, Result r)
 {
     std::map<int64_t, std::string> files;
@@ -174,7 +176,7 @@ Task<std::string> Service::messages_json(DbPtr db, Result r)
         for (size_t i = 0; i < r.size(); i++)
             ids += (i ? "," : "") + std::to_string(num(r[i][0])); /* numbers from the database: safe to put in the statement */
         Result f = co_await db->execSqlCoro("SELECT message, file, name, mime, size, w, h, duration_ms, preview FROM message_files"
-                                            " WHERE message IN (" + ids + ") ORDER BY message, position");
+                                            " WHERE message IN (" + ids + ") AND removed_ms IS NULL ORDER BY message, position");
         for (const auto &row : f) {
             std::string &out = files[num(row[0])];
             out += out.empty() ? "[" : ",";
@@ -436,7 +438,7 @@ Task<Answer> Service::history(std::string member, int64_t channel, int64_t befor
         if (live.empty() || !seen)
             co_return fail(404, "no_channel");
         Result r = co_await db_->execSqlCoro(std::string("SELECT ") + MESSAGE_COLS +
-                                                 " FROM messages WHERE channel = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                                                 " FROM messages WHERE channel = ? AND id < ? AND deleted_ms IS NULL ORDER BY id DESC LIMIT ?",
                                              channel, before > 0 ? before : INT64_MAX, (int64_t)limit);
         const std::string messages = co_await messages_json(db_, r);
         co_return Answer{200, "{\"messages\":" + messages + "}"};
@@ -529,7 +531,7 @@ Task<Answer> Service::send(std::string member, int64_t channel, std::string in, 
         std::string msg = list.substr(1, list.size() - 2);
         if (msg.empty())
             throw std::out_of_range("message");
-        int64_t ev = co_await add_event(tx, "message", msg, "", channel);
+        int64_t ev = co_await add_event(tx, "message", msg, "", channel, mid);
         if (!co_await Committed(std::move(tx)))
             co_return fail(500, "database");
         bump(ev);
@@ -696,14 +698,16 @@ Task<std::string> Service::may_moderate(std::string by, std::string target, int6
 
 /* ---- the event log ---- */
 
-Task<int64_t> Service::add_event(TxPtr tx, const char *kind, std::string data, std::string only_for, int64_t channel)
+Task<int64_t> Service::add_event(TxPtr tx, const char *kind, std::string data, std::string only_for, int64_t channel, int64_t message)
 {
     co_await tx->execSqlCoro("SELECT value FROM settings WHERE name = 'event_lock' FOR UPDATE");
     const std::string k(kind);
     const std::optional<std::string> to = nullable(only_for);
     const std::optional<int64_t> about = channel > 0 ? std::optional<int64_t>(channel) : std::nullopt;
-    Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms, only_for, channel) VALUES (?, ?, ?, ?, ?)", k, data, now_ms(),
-                                        to, about);
+    /* `message`: the message it is about, so an edit or a deletion can rewrite what was said of it before */
+    const std::optional<int64_t> which = message > 0 ? std::optional<int64_t>(message) : std::nullopt;
+    Result r = co_await tx->execSqlCoro("INSERT INTO events (kind, data, ts_ms, only_for, channel, message) VALUES (?, ?, ?, ?, ?, ?)", k,
+                                        data, now_ms(), to, about, which);
     co_return (int64_t)r.insertId();
 }
 

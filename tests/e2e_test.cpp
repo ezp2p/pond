@@ -122,7 +122,7 @@ int main()
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + once + k + "\",\"profile\":\"main\"}", &out) == 409); /* used up */
     CHECK(ben.post("/api/v1/ponds/join", "{\"link\":\"" + base + open + k + "\",\"profile\":\"main\"}", &out) == 201);
     CHECK(has(ann.get("/api/v1/ponds"), "Lily Pad"));
-    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":8,\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
+    CHECK(has(ann.get("/api/v1/ponds"), "\"protocol\":14,\"features\":[\"files\",\"roles\",\"receipts\",\"sealed\""));
 
     std::string ch = pond.channel("general");
     std::string P = "/api/v1/ponds/" + pid, msgs = P + "/channels/" + ch + "/messages";
@@ -175,6 +175,68 @@ int main()
         CHECK(until([&] { return has(ben.get("/api/v1/files/" + bid), "\"available\""); }));
         CHECK(ben.get("/api/v1/files/" + bid + "/content") == big);
         CHECK(has(ann.get(msgs), "\"state\":\"available\""));
+    }
+
+    /* ---- editing and deleting messages (protocol 14, docs/design.md, "Editing and deleting messages"): every member's Puddle
+     * hears of it on the event stream, keeps the message as it reads now or forgets it, and the log is for moderators ---- */
+    {
+        auto id_of = [](const std::string &page, const std::string &text) {
+            long long id = 0;
+            size_t at = page.find(text);
+            if (at != std::string::npos)
+                sscanf(page.c_str() + page.rfind("{\"id\":", at), "{\"id\":%lld", &id);
+            return std::to_string(id);
+        };
+        CHECK(ann.post(msgs + "/send", "{\"body\":\"teh frogs\"}") == 200);
+        CHECK(until([&] { return has(ben.get(msgs), "teh frogs"); }));
+        const std::string M = id_of(ann.get(msgs), "teh frogs");
+        CHECK(M != "0");
+        CHECK(ben.post(msgs + "/" + M + "/edit", "{\"body\":\"mine\"}", &out) == 404); /* only its author */
+        CHECK(ann.post(msgs + "/" + M + "/edit", "{\"body\":\"the frogs\"}", &out) == 200 && has(out, "\"text\":\"the frogs\"") &&
+              has(out, "\"edited\":"));
+        CHECK(has(ann.get(msgs), "the frogs") && !has(ann.get(msgs), "teh frogs")); /* at once on the author's side */
+        CHECK(until([&] { std::string m = ben.get(msgs); return has(m, "the frogs") && !has(m, "teh frogs") && has(m, "\"edited\":"); }, 5000));
+        /* deleting one's own: gone from both Puddles */
+        CHECK(ann.post(msgs + "/send", "{\"body\":\"oops, wrong pond\"}") == 200);
+        CHECK(until([&] { return has(ben.get(msgs), "oops, wrong pond"); }));
+        const std::string W = id_of(ann.get(msgs), "oops, wrong pond");
+        CHECK(ben.post(msgs + "/" + W + "/delete", "", &out) == 409 && has(out, "no_permission")); /* not his, and no say over it */
+        CHECK(ann.post(msgs + "/" + W + "/delete", "") == 204);
+        CHECK(!has(ann.get(msgs), "oops, wrong pond"));
+        CHECK(until([&] { return !has(ben.get(msgs), "oops, wrong pond"); }, 5000));
+        CHECK(ann.post(msgs + "/" + W + "/delete", "", &out) == 404);
+        /* an administrator deletes anyone's, and reads the log: what it said before, and what was deleted */
+        CHECK(ben.get(P + "/channels/" + ch + "/log").find("oops") == std::string::npos);
+        CHECK(pond.ctl("member offer Ben administrator --yes") == 0);
+        CHECK(until([&] { return has(ben.get(P), "\"offer\":{"); }));
+        CHECK(ben.post(P + "/offer/accept", "", &out) == 200);
+        CHECK(until([&] { return has(ben.get(P + "/channels/" + ch + "/log"), "oops, wrong pond"); }));
+        std::string log = ben.get(P + "/channels/" + ch + "/log");
+        CHECK(has(log, "teh frogs") && has(log, "\"deleted\":{\"ts\":") && has(log, "\"versions\":[{\"text\":\"teh frogs\""));
+        CHECK(has(ben.get(msgs + "/" + M + "/versions"), "teh frogs"));
+        CHECK(ben.post(msgs + "/" + M + "/delete", "") == 204);
+        CHECK(!has(ben.get(msgs), "the frogs"));
+        CHECK(until([&] { return !has(ann.get(msgs), "the frogs"); }, 5000));
+        /* a deleted message's file, over Ben's automatic limit so never fetched: the log still gives it to him, to save */
+        {
+            std::string evidence(3 * (1 << 19), '\0');
+            for (size_t i = 0; i < evidence.size(); i++)
+                evidence[i] = (char)(i * 29 + i / 1021);
+            std::string eid = ann.upload(evidence);
+            CHECK(ann.post(msgs + "/send", "{\"body\":\"look\",\"files\":[{\"id\":\"" + eid + "\",\"name\":\"e.bin\",\"mime\":\"x/y\"}]}") == 200);
+            CHECK(until([&] { return has(ben.get(msgs), "e.bin"); }));
+            const std::string E = id_of(ann.get(msgs), "\"look\"");
+            CHECK(ann.post(msgs + "/" + E + "/delete", "") == 204);
+            CHECK(until([&] { return !has(ben.get(msgs), "e.bin"); }));
+            CHECK(has(ben.get(P + "/channels/" + ch + "/log"), "e.bin"));
+            CHECK(ben.post(msgs + "/" + E + "/files/" + eid + "/download", "") == 204);
+            CHECK(until([&] { return has(ben.get("/api/v1/files/" + eid), "\"available\""); }, 15000));
+            CHECK(ben.get("/api/v1/files/" + eid + "/content") == evidence);
+        }
+        CHECK(ben.post(msgs + "/" + M + "/purge", "") == 204);
+        CHECK(!has(ben.get(P + "/channels/" + ch + "/log"), "teh frogs"));
+        CHECK(pond.ctl("member role Ben member --yes") == 0);
+        CHECK(until([&] { return !has(ben.get(P), "\"role\":\"administrator\""); }));
     }
 
     /* ---- direct messages through the Pond (docs/dms.md): sealed from one Puddle to the other, relayed, never kept ---- */

@@ -122,6 +122,96 @@ paths:
         "404": { description: "No such channel (`no_channel`)" }
         "409": { description: "`no_file`, with `file`: one of the files is not here whole; `files_off`: the Pond takes no files; `muted`, with `until` (ms, or null until unmuted): an operator or administrator muted the sender" }
         "429": { description: "Too many (`slow_down`)" }
+  /pond/v1/channels/{channel}/messages/{message}/edit:
+    post:
+      summary: Edit one's own message (protocol 14, feature `message_edits`; docs/design.md, "Editing and deleting messages")
+      description: |
+        Only its author edits a message. `text` replaces its words (cleaned as a send's); `files` are the ids of the files it
+        keeps, which must be some of those it carries now: an edit drops files, never adds one. What it said before, and the
+        files it carried then, go in the message log. Every member hears of it in a `message_edited` event, and the events that
+        said the message before are rewritten to say it as it reads now. The same text and files answer the message and change
+        nothing. Counts against the sender's rate for sends; refused while they are muted.
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+        - { name: message, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text: { type: string, description: "Up to 4000 characters once trimmed; may be empty while it keeps a file" }
+                files: { type: array, maxItems: 10, items: { type: string, pattern: "^[0-9a-f]{64}$" } }
+      responses:
+        "200":
+          description: The message as it now reads, with `edited`
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "400": { description: "`bad_text` (too long, or nothing left), `bad_file` (a file it doesn't carry)" }
+        "404": { description: "`no_channel`; `no_message`: none here, deleted, or not the sender's" }
+        "409": { description: "`muted`, with `until`" }
+        "429": { description: "`slow_down`" }
+  /pond/v1/channels/{channel}/messages/{message}/delete:
+    post:
+      summary: Delete a message (protocol 14)
+      description: |
+        One's own, or anyone's in a channel where one may `manage_messages` (operators and administrators everywhere). It is
+        gone for every member at once (`message_deleted`, and the events that said it become `message_deleted` too), but the
+        Pond keeps it, with every text it had and its files, in the message log until it is purged. A deletion by someone else
+        goes in `admin_log`.
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+        - { name: message, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "204": { description: Deleted }
+        "404": { description: "`no_channel`, `no_message` (none here, or deleted already)" }
+        "409": { description: "`no_permission`: someone else's, and the member may not manage messages here" }
+  /pond/v1/channels/{channel}/messages/{message}/versions:
+    get:
+      summary: One message with every text it had (protocol 14), for whoever may `view_message_log` in the channel
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+        - { name: message, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoggedMessage" }
+        "404": { description: "`no_channel` (also without the permission), `no_message`" }
+  /pond/v1/channels/{channel}/log:
+    get:
+      summary: The channel's message log (protocol 14), for whoever may `view_message_log` there
+      description: Its messages that were edited or deleted, newest first, each with every text it had and every file it carried.
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+        - { name: before, in: query, schema: { type: integer, minimum: 1 }, description: Only messages with a lower id }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        "200":
+          description: The log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages: { type: array, items: { $ref: "#/components/schemas/LoggedMessage" } }
+        "404": { description: "`no_channel` (also without the permission)" }
+  /pond/v1/channels/{channel}/messages/{message}/purge:
+    post:
+      summary: Erase a deleted message for good (protocol 14)
+      description: |
+        For whoever may both `manage_messages` and `view_message_log` in the channel. The message, every text it had and its
+        files go: a file at once, unless another message or a page carries it. Nothing can bring them back. Goes in `admin_log`.
+      parameters:
+        - { $ref: "#/components/parameters/Channel" }
+        - { name: message, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "204": { description: Erased }
+        "404": { description: "`no_channel` (also without the permissions), `no_message`" }
+        "409": { description: "`not_deleted`: delete it first" }
   /pond/v1/files/{file}:
     post:
       summary: Begin sending a file
@@ -852,7 +942,7 @@ components:
                 description: |
                   Optional parts this Pond has. `files`: members may send files (docs/design.md, "Files"). `roles`: operators
                   and administrators (docs/design.md, "Roles"). `receipts`: every answer to a member is signed
-                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). `role_colors`: names in a role's colour, as each member chooses or the Pond enforces (protocol 12, "Role colours"). `overrides`: what everyone may do, and each channel's permissions (protocol 13, "Permissions"). `page_kinds`: roles, events, form and shop pages and pages for some roles ("Pages"). `applications`: the entry form ("Entry form"). `shop`: the shop ("Shop"). `voice_moderation`: muting and disconnecting in voice ("Voice moderation"). Missing means none.
+                  (docs/design.md, "Receipts and sealing"). `sealed`: every request and answer is sealed (the same). `pictures`: the icon and members' profile pictures (protocol 6, docs/design.md, "Pictures"). `voice`: voice channels (docs/voice.md). `channel_roles`: roles for channels, and their order from the app (protocol 9, docs/design.md, "Roles for channels"). `role_permissions`: what roles let members do, their colour and order (protocol 10, "Permissions"). `pages`: pages above the channels, and the banner (protocol 11, "Pages"). `role_colors`: names in a role's colour, as each member chooses or the Pond enforces (protocol 12, "Role colours"). `overrides`: what everyone may do, and each channel's permissions (protocol 13, "Permissions"). `page_kinds`: roles, events, form and shop pages and pages for some roles ("Pages"). `applications`: the entry form ("Entry form"). `shop`: the shop ("Shop"). `voice_moderation`: muting and disconnecting in voice ("Voice moderation"). `message_edits`: editing and deleting messages, and the message log (protocol 14, "Editing and deleting messages"). Missing means none.
               pond: { $ref: "#/components/schemas/Pond" }
               me: { $ref: "#/components/schemas/Member" }
               offer:
@@ -975,8 +1065,8 @@ components:
     Permission:
       enum: [manage_pond, manage_channels, manage_roles, manage_invites, kick_members, ban_members, mute_members, manage_pages,
              view_channels, send_messages, attach_files, connect, speak, video, move_members, voice_mute, manage_events,
-             manage_applications, manage_shop]
-      description: 'docs/design.md, "Permissions". From view_channels on, protocol 13; view_channels to voice_mute are those a channel may allow or deny.'
+             manage_applications, manage_shop, manage_messages, view_message_log]
+      description: 'docs/design.md, "Permissions". From view_channels on, protocol 13; manage_messages and view_message_log, protocol 14. view_channels to voice_mute, manage_messages and view_message_log are those a channel may allow or deny.'
     Override:
       type: object
       description: 'What a channel allows and denies a role, or everyone (role 0) (protocol 13)'
@@ -1090,7 +1180,24 @@ components:
         author: { type: string, description: The author's user id }
         text: { type: string, description: May be empty when there are files }
         ts: { type: integer, description: ms, by the Pond's clock }
+        edited: { type: integer, description: "Protocol 14: when it was last edited (ms); left out when it never was" }
         files: { type: array, items: { $ref: "#/components/schemas/File" }, description: Left out when there are none }
+    LoggedMessage:
+      description: 'A message as the message log gives it (protocol 14; docs/design.md, "Editing and deleting messages")'
+      allOf:
+        - { $ref: "#/components/schemas/Message" }
+        - type: object
+          properties:
+            text: { type: string, description: "What it said last (when it was deleted, for a deleted one)" }
+            deleted: { type: object, description: "Left out while it is not deleted", properties: { ts: { type: integer }, by: { type: string, description: "A member's id, or pondctl" } } }
+            files:
+              description: Every file it carried; one an edit dropped has `removed` (ms)
+              type: array
+              items: { allOf: [{ $ref: "#/components/schemas/File" }, { type: object, properties: { removed: { type: integer } } }] }
+            versions:
+              description: Every earlier text, oldest first, with when it was written and replaced, and the ids of the files it carried
+              type: array
+              items: { type: object, properties: { text: { type: string }, ts: { type: integer }, until: { type: integer }, files: { type: array, items: { type: string } } } }
     FileRef:
       type: object
       required: [id, name, mime]
@@ -1114,7 +1221,7 @@ components:
       required: [id, kind, data]
       properties:
         id: { type: integer }
-        kind: { enum: [message, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, role_order, page, page_deleted, page_order, voice, voice_left] }
+        kind: { enum: [message, message_edited, message_deleted, channel, channel_deleted, channels, member, member_left, pond, role, role_deleted, role_offer, role_order, page, page_deleted, page_order, voice, voice_left] }
         data:
           description: |
             message: a Message. channel: a Channel (made or changed). channel_deleted: {id}. member: a Member (joined, or a
@@ -1126,4 +1233,6 @@ components:
             channel the member may not see is not given to them. Protocol 10: role carries the whole ChannelRole (made or
             changed; a new one is at the bottom), and role_order: {roles: [ids]}, every role, highest first. Protocol 11
             (docs/design.md, "Pages"): page: a PageHead (made or changed; a new one is last), page_deleted: {id}, page_order:
-            {pages: [ids]}, first to last.
+            {pages: [ids]}, first to last. Protocol 14 (docs/design.md, "Editing and deleting messages"): message_edited: a
+            Message as it now reads, with `edited`; message_deleted: {id, channel}, no longer there. When a message is edited,
+            the events that said it before say it as it now reads; when it is deleted, they become message_deleted.
