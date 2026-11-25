@@ -1,9 +1,9 @@
 # pond
 
 Community servers for Puddle: someone runs a Pond, makes text channels, and gives out invite links; people join from their
-Puddle. The design is in [docs/design.md](docs/design.md) and the routes in [api/pond.yaml](api/pond.yaml).
+Puddle. The design is on the [wiki](https://www.ezp2p.org/wiki/pond/design/) and the routes in [api/pond.yaml](api/pond.yaml).
 
-What a Pond says to Puddles follows the Puddle Protocol (`ezp2p/protocol`); [docs/protocol.md](docs/protocol.md) says
+What a Pond says to Puddles follows the Puddle Protocol (`ezp2p/protocol`); [the wiki](https://www.ezp2p.org/wiki/pond/design/protocol/) says
 which parts Pond implements and what the protocol asks of it next.
 
 - `pondd` is the service. It has no UI and serves HTTPS on its chat port (TCP) and voice on its voice port (UDP), both 443 unless set.
@@ -19,7 +19,7 @@ docker compose up -d
 docker exec pond pondctl invite create     # the pond://… link to give out
 ```
 
-`:latest` is the newest release and `:dev` the newest build of `dev`. [docs/docker.md](docs/docker.md) says more.
+`:latest` is the newest release and `:dev` the newest build of `dev`. [The wiki](https://www.ezp2p.org/wiki/pond/docker/) says more.
 
 ## Build
 
@@ -51,3 +51,11 @@ Give out the `pond://…` link that `invite create` prints. Someone joins by pas
 server rail).
 
 `scripts/dev.sh` starts a throwaway MariaDB and a Pond with an invite, for trying things out.
+
+## Docs, decisions and what's next
+
+The design documents that used to be in `docs/` are on the website wiki ([Pond design](https://www.ezp2p.org/wiki/pond/design/), source in
+`ezp2p/website` under `src/wiki/pond/`). A comment or spec that names `docs/design.md`, `docs/dms.md`, `docs/voice.md`
+or `docs/protocol.md` means the wiki page of that name. When a change alters the design, update the wiki page in a
+website pull request alongside. The decisions made along the way are under [Decisions](https://www.ezp2p.org/wiki/decisions/), and the work
+still to do is on the [project board](https://github.com/orgs/ezp2p/projects/1).
